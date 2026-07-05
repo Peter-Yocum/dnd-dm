@@ -1,5 +1,7 @@
 # D&D Dungeon Master
 
+![Gameplay screenshot — party sidebar, live character sheet, initiative order, dice rolls, and DM narration](docs/images/gameplay-screenshot.png)
+
 A local, agentic AI Dungeon Master for D&D 5e. It runs actual game sessions —
 narrating, adjudicating rules, rolling dice, and tracking every character's HP,
 inventory, and initiative order — grounded in real rulebook/monster/spell data

@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}Character Creation — {{ player_name }} — {{ campaign.name }}{% endblock %}
+
+{% block content %}
+<div class="sz-layout">
+
+  <!-- ── chat panel ──────────────────────────────────────────────── -->
+  <section class="sz-chat">
+    <div class="sz-chat-header">
+      <a href="/campaigns/{{ campaign.id }}/session-zero" class="btn-ghost btn-sm">← Session 0</a>
+      <span class="sz-player-label">Creating character for <strong>{{ player_name }}</strong></span>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="message dm-message welcome">
+        <p>The Dungeon Master is ready. Introduce yourself and let's build your character!</p>
+      </div>
+    </div>
+
+    <form class="input-form"
+          id="message-form"
+          hx-post="/campaigns/{{ campaign.id }}/session-zero/{{ player_slug }}/message"
+          hx-on::after-request="this.reset(); startStream()"
+          hx-swap="none">
+      <input type="hidden" name="thread_id" id="thread-id-input">
+      <textarea
+        name="message"
+        id="message-input"
+        rows="3"
+        placeholder="Tell the DM about the character you have in mind…"
+        required
+        autofocus></textarea>
+      <button type="submit" id="send-btn" class="btn-primary">Send</button>
+    </form>
+  </section>
+
+  <!-- ── character sheet preview ─────────────────────────────────── -->
+  <aside class="sz-sheet">
+    <div class="sz-sheet-header">
+      <h3>Character Sheet</h3>
+      <span class="sz-sheet-hint text-dim">Updates as you make choices</span>
+    </div>
+
+    <div id="char-preview"
+         hx-get="/campaigns/{{ campaign.id }}/session-zero/{{ player_slug }}/draft"
+         hx-trigger="load, refresh"
+         hx-swap="innerHTML"
+         hx-target="#char-preview-inner">
+      <div id="char-preview-inner" class="char-preview-content">
+        <p class="text-dim preview-empty">No choices made yet…</p>
+      </div>
+    </div>
+  </aside>
+
+</div>
+
+<script>
+  const CAMPAIGN_ID  = "{{ campaign.id }}";
+  const PLAYER_SLUG  = "{{ player_slug }}";
+  const INITIAL_TID  = "{{ thread_id }}";
+  const STORAGE_KEY  = "sz_thread_" + CAMPAIGN_ID + "_" + PLAYER_SLUG;
+
+  let currentThreadId = sessionStorage.getItem(STORAGE_KEY) || INITIAL_TID;
+  sessionStorage.setItem(STORAGE_KEY, currentThreadId);
+  document.getElementById("thread-id-input").value = currentThreadId;
+
+  let activeSource = null;
+
+  function appendMessage(cls, html) {
+    const msgs = document.getElementById("messages");
+    const div = document.createElement("div");
+    div.className = "message " + cls;
+    div.innerHTML = html;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+    return div;
+  }
+
+  function refreshPreview() {
+    // Re-fetch the draft and render into the preview panel.
+    fetch(`/campaigns/${CAMPAIGN_ID}/session-zero/${PLAYER_SLUG}/draft`)
+      .then(r => r.json())
+      .then(draft => {
+        const el = document.getElementById("char-preview-inner");
+        el.innerHTML = renderDraft(draft);
+      });
+  }
+
+  function renderDraft(d) {
+    const stats = ["strength","dexterity","constitution","intelligence","wisdom","charisma"];
+    const abbr  = ["STR","DEX","CON","INT","WIS","CHA"];
+
+    let html = "";
+
+    // Identity block
+    const name = d.name || "<em>name unknown</em>";
+    const race = [d.race, d.subrace].filter(Boolean).join(" ");
+    const cls  = [d.char_class, d.subclass].filter(Boolean).join(" / ");
+    html += `<div class="preview-identity">
+      <div class="preview-name">${name}</div>
+      <div class="preview-subtitle">${[race, cls, d.background, d.alignment].filter(Boolean).join(" · ")}</div>
+    </div>`;
+
+    // Ability scores
+    const hasScores = stats.some(s => d[s]);
+    if (hasScores) {
+      html += `<div class="preview-scores">`;
+      stats.forEach((s, i) => {
+        const val = d[s] || 0;
+        const mod = val ? Math.floor((val - 10) / 2) : null;
+        const modStr = mod !== null ? (mod >= 0 ? `+${mod}` : `${mod}`) : "—";
+        html += `<div class="preview-score">
+          <span class="score-abbr">${abbr[i]}</span>
+          <span class="score-val">${val || "—"}</span>
+          <span class="score-mod">${modStr}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+    // Appearance
+    if (d.appearance) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Appearance</div>
+        <div class="preview-value">${d.appearance}</div>
+      </div>`;
+    }
+
+    // Skills
+    if (d.skill_proficiencies && d.skill_proficiencies.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Skills</div>
+        <div class="preview-value">${d.skill_proficiencies.join(", ")}</div>
+      </div>`;
+    }
+
+    // Personality
+    const personality = [
+      ...(d.personality_traits || []).map(t => `<em>${t}</em>`),
+      ...(d.ideals || []).map(t => `Ideal: ${t}`),
+      ...(d.bonds || []).map(t => `Bond: ${t}`),
+      ...(d.flaws || []).map(t => `Flaw: ${t}`),
+    ];
+    if (personality.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Personality</div>
+        <div class="preview-value">${personality.join("<br>")}</div>
+      </div>`;
+    }
+
+    // Backstory
+    if (d.backstory) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Backstory</div>
+        <div class="preview-value preview-backstory">${d.backstory.slice(0, 300)}${d.backstory.length > 300 ? "…" : ""}</div>
+      </div>`;
+    }
+
+    if (!html || (!d.name && !hasScores)) {
+      return `<p class="text-dim preview-empty">No choices made yet…</p>`;
+    }
+
+    return html;
+  }
+
+  function renderFinalized(message) {
+    document.getElementById("char-preview-inner").innerHTML = `
+      <div class="preview-finalized">
+        <p class="preview-finalized-message">${message.replace(/</g, "&lt;")}</p>
+        <a href="/campaigns/${CAMPAIGN_ID}/session-zero" class="btn-primary btn-sm">← Back to Session 0 lobby</a>
+      </div>`;
+  }
+
+  // Shown while the model works through tool calls (update_character_draft,
+  // list_options, etc.) that generate little or no streamed content of their
+  // own — without this the player watches a blank bubble between visible
+  // replies.
+  const THINKING_VERBS = [
+    "Pondering", "Weighing options", "Sketching your hero", "Consulting the rules",
+    "Considering", "Rolling dice behind the screen", "Envisioning", "Taking notes",
+  ];
+
+  function startThinking(p) {
+    let i = Math.floor(Math.random() * THINKING_VERBS.length);
+    p.textContent = THINKING_VERBS[i] + "…";
+    p.classList.add("thinking");
+    return setInterval(() => {
+      i = (i + 1) % THINKING_VERBS.length;
+      p.textContent = THINKING_VERBS[i] + "…";
+    }, 1800);
+  }
+
+  function startStream() {
+    if (activeSource) { activeSource.close(); }
+
+    const sendBtn = document.getElementById("send-btn");
+    sendBtn.disabled = true;
+    let finalized = false;
+
+    const dmDiv = appendMessage("dm-message streaming", "<p></p>");
+    const p = dmDiv.querySelector("p");
+    let thinkingTimer = startThinking(p);
+
+    const url = `/campaigns/${CAMPAIGN_ID}/session-zero/${PLAYER_SLUG}/stream`
+              + `?thread_id=${encodeURIComponent(currentThreadId)}`;
+    activeSource = new EventSource(url);
+
+    activeSource.addEventListener("token", e => {
+      if (thinkingTimer) {
+        clearInterval(thinkingTimer);
+        thinkingTimer = null;
+        p.classList.remove("thinking");
+        p.textContent = "";
+      }
+      p.textContent += e.data;
+      document.getElementById("messages").scrollTop = 9999;
+    });
+
+    activeSource.addEventListener("stall", e => {
+      // Purely informational — the underlying request is still live and may
+      // still resolve on its own, so we don't stop the thinking indicator or
+      // touch sendBtn here. See STALL_MESSAGE in dm_agent.py.
+      appendMessage("system-message stall-message", `<p>${e.data.replace(/\n/g, "<br>")}</p>`);
+    });
+
+    activeSource.addEventListener("finalized", e => {
+      if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
+      finalized = true;
+      renderFinalized(e.data);
+    });
+
+    activeSource.addEventListener("done", () => {
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      dmDiv.classList.remove("streaming");
+      activeSource.close();
+      activeSource = null;
+      sendBtn.disabled = false;
+      // Skip re-fetching the (now-cleared) draft — the finalized banner is
+      // the correct state to leave on screen.
+      if (!finalized) refreshPreview();
+    });
+
+    activeSource.addEventListener("error", e => {
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      dmDiv.classList.remove("streaming");
+      // e.data is only set for our own server-sent "error" event (see the
+      // except block around watch_for_stalls in main.py) — a native
+      // connection-drop error has no data, so fall back to a generic note.
+      appendMessage("system-message error-message", `<p>${e.data || "Connection lost. Please try sending your message again."}</p>`);
+      activeSource.close();
+      activeSource = null;
+      sendBtn.disabled = false;
+    });
+  }
+
+  document.getElementById("message-form").addEventListener("htmx:beforeRequest", () => {
+    const msg = document.getElementById("message-input").value.trim();
+    if (msg) appendMessage("player-message", `<p>${msg.replace(/</g,"&lt;")}</p>`);
+  });
+
+  document.getElementById("message-input").addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      document.getElementById("message-form").requestSubmit();
+    }
+  });
+</script>
+{% endblock %}

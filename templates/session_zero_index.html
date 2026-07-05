@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Session 0 — {{ campaign.name }}{% endblock %}
+
+{% block content %}
+<div class="page-index">
+  <div class="sz-header">
+    <a href="/campaigns/{{ campaign.id }}" class="btn-ghost btn-sm">← Back to Campaign</a>
+    <h1>Session 0 — {{ campaign.name }}</h1>
+    <p class="text-dim">The DM will pitch the campaign and guide each player through character creation.</p>
+  </div>
+
+  {% if campaign.party %}
+  <section class="sz-party">
+    <h2>Characters Created</h2>
+    <div class="sz-party-list">
+      {% for c in campaign.party %}
+      <div class="sz-char-card">
+        <span class="char-name">{{ c.name }}</span>
+        <span class="char-class">{{ c.race }} {{ c.char_class }} {{ c.level }}</span>
+        <span class="char-hp">{{ c.current_hp }}/{{ c.max_hp }} HP · AC {{ c.ac }}</span>
+        {% if not c.is_player_controlled %}<span class="char-companion-tag">DM companion</span>{% endif %}
+        <button class="btn-danger btn-sm"
+                hx-delete="/campaigns/{{ campaign.id }}/party/{{ c.id }}"
+                hx-confirm="Remove {{ c.name }} from the party? This cannot be undone."
+                hx-target="body"
+                hx-push-url="/campaigns/{{ campaign.id }}/session-zero">
+          Remove
+        </button>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if recommended %}
+  <section class="sz-fill-party">
+    {% for adv in recommended %}
+    <p class="text-dim">Recommended party size for {{ adv.name }}: {{ adv.recommended_players }}
+       (currently {{ campaign.party|length }})</p>
+    {% endfor %}
+    <div class="sz-fill-party-controls">
+      <select id="fill-party-class" class="fill-party-select">
+        <option value="">Random (DM decides)</option>
+        {% for cls in class_names %}
+        <option value="{{ cls }}">{{ cls }}</option>
+        {% endfor %}
+      </select>
+      <button type="button" id="fill-party-btn" class="btn-ghost btn-sm">Ask DM to add a member</button>
+    </div>
+    <p id="fill-party-result" class="text-dim"></p>
+  </section>
+  {% endif %}
+
+  <section class="sz-new">
+    <h2>Start Character Creation</h2>
+    <p class="text-dim">Enter the player's name to open a dedicated character creation session.
+       Each player gets their own conversation with the DM.</p>
+    <form method="post" action="/campaigns/{{ campaign.id }}/session-zero" class="sz-form">
+      <div class="field">
+        <label for="player_name">Player name</label>
+        <input id="player_name" name="player_name" type="text"
+               required placeholder="e.g. Alice" autofocus>
+      </div>
+      <button type="submit" class="btn-primary">Begin Session →</button>
+    </form>
+  </section>
+
+  {% if campaign.party %}
+  <section class="sz-done">
+    <h2>Ready to Play?</h2>
+    <p class="text-dim">All characters are created. Head to the main game to start your adventure.</p>
+    <a href="/campaigns/{{ campaign.id }}" class="btn-primary">Enter the Campaign →</a>
+  </section>
+  {% endif %}
+</div>
+
+{% if recommended %}
+<script>
+  document.getElementById("fill-party-btn").addEventListener("click", async () => {
+    const btn = document.getElementById("fill-party-btn");
+    const select = document.getElementById("fill-party-class");
+    const result = document.getElementById("fill-party-result");
+    btn.disabled = true;
+    select.disabled = true;
+    btn.textContent = "Thinking…";
+    result.textContent = "";
+    try {
+      const body = new URLSearchParams({ char_class: select.value });
+      const resp = await fetch("/campaigns/{{ campaign.id }}/session-zero/fill-party", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "Request failed");
+      result.textContent = data.summary;
+      setTimeout(() => location.reload(), 1500);
+    } catch (err) {
+      result.textContent = "Error: " + err.message;
+      btn.disabled = false;
+      select.disabled = false;
+      btn.textContent = "Ask DM to add a member";
+    }
+  });
+</script>
+{% endif %}
+{% endblock %}

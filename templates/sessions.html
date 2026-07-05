@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Sessions — {{ campaign.name }}{% endblock %}
+
+{% block content %}
+<div class="sessions-layout">
+
+  <!-- ── session list ────────────────────────────────────────────── -->
+  <aside class="sessions-sidebar">
+    <div class="sessions-header">
+      <a href="/campaigns/{{ campaign.id }}" class="btn-ghost btn-sm">← Back to Game</a>
+      <h2>{{ campaign.name }}</h2>
+      <p class="text-dim">{{ sessions | length }} session{% if sessions | length != 1 %}s{% endif %} recorded</p>
+    </div>
+
+    <ul class="session-list">
+      {% for s in sessions %}
+      <li class="session-item {% if selected and selected.id == s.id %}active{% endif %}">
+        <a href="/campaigns/{{ campaign.id }}/sessions/{{ s.id }}">
+          <span class="session-num">Session {{ s.session_number }}</span>
+          {% if s.real_date %}<span class="session-date">{{ s.real_date }}</span>{% endif %}
+          {% if s.key_events %}
+          <span class="session-preview">{{ s.key_events[0] }}</span>
+          {% elif s.summary %}
+          <span class="session-preview">{{ s.summary[:80] }}…</span>
+          {% endif %}
+        </a>
+      </li>
+      {% else %}
+      <li class="empty">No sessions recorded yet. End a game session to create the first chronicle.</li>
+      {% endfor %}
+    </ul>
+  </aside>
+
+  <!-- ── session detail ──────────────────────────────────────────── -->
+  <main class="session-detail">
+    {% if selected %}
+
+    <div class="session-detail-header">
+      <h2>Session {{ selected.session_number }}</h2>
+      {% if selected.real_date %}<span class="session-date">{{ selected.real_date }}</span>{% endif %}
+    </div>
+
+    {% if selected.key_events %}
+    <section class="detail-section">
+      <h3>Key Events</h3>
+      <ul class="key-events-list">
+        {% for event in selected.key_events %}
+        <li>{{ event }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if selected.summary %}
+    <section class="detail-section">
+      <h3>Chronicle</h3>
+      <div class="chronicle-text">
+        {% for para in selected.summary.split('\n\n') %}
+        {% if para.strip() %}<p>{{ para.strip() }}</p>{% endif %}
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    {% if transcript %}
+    <section class="detail-section">
+      <h3>Full Transcript</h3>
+      <div class="transcript">
+        {% for turn in transcript %}
+        <div class="turn turn-{{ turn.role }}">
+          <span class="turn-role">{{ "Player" if turn.role == "player" else "DM" }}</span>
+          <div class="turn-content">{{ turn.content }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    {% else %}
+    <div class="detail-empty">
+      <p>Select a session from the list to view its chronicle and transcript.</p>
+    </div>
+    {% endif %}
+  </main>
+
+</div>
+{% endblock %}

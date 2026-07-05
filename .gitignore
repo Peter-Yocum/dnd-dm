@@ -1,0 +1,29 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data — never commit DB contents or embeddings
+data/
+
+# Alembic ignores compiled migrations but keeps version files
+alembic/versions/*.pyc
+
+# Docs — raw scanned PDFs can be large. Source markdown (docs/source/) is
+# OCR'd copyrighted rulebook/adventure text (WotC), not redistributed here —
+# regenerate it from your own legally-owned PDFs via scripts/ocr_ingest.py +
+# scripts/build_index.py.
+docs/raw/
+docs/source/
+
+# Stray archives
+*.tar.gz
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/

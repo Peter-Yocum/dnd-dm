@@ -1,0 +1,855 @@
+{% extends "base.html" %}
+{% block title %}{{ campaign.name }} — D&D DM{% endblock %}
+
+{% block content %}
+<div class="game-layout">
+
+  <!-- ── sidebar ─────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sidebar-section sidebar-header">
+      <h3>{{ campaign.name }}</h3>
+      <p class="setting">{{ campaign.setting or "" }}</p>
+      <button type="button" class="btn-ghost btn-sm campaign-menu-btn" onclick="openCampaignModal()">
+        ⚙ Campaign{% if campaign.safety_flags %} <span class="flag-indicator">{{ campaign.safety_flags | length }}</span>{% endif %}
+      </button>
+    </div>
+
+    <div class="sidebar-section">
+      <h4>Party</h4>
+      <ul class="party-list">
+        {% for c in campaign.party %}
+        <li class="party-member clickable {% if c.current_hp == 0 %}downed{% elif c.current_hp / c.max_hp < 0.25 %}critical{% elif c.current_hp / c.max_hp < 0.5 %}bloodied{% endif %}"
+            data-char-id="{{ c.id }}"
+            onclick="loadCharacterSheet('{{ c.id }}')">
+          <span class="char-name">{{ c.name }}</span>
+          <span class="char-class">{{ c.char_class }} {{ c.level }}</span>
+          <span class="char-hp">{{ c.current_hp }}/{{ c.max_hp }} HP</span>
+        </li>
+        {% else %}
+        <li class="empty">No party members yet.</li>
+        {% endfor %}
+      </ul>
+    </div>
+
+    <div class="sidebar-section">
+      <h4>World</h4>
+      <div class="world-clock">
+        {% if campaign.in_game_date %}<span class="world-line">{{ campaign.in_game_date }}</span>{% endif %}
+        <span class="world-line">{{ campaign.time_of_day.value | title }} &middot; Day {{ campaign.days_elapsed }}</span>
+        {% if campaign.current_weather %}<span class="world-line weather">{{ campaign.current_weather }}</span>{% endif %}
+        <span class="world-line rest-status {% if campaign.last_long_rest_day == campaign.days_elapsed %}rested{% endif %}">
+          {% if campaign.last_long_rest_day == campaign.days_elapsed %}Long rest taken today{% else %}No long rest today{% endif %}
+        </span>
+      </div>
+      <div class="rest-buttons">
+        <button type="button" id="short-rest-btn" class="btn-ghost btn-sm">Short Rest</button>
+        <button type="button" id="long-rest-btn" class="btn-ghost btn-sm">Long Rest</button>
+      </div>
+      <p id="rest-result" class="text-dim"></p>
+    </div>
+
+    {% if campaign.active_encounter and campaign.active_encounter.is_active %}
+    <div class="sidebar-section combat-active">
+      <h4>⚔ Combat — Round {{ campaign.active_encounter.round }}</h4>
+      <ol class="initiative-list">
+        {% for e in campaign.active_encounter.initiative_order %}
+        <li class="{% if e.is_current_turn %}current-turn{% endif %}">
+          <span class="init-score">{{ e.initiative }}</span>
+          {{ e.name }}
+        </li>
+        {% endfor %}
+      </ol>
+    </div>
+    {% endif %}
+
+    <div class="sidebar-section">
+      <h4>Active Quests</h4>
+      <ul class="quest-list">
+        {% for q in campaign.quests if q.status.value == "active" %}
+        <li>{{ q.name }}</li>
+        {% else %}
+        <li class="empty">None</li>
+        {% endfor %}
+      </ul>
+    </div>
+
+    {% set known_npcs = campaign.npcs | selectattr("has_met_party") | list %}
+    {% if campaign.factions or known_npcs %}
+    <div class="sidebar-section">
+      <h4>Factions &amp; NPCs</h4>
+
+      {% if campaign.factions %}
+      <ul class="faction-list">
+        {% for f in campaign.factions %}
+        <li class="faction-entry">
+          <div class="faction-header">
+            <span class="faction-name">{{ f.name }}</span>
+            <span class="rep-badge {% if f.party_reputation > 25 %}rep-good{% elif f.party_reputation < -25 %}rep-bad{% endif %}">{{ f.party_reputation }}</span>
+          </div>
+          {% if f.relationships %}
+          <ul class="rel-list">
+            {% for r in f.relationships %}
+            <li class="rel-badge {% if 'allied' in r.relationship.lower() or 'friendly' in r.relationship.lower() %}rel-good{% elif 'hostile' in r.relationship.lower() or 'rival' in r.relationship.lower() or 'enem' in r.relationship.lower() %}rel-bad{% endif %}">
+              ↔ {{ r.faction_name }} — {{ r.relationship }}
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+
+      {% if known_npcs %}
+      <ul class="npc-list">
+        {% for n in known_npcs %}
+        <li class="npc-entry">
+          <span class="npc-name">{{ n.name }}</span>
+          <span class="npc-attitude attitude-{{ n.attitude.value }}">{{ n.attitude.value }}</span>
+          {% if n.relationships %}
+          <ul class="rel-list">
+            {% for r in n.relationships %}
+            <li class="rel-badge">↔ {{ r.npc_name }} — {{ r.description }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <div class="sidebar-section">
+      <h4>Session</h4>
+      <div class="session-controls">
+        <span class="session-label" id="session-label">Session {{ campaign.session_count + 1 }}</span>
+        <button class="btn-ghost btn-sm" id="end-session-btn" onclick="endSession()">End Session</button>
+      </div>
+      <p id="context-warning" class="context-warning hidden">
+        This session is getting long — the DM's memory of earlier turns is starting to
+        fade. Consider ending it soon to keep things sharp.
+      </p>
+    </div>
+
+    <div class="sidebar-bottom">
+      <a href="/campaigns/{{ campaign.id }}/sessions" class="btn-ghost btn-sm">Session History</a>
+      <a href="/campaigns/{{ campaign.id }}/session-zero" class="btn-ghost btn-sm">Session 0 / Chars</a>
+      <a href="/" class="btn-ghost">← Campaigns</a>
+    </div>
+  </aside>
+
+  <!-- ── main chat area ──────────────────────────────────────────── -->
+  <section class="chat-area">
+    <div class="messages" id="messages">
+      <div class="message dm-message welcome" id="welcome-message">
+        {% if campaign.session_count == 0 %}
+        <p>Welcome to <strong>{{ campaign.name }}</strong>. Character creation is done — ready to start the adventure?</p>
+        <button type="button" id="begin-session-btn" class="btn-primary btn-sm">Begin the Adventure</button>
+        {% else %}
+        <p>Welcome back to <strong>{{ campaign.name }}</strong>.</p>
+        <button type="button" id="begin-session-btn" class="btn-primary btn-sm">Continue the Adventure</button>
+        {% endif %}
+      </div>
+    </div>
+
+    <form class="input-form"
+          id="message-form"
+          hx-post="/campaigns/{{ campaign.id }}/message"
+          hx-on::after-request="this.reset(); startStream('{{ campaign.id }}')"
+          hx-swap="none">
+      <input type="hidden" name="thread_id" id="thread-id-input">
+      <textarea
+        name="message"
+        id="message-input"
+        rows="3"
+        placeholder="What do you do?"
+        required
+        autofocus></textarea>
+      <div class="input-form-footer">
+        <label class="ooc-toggle-label" title="Ask a real-world question about game state or rules instead of an in-fiction action — the DM answers plainly, no story wrapper.">
+          <input type="checkbox" id="ooc-toggle"> OOC (ask the DM directly)
+        </label>
+        <button type="submit" id="send-btn" class="btn-primary">Send</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ── character sheet panel ───────────────────────────────────── -->
+  <aside class="sz-sheet">
+    <div class="sz-sheet-header">
+      <h3>Character Sheet</h3>
+      <span class="sz-sheet-hint text-dim">Click a party member to inspect</span>
+    </div>
+    <div id="sheet-preview">
+      <p class="text-dim preview-empty">Select a party member to view their sheet.</p>
+    </div>
+  </aside>
+
+</div>
+
+<!-- ── campaign settings modal ─────────────────────────────────── -->
+<div id="campaign-modal" class="session-overlay hidden">
+  <div class="session-overlay-box campaign-modal-box">
+    <h2>Campaign</h2>
+
+    {% if campaign.books_in_play %}
+    <div class="sidebar-section">
+      <h4>Adventure Material</h4>
+      <ul class="books-list">
+        {% for slug in campaign.books_in_play %}
+        <li>{{ slug | replace("-", " ") | title }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {% if available_adventures %}
+    <div class="sidebar-section">
+      <h4>Add Material</h4>
+      <form method="post" action="/campaigns/{{ campaign.id }}/books" class="add-adventure-form">
+        <select name="adventure" class="adv-select">
+          {% for adv in available_adventures %}
+          <option value="{{ adv.slug }}">{{ adv.name }}{% if adv.levels %} (Lvl {{ adv.levels }}){% endif %}</option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="btn-ghost btn-sm">Add</button>
+      </form>
+    </div>
+    {% endif %}
+
+    <div class="sidebar-section safety-section">
+      <h4>Safety Tools</h4>
+      <p class="safety-hint">Flag anything the DM should steer away from — no explanation required.</p>
+      <div class="safety-controls">
+        <input type="text" id="safety-note-input" placeholder="What to avoid (optional)" maxlength="200">
+        <button class="btn-danger btn-sm" id="safety-flag-btn" onclick="pullSafetyFlag()">🛑 X-Card</button>
+      </div>
+      <p id="safety-confirm" class="safety-confirm hidden">Noted — the DM will steer away.</p>
+      {% if campaign.safety_flags %}
+      <div id="safety-active" class="safety-active">
+        <span class="safety-active-label">{{ campaign.safety_flags | length }} active flag(s)</span>
+        <button class="btn-ghost btn-sm" onclick="clearSafetyFlags()">Clear</button>
+      </div>
+      {% else %}
+      <div id="safety-active" class="safety-active hidden">
+        <span class="safety-active-label"></span>
+        <button class="btn-ghost btn-sm" onclick="clearSafetyFlags()">Clear</button>
+      </div>
+      {% endif %}
+    </div>
+
+    <button class="btn-ghost" onclick="closeCampaignModal()">Close</button>
+  </div>
+</div>
+
+<!-- ── session-end overlay ─────────────────────────────────────── -->
+<div id="session-overlay" class="session-overlay hidden">
+  <div class="session-overlay-box">
+    <h2>Session Ended</h2>
+    <p id="overlay-session-num"></p>
+    <div id="overlay-events" class="overlay-events"></div>
+    <p class="overlay-hint">The chronicle has been saved. A new session begins.</p>
+    <button class="btn-primary" onclick="closeOverlay()">Continue to Next Session</button>
+    <a id="overlay-history-link" href="#" class="btn-ghost">View Full Chronicle</a>
+  </div>
+</div>
+
+<script>
+  // ── thread_id management ──────────────────────────────────────────────────
+  // The server generates a fresh thread_id on every page load. We store it in
+  // sessionStorage so refreshes within the same tab reuse the same LangGraph
+  // thread. Closing the tab / ending the session clears it.
+
+  const CAMPAIGN_ID   = "{{ campaign.id }}";
+  const INITIAL_TID   = "{{ thread_id }}";
+  const STORAGE_KEY   = "thread_" + CAMPAIGN_ID;
+
+  // OOC marker the mechanics/narrator prompts recognize (see
+  // get_mechanics_system_prompt/get_narrator_system_prompt) — declared here,
+  // near the top, since hydrateMessages (called during initial page load)
+  // needs it too.
+  const OOC_MARKER = "[OOC] ";
+
+  let currentThreadId = sessionStorage.getItem(STORAGE_KEY) || INITIAL_TID;
+  sessionStorage.setItem(STORAGE_KEY, currentThreadId);
+  document.getElementById("thread-id-input").value = currentThreadId;
+
+  // Re-populate the chat panel from the persisted thread on load — a plain
+  // reload keeps the same thread_id (see above) so the conversation is still
+  // intact server-side, but nothing previously re-rendered it into the DOM,
+  // which made a reload look like the session had been wiped. If the thread
+  // has no turns yet (a genuinely new session), this is a no-op and the
+  // normal welcome/begin-adventure prompt stays as-is.
+  async function hydrateMessages() {
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/messages?thread_id=${encodeURIComponent(currentThreadId)}`);
+      if (!resp.ok) return;
+      const turns = await resp.json();
+      if (!turns.length) return;
+
+      const welcome = document.getElementById("welcome-message");
+      if (welcome) welcome.remove();
+
+      turns.forEach(t => {
+        if (t.role === "player") {
+          const isOoc = t.content.startsWith(OOC_MARKER);
+          const text = isOoc ? t.content.slice(OOC_MARKER.length) : t.content;
+          const prefix = isOoc ? `<span class="ooc-badge">OOC</span> ` : "";
+          appendMessage("player-message" + (isOoc ? " ooc-message" : ""), `<p>${prefix}${escapeHtml(text)}</p>`);
+        } else {
+          const div = appendMessage("dm-message", "");
+          renderDmParagraphs(div, t.content);
+          div.classList.toggle("ooc-message", t.content.trimStart().startsWith("🛈"));
+        }
+      });
+      document.getElementById("messages").scrollTop = 9999;
+    } catch (err) {
+      // Non-critical — on failure the welcome/begin prompt is a safe fallback.
+    }
+  }
+  hydrateMessages();
+  checkContextStatus();  // in case a reload lands on a thread already near the trim limit
+
+  // ── SSE streaming ─────────────────────────────────────────────────────────
+
+  let activeSource = null;
+
+  // Chat auto-scroll only "sticks" to the bottom while the user is already
+  // there. Without this check, every streamed token forcing scrollTop to the
+  // max fights any manual scroll-up mid-stream — the view snaps back down
+  // before the browser finishes the user's scroll gesture, which reads as
+  // the scrollbar vibrating in place rather than actually moving.
+  const SCROLL_PIN_THRESHOLD = 80;
+  function isPinnedToBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_PIN_THRESHOLD;
+  }
+
+  function appendMessage(cls, html) {
+    const msgs = document.getElementById("messages");
+    const pinned = isPinnedToBottom(msgs);
+    const div = document.createElement("div");
+    div.className = "message " + cls;
+    div.innerHTML = html;
+    msgs.appendChild(div);
+    if (pinned) msgs.scrollTop = msgs.scrollHeight;
+    return div;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // Renders accumulated raw DM text as separate <p> elements split on blank
+  // lines, so distinct beats (description, dialogue, a roll) read as
+  // paragraphs instead of one dense block. A paragraph starting with 🎲 (the
+  // narrator's roll-line marker) or 💰 (the loot-line marker — an item or
+  // currency change actually applied via a tool call — see
+  // get_narrator_system_prompt) gets its own visual treatment instead of
+  // blending into the prose around it.
+  function renderDmParagraphs(dmDiv, rawText) {
+    const paragraphs = rawText.split(/\n\s*\n/);
+    dmDiv.innerHTML = paragraphs.map(p => {
+      const trimmed = p.trimStart();
+      const isRoll = trimmed.startsWith("🎲");
+      const isLoot = trimmed.startsWith("💰");
+      const cls = isRoll ? "roll-line" : (isLoot ? "loot-line" : "");
+      const html = escapeHtml(p).replace(/\n/g, "<br>");
+      return `<p class="${cls}">${html}</p>`;
+    }).join("");
+  }
+
+  // Shown while the mechanics model works through its tool-calling loop —
+  // that phase is never streamed to the browser (only narrator tokens are),
+  // so without this the player just watches a blank bubble for however long
+  // that turn takes, which can be minutes for a multi-tool-call turn.
+  const THINKING_VERBS = [
+    "Pondering", "Weaving the tale", "Consulting the dice", "Envisioning the scene",
+    "Conjuring details", "Divining what happens next", "Scheming", "Dreaming up the moment",
+    "Plotting twists", "Reading the omens", "Summoning the scene", "Rolling behind the screen",
+  ];
+
+  function startThinking(p) {
+    let i = Math.floor(Math.random() * THINKING_VERBS.length);
+    p.textContent = THINKING_VERBS[i] + "…";
+    p.classList.add("thinking");
+    return setInterval(() => {
+      i = (i + 1) % THINKING_VERBS.length;
+      p.textContent = THINKING_VERBS[i] + "…";
+    }, 1800);
+  }
+
+  function clearStallDivs(divs) {
+    divs.forEach(d => d.remove());
+    divs.length = 0;
+  }
+
+  function startStream(campaignId) {
+    if (activeSource) { activeSource.close(); }
+
+    const sendBtn = document.getElementById("send-btn");
+    sendBtn.disabled = true;
+
+    const dmDiv = appendMessage("dm-message streaming", "<p></p>");
+    const p = dmDiv.querySelector("p");
+    let thinkingTimer = startThinking(p);
+    let rawText = "";
+    let stallDivs = [];
+
+    const url = `/campaigns/${campaignId}/stream?thread_id=${encodeURIComponent(currentThreadId)}`;
+    activeSource = new EventSource(url);
+
+    activeSource.addEventListener("token", e => {
+      if (thinkingTimer) {
+        clearInterval(thinkingTimer);
+        thinkingTimer = null;
+      }
+      clearStallDivs(stallDivs);
+      const msgs = document.getElementById("messages");
+      const pinned = isPinnedToBottom(msgs);
+      rawText += e.data;
+      renderDmParagraphs(dmDiv, rawText);
+      // 🛈 is the narrator's own marker for an OOC reply (see
+      // get_narrator_system_prompt) — style the whole bubble, not just one
+      // paragraph, since an OOC answer isn't in-fiction prose at all.
+      dmDiv.classList.toggle("ooc-message", rawText.trimStart().startsWith("🛈"));
+      if (pinned) msgs.scrollTop = msgs.scrollHeight;
+    });
+
+    activeSource.addEventListener("stall", e => {
+      // Purely informational — the underlying request is still live and may
+      // still resolve on its own, so we don't stop the thinking indicator or
+      // touch sendBtn here. See STALL_MESSAGE in dm_agent.py. The banner itself
+      // is cleared once real content actually arrives (see clearStallDivs
+      // calls in the token/done/error handlers) so it doesn't linger after
+      // the model recovers.
+      stallDivs.push(appendMessage("system-message stall-message", `<p>${e.data.replace(/\n/g, "<br>")}</p>`));
+    });
+
+    activeSource.addEventListener("done", () => {
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      clearStallDivs(stallDivs);
+      dmDiv.classList.remove("streaming");
+      activeSource.close();
+      activeSource = null;
+      sendBtn.disabled = false;
+      checkContextStatus();
+    });
+
+    activeSource.addEventListener("error", e => {
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      clearStallDivs(stallDivs);
+      dmDiv.classList.remove("streaming");
+      // e.data is only set for our own server-sent "error" event (see the
+      // except block around watch_for_stalls in main.py) — a native
+      // connection-drop error has no data, so fall back to a generic note.
+      appendMessage("system-message error-message", `<p>${e.data || "Connection lost. Please try sending your message again."}</p>`);
+      activeSource.close();
+      activeSource = null;
+      sendBtn.disabled = false;
+    });
+  }
+
+  // ── context-length warning ───────────────────────────────────────────────
+
+  async function checkContextStatus() {
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/thread-info?thread_id=${encodeURIComponent(currentThreadId)}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      document.getElementById("context-warning").classList.toggle("hidden", !data.near_limit);
+    } catch (err) {
+      // Non-critical — just skip the warning this turn.
+    }
+  }
+
+  // ── begin/continue the adventure ─────────────────────────────────────────
+
+  async function beginSession() {
+    const btn = document.getElementById("begin-session-btn");
+    btn.disabled = true;
+    btn.textContent = "Thinking…";
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/session/begin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `thread_id=${encodeURIComponent(currentThreadId)}`,
+      });
+      if (!resp.ok) {
+        alert("Failed to begin session — check the server logs.");
+        btn.disabled = false;
+        btn.textContent = "Begin the Adventure";
+        return;
+      }
+      const welcome = document.getElementById("welcome-message");
+      if (welcome) welcome.remove();
+      startStream(CAMPAIGN_ID);
+    } catch (err) {
+      alert("Error: " + err);
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById("begin-session-btn")?.addEventListener("click", beginSession);
+
+  // ── campaign settings modal ──────────────────────────────────────────────
+
+  function openCampaignModal() {
+    document.getElementById("campaign-modal").classList.remove("hidden");
+  }
+
+  function closeCampaignModal() {
+    document.getElementById("campaign-modal").classList.add("hidden");
+  }
+
+  function updateFlagIndicator(count) {
+    const btn = document.querySelector(".campaign-menu-btn");
+    let badge = btn.querySelector(".flag-indicator");
+    if (count > 0) {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "flag-indicator";
+        btn.appendChild(badge);
+      }
+      badge.textContent = count;
+    } else if (badge) {
+      badge.remove();
+    }
+  }
+
+  // ── character sheet panel ────────────────────────────────────────────────
+
+  function abilityRow(label, score, mod) {
+    const modStr = mod >= 0 ? `+${mod}` : `${mod}`;
+    return `<div class="preview-score">
+      <span class="score-abbr">${label}</span>
+      <span class="score-val">${score}</span>
+      <span class="score-mod">${modStr}</span>
+    </div>`;
+  }
+
+  function renderCharacterSheet(d) {
+    const ab = d.ability_scores || {};
+    const mods = {
+      strength: Math.floor((ab.strength - 10) / 2), dexterity: Math.floor((ab.dexterity - 10) / 2),
+      constitution: Math.floor((ab.constitution - 10) / 2), intelligence: Math.floor((ab.intelligence - 10) / 2),
+      wisdom: Math.floor((ab.wisdom - 10) / 2), charisma: Math.floor((ab.charisma - 10) / 2),
+    };
+
+    let html = `<div class="preview-identity">
+      <div class="preview-name">${d.name}${d.is_player_controlled === false ? ' <span class="char-companion-tag">DM companion</span>' : ''}</div>
+      <div class="preview-subtitle">${[d.race, [`${d.char_class} ${d.level}`, d.subclass].filter(Boolean).join(" / "), d.background, d.alignment].filter(Boolean).join(" · ")}</div>
+    </div>`;
+
+    html += `<div class="preview-section">
+      <div class="preview-label">Combat</div>
+      <div class="preview-value">
+        HP: ${d.current_hp}/${d.max_hp}${d.temp_hp ? ` (+${d.temp_hp} temp)` : ""}<br>
+        AC: ${d.ac} &middot; Speed: ${d.speed} ft &middot; Passive Perception: ${d.passive_perception}
+        ${d.conditions && d.conditions.length ? `<br>Conditions: ${d.conditions.join(", ")}` : ""}
+        ${d.exhaustion_level ? `<br>Exhaustion: ${d.exhaustion_level}` : ""}
+      </div>
+    </div>`;
+
+    html += `<div class="preview-scores">
+      ${abilityRow("STR", ab.strength, mods.strength)}
+      ${abilityRow("DEX", ab.dexterity, mods.dexterity)}
+      ${abilityRow("CON", ab.constitution, mods.constitution)}
+      ${abilityRow("INT", ab.intelligence, mods.intelligence)}
+      ${abilityRow("WIS", ab.wisdom, mods.wisdom)}
+      ${abilityRow("CHA", ab.charisma, mods.charisma)}
+    </div>`;
+
+    if (d.saving_throw_proficiencies && d.saving_throw_proficiencies.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Saving Throws</div>
+        <div class="preview-value">${d.saving_throw_proficiencies.join(", ")}</div>
+      </div>`;
+    }
+
+    if (d.skill_proficiencies && d.skill_proficiencies.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Skills</div>
+        <div class="preview-value">${d.skill_proficiencies.join(", ")}</div>
+      </div>`;
+    }
+
+    if (d.spell_slots && Object.keys(d.spell_slots).length) {
+      const slots = Object.entries(d.spell_slots)
+        .filter(([, s]) => s.max > 0)
+        .map(([lvl, s]) => `L${lvl}: ${s.max - s.used}/${s.max}`);
+      if (slots.length) {
+        html += `<div class="preview-section">
+          <div class="preview-label">Spell Slots</div>
+          <div class="preview-value">${slots.join(", ")}</div>
+        </div>`;
+      }
+    }
+    if (d.spells_known && d.spells_known.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Spells Known</div>
+        <div class="preview-value">${d.spells_known.map(s => s.name).join(", ")}</div>
+      </div>`;
+    }
+
+    if (d.attacks && d.attacks.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Attacks</div>
+        <div class="preview-value">${d.attacks.map(a =>
+          `${a.name} (${a.to_hit_bonus >= 0 ? "+" : ""}${a.to_hit_bonus} to hit, ${a.damage_dice} ${a.damage_type || ""})`
+        ).join("<br>")}</div>
+      </div>`;
+    }
+
+    if (d.inventory && d.inventory.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Inventory</div>
+        <div class="preview-value">${d.inventory.map(i => i.name + (i.quantity > 1 ? ` x${i.quantity}` : "")).join(", ")}</div>
+      </div>`;
+    }
+    if (d.currency) {
+      const c = d.currency;
+      const parts = [];
+      if (c.pp) parts.push(`${c.pp}pp`);
+      if (c.gp) parts.push(`${c.gp}gp`);
+      if (c.ep) parts.push(`${c.ep}ep`);
+      if (c.sp) parts.push(`${c.sp}sp`);
+      if (c.cp) parts.push(`${c.cp}cp`);
+      html += `<div class="preview-section">
+        <div class="preview-label">Currency</div>
+        <div class="preview-value">${parts.length ? parts.join(", ") : "0 gp"}</div>
+      </div>`;
+    }
+
+    if (d.features && d.features.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Features</div>
+        <div class="preview-value">${d.features.join(", ")}</div>
+      </div>`;
+    }
+
+    if (d.appearance) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Appearance</div>
+        <div class="preview-value">${d.appearance}</div>
+      </div>`;
+    }
+
+    const personality = [
+      ...(d.personality_traits || []).map(t => `<em>${t}</em>`),
+      ...(d.ideals || []).map(t => `Ideal: ${t}`),
+      ...(d.bonds || []).map(t => `Bond: ${t}`),
+      ...(d.flaws || []).map(t => `Flaw: ${t}`),
+    ];
+    if (personality.length) {
+      html += `<div class="preview-section">
+        <div class="preview-label">Personality</div>
+        <div class="preview-value">${personality.join("<br>")}</div>
+      </div>`;
+    }
+
+    return html;
+  }
+
+  async function loadCharacterSheet(charId) {
+    document.querySelectorAll(".party-member").forEach(li => li.classList.toggle("active", li.dataset.charId === charId));
+    const el = document.getElementById("sheet-preview");
+    el.innerHTML = `<p class="text-dim preview-empty">Loading…</p>`;
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/party/${charId}`);
+      if (!resp.ok) {
+        el.innerHTML = `<p class="text-dim preview-empty">Couldn't load that character.</p>`;
+        return;
+      }
+      const data = await resp.json();
+      el.innerHTML = renderCharacterSheet(data);
+    } catch (err) {
+      el.innerHTML = `<p class="text-dim preview-empty">Couldn't load that character.</p>`;
+    }
+  }
+
+  // OOC toggle: prepend the marker (declared near the top of this script)
+  // so the question is answered plainly instead of as an in-fiction action.
+  // htmx:configRequest is the right hook to edit outgoing params — by
+  // htmx:beforeRequest (used below) the request is already configured.
+  document.getElementById("message-form").addEventListener("htmx:configRequest", e => {
+    if (document.getElementById("ooc-toggle").checked) {
+      e.detail.parameters.message = OOC_MARKER + e.detail.parameters.message;
+    }
+  });
+
+  // Show the player message in the chat when the form submits. Sending a
+  // message is a deliberate re-engagement action, so always jump to the
+  // bottom here regardless of pin state — unlike incoming DM tokens, this
+  // isn't something arriving passively while the player is reading history.
+  document.getElementById("message-form").addEventListener("htmx:beforeRequest", () => {
+    const msg = document.getElementById("message-input").value.trim();
+    const oocToggle = document.getElementById("ooc-toggle");
+    if (msg) {
+      const cls = "player-message" + (oocToggle.checked ? " ooc-message" : "");
+      const prefix = oocToggle.checked ? `<span class="ooc-badge">OOC</span> ` : "";
+      appendMessage(cls, `<p>${prefix}${msg.replace(/</g,"&lt;")}</p>`);
+      const msgs = document.getElementById("messages");
+      msgs.scrollTop = msgs.scrollHeight;
+    }
+    oocToggle.checked = false;  // don't let it silently stick to the next, real action
+  });
+
+  // Ctrl+Enter / Cmd+Enter to submit.
+  document.getElementById("message-input").addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      document.getElementById("message-form").requestSubmit();
+    }
+  });
+
+  // ── rest buttons ──────────────────────────────────────────────────────────
+  // Deterministic, whole-party actions — no LLM call, so they're instant and
+  // can't hallucinate (see apply_long_rest/apply_short_rest). Page reload
+  // afterward is the simplest way to reflect the new HP/slots/clock
+  // everywhere (sidebar, character sheet panel) without hand-syncing state.
+
+  async function takeRest(kind) {
+    const shortBtn = document.getElementById("short-rest-btn");
+    const longBtn = document.getElementById("long-rest-btn");
+    const result = document.getElementById("rest-result");
+    shortBtn.disabled = true;
+    longBtn.disabled = true;
+    result.textContent = kind === "long" ? "Resting (8 hours)…" : "Resting (1 hour)…";
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/rest/${kind}`, { method: "POST" });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "Request failed");
+      result.textContent = data.summary;
+      setTimeout(() => location.reload(), 1800);
+    } catch (err) {
+      result.textContent = "Error: " + err.message;
+      shortBtn.disabled = false;
+      longBtn.disabled = false;
+    }
+  }
+  document.getElementById("short-rest-btn").addEventListener("click", () => takeRest("short"));
+  document.getElementById("long-rest-btn").addEventListener("click", () => takeRest("long"));
+
+  // ── session end ───────────────────────────────────────────────────────────
+
+  async function endSession() {
+    const btn = document.getElementById("end-session-btn");
+    btn.disabled = true;
+    btn.textContent = "Summarising…";
+
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/session/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `thread_id=${encodeURIComponent(currentThreadId)}`,
+      });
+
+      if (!resp.ok) {
+        alert("Failed to end session — check the server logs.");
+        btn.disabled = false;
+        btn.textContent = "End Session";
+        return;
+      }
+
+      const data = await resp.json();
+
+      // Switch to the new thread.
+      currentThreadId = data.new_thread_id;
+      sessionStorage.setItem(STORAGE_KEY, currentThreadId);
+      document.getElementById("thread-id-input").value = currentThreadId;
+
+      // Show overlay.
+      document.getElementById("overlay-session-num").textContent =
+        `Session ${data.session_number} complete`;
+
+      const eventsEl = document.getElementById("overlay-events");
+      eventsEl.innerHTML = "";
+      if (data.key_events && data.key_events.length) {
+        const ul = document.createElement("ul");
+        data.key_events.forEach(ev => {
+          const li = document.createElement("li");
+          li.textContent = ev;
+          ul.appendChild(li);
+        });
+        eventsEl.appendChild(ul);
+      }
+
+      const link = document.getElementById("overlay-history-link");
+      link.href = `/campaigns/${CAMPAIGN_ID}/sessions/${data.session_id}`;
+
+      document.getElementById("session-overlay").classList.remove("hidden");
+
+    } catch (err) {
+      alert("Error ending session: " + err);
+      btn.disabled = false;
+      btn.textContent = "End Session";
+    }
+  }
+
+  // ── safety tools (X-card) ────────────────────────────────────────────────
+
+  async function pullSafetyFlag() {
+    const btn = document.getElementById("safety-flag-btn");
+    const input = document.getElementById("safety-note-input");
+    btn.disabled = true;
+
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/safety-flag`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `note=${encodeURIComponent(input.value.trim())}`,
+      });
+      if (!resp.ok) { alert("Failed to flag — check the server logs."); return; }
+      const data = await resp.json();
+
+      input.value = "";
+      const confirmEl = document.getElementById("safety-confirm");
+      confirmEl.classList.remove("hidden");
+      setTimeout(() => confirmEl.classList.add("hidden"), 4000);
+
+      const active = document.getElementById("safety-active");
+      active.classList.remove("hidden");
+      active.querySelector(".safety-active-label").textContent =
+        `${data.active_flags.length} active flag(s)`;
+      updateFlagIndicator(data.active_flags.length);
+    } catch (err) {
+      alert("Error flagging: " + err);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function clearSafetyFlags() {
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/safety-flag/clear`, { method: "POST" });
+      if (!resp.ok) { alert("Failed to clear flags — check the server logs."); return; }
+      document.getElementById("safety-active").classList.add("hidden");
+      updateFlagIndicator(0);
+    } catch (err) {
+      alert("Error clearing flags: " + err);
+    }
+  }
+
+  function closeOverlay() {
+    document.getElementById("session-overlay").classList.add("hidden");
+    document.getElementById("context-warning").classList.add("hidden");
+    // Reset the chat window for the new session — same begin/continue button
+    // as a fresh page load, wired up again since the whole node is replaced.
+    const msgs = document.getElementById("messages");
+    msgs.innerHTML = `<div class="message dm-message welcome" id="welcome-message">
+      <p>Welcome back to <strong>{{ campaign.name }}</strong>.</p>
+      <button type="button" id="begin-session-btn" class="btn-primary btn-sm">Continue the Adventure</button>
+    </div>`;
+    document.getElementById("begin-session-btn").addEventListener("click", beginSession);
+    // Update label
+    const label = document.getElementById("session-label");
+    if (label) {
+      const prev = parseInt(label.textContent.replace(/\D/g, "")) || 1;
+      label.textContent = "Session " + (prev + 1);
+    }
+    const btn = document.getElementById("end-session-btn");
+    btn.disabled = false;
+    btn.textContent = "End Session";
+  }
+</script>
+{% endblock %}

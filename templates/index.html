@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Campaigns — D&D DM{% endblock %}
+
+{% block content %}
+<div class="page-index">
+  <h1>Your Campaigns</h1>
+
+  <section class="campaign-list">
+    {% if campaigns %}
+      {% for c in campaigns %}
+      <div class="campaign-card">
+        <a href="/campaigns/{{ c.id }}" class="campaign-name">{{ c.name }}</a>
+        <span class="campaign-date">{{ c.created_at }}</span>
+        <button class="btn-danger btn-sm"
+                hx-delete="/campaigns/{{ c.id }}"
+                hx-confirm="Delete '{{ c.name }}'? This cannot be undone."
+                hx-target="body"
+                hx-push-url="/">
+          Delete
+        </button>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="empty">No campaigns yet. Create one below.</p>
+    {% endif %}
+  </section>
+
+  <section class="new-campaign">
+    <h2>New Campaign</h2>
+    <form method="post" action="/campaigns">
+      <div class="field">
+        <label for="name">Campaign name</label>
+        <input id="name" name="name" type="text" required placeholder="The Lost Mines of Phandelver">
+      </div>
+      <div class="field">
+        <label for="setting">Setting <span class="optional">(optional)</span></label>
+        <input id="setting" name="setting" type="text" placeholder="Forgotten Realms, 1492 DR">
+      </div>
+
+      {% if adventures %}
+      <div class="field">
+        <label>Adventure material <span class="optional">(select all that apply — core rulebooks always included)</span></label>
+        <div class="adventure-picker">
+          {% for adv in adventures %}
+          <label class="adventure-option">
+            <input type="checkbox" name="adventures" value="{{ adv.slug }}">
+            <span class="adv-name">{{ adv.name }}</span>
+            {% if adv.levels or adv.recommended_players %}
+            <span class="adv-levels">
+              {%- if adv.levels %}Levels {{ adv.levels }}{% endif -%}
+              {%- if adv.levels and adv.recommended_players %} · {% endif -%}
+              {%- if adv.recommended_players %}{{ adv.recommended_players }} players{% endif -%}
+            </span>
+            {% endif %}
+            {% if adv.description %}<span class="adv-desc">{{ adv.description }}</span>{% endif %}
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      <button type="submit" class="btn-primary">Create Campaign</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

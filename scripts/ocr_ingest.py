@@ -105,7 +105,14 @@ def _extract_with_mineru(pdf_path: Path, out_path: Path, first: int, last: int, 
     # PATH — invoking this script via a venv's python (e.g. .venv/bin/python
     # scripts/ocr_ingest.py) does not put that venv's bin/ on PATH, so a bare
     # "mineru" lookup fails even though it's installed right next to it.
-    mineru_bin = Path(sys.executable).parent / "mineru"
+    # Reuse sys.executable's own suffix (".exe" on Windows, "" on Mac/Linux)
+    # rather than hardcoding one — confirmed live that the un-suffixed guess
+    # silently failed on Windows (pip installs console scripts as
+    # "mineru.exe" there, not bare "mineru"), producing a WinError 2 from
+    # subprocess.run once it fell through to the PATH-lookup fallback too
+    # (the venv's Scripts/ dir isn't on PATH unless the venv is activated).
+    interpreter_suffix = Path(sys.executable).suffix
+    mineru_bin = Path(sys.executable).parent / f"mineru{interpreter_suffix}"
     if not mineru_bin.exists():
         mineru_bin = Path("mineru")  # fall back to PATH lookup
 

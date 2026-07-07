@@ -42,6 +42,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Windows' default console codec (cp1252/"charmap") can't encode the em-dashes/
+# box-drawing/arrow characters this script prints for readability — confirmed
+# live as a real UnicodeEncodeError crash on a fresh Windows venv (Mac/Linux
+# default to UTF-8 stdout so this never surfaced there). errors="replace"
+# rather than "strict" so a genuinely unencodable character degrades to "?"
+# instead of crashing an otherwise-successful book mid-run.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import fitz  # PyMuPDF — only used here for page counts, not extraction
 
 DEFAULT_INPUT  = "docs/raw"

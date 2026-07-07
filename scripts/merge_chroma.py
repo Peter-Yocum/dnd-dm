@@ -27,6 +27,12 @@ import argparse
 import sys
 from pathlib import Path
 
+# Windows' default console codec (cp1252/"charmap") can't encode the em-dashes
+# this script prints for readability — see ocr_ingest.py's identical fix for
+# the confirmed-live crash this avoids.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.config import settings

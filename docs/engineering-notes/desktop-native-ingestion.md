@@ -21,34 +21,47 @@ both directions:
   `_entities.json`/`_entities/*.json` registries, `data/chroma_db/`, and
   `data/bm25_rules.pkl` need to come back — see "Syncing back," below.
 
-## One-time desktop setup
+## One-time desktop setup (Windows / PowerShell, no `make`)
 
-1. `git clone`/checkout the repo (gets Makefile, scripts, requirements.txt).
-2. Copy the PDFs you want processed into `docs/raw/` on the desktop (any
+The desktop has no `make` available (and no virtualization, so no Docker
+either — everything below is plain PowerShell + a native Python venv). The
+Makefile targets mentioned later in this doc (`merge-chroma`,
+`load-lore-json`) run on the **laptop** (Mac, which has `make`) — this
+section is desktop-only and deliberately spells out raw commands instead.
+
+1. `git clone`/checkout the repo (gets Makefile, scripts, requirements.txt —
+   `make` isn't needed to just have the files, only to *run* targets).
+2. Copy the PDFs you want processed into `docs\raw\` on the desktop (any
    subset — you don't need the whole library at once).
-3. **Python venv** (cross-platform target, works on Windows too):
-   ```
-   make setup-venv
+3. **Python venv:**
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
    Installs the exact same `requirements.txt` the Docker image uses —
    everything `build_index.py`/`extract_entities.py`/`merge_chroma.py`/
    `load_lore_json.py` need. This is a completely separate install from OCR.
+   (If a later Mac/Linux machine ever does this instead, `make setup-venv`
+   is the equivalent one-liner there, since `make` exists on those.)
 4. **OCR (MinerU) — separate install, platform-specific backend.** On the
    laptop this uses MinerU's `mlx-engine` (Apple Silicon/Metal). On an Nvidia
    desktop it needs MinerU's CUDA path instead:
-   ```
-   .venv/Scripts/pip install -U "mineru[all]"     # Windows
-   ./.venv/bin/pip install -U "mineru[all]"       # Linux
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -U "mineru[all]"
    ```
    **I haven't verified this on real CUDA hardware** (this was built/tested
    on the Apple Silicon laptop only) — the analogous check to the laptop's
    `_select_mac_engine()` would be confirming `mineru`/the underlying `torch`
-   install actually detects the 3080 Ti (`python -c "import torch;
-   print(torch.cuda.is_available())"` should print `True`; if it prints
-   `False`, you have a CPU-only torch wheel installed and need the CUDA
-   build from pytorch.org matching your CUDA version first). Do this check
-   — and a small one-page OCR smoke test — before trusting it for a
-   real overnight run, same discipline as the laptop's own MLX verification.
+   install actually detects the 3080 Ti:
+   ```powershell
+   .\.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+   ```
+   Should print `True`; if it prints `False`, you have a CPU-only torch
+   wheel installed and need the CUDA build from pytorch.org matching your
+   CUDA version first. Do this check — and a small one-page OCR smoke test
+   (`--pages 1`) — before trusting it for a real overnight run, same
+   discipline as the laptop's own MLX verification.
 5. **Ollama, with a model that fits 12GB VRAM.** The app's default
    (`settings.mechanics_model`, `gemma4:26b-mlx`) is a non-starter here twice
    over: it's ~26B (won't fit 12GB even quantized) and it's in MLX format,
@@ -72,28 +85,39 @@ both directions:
    ollama pull gemma4:e4b
    ```
 
-## Running ingestion
+## Running ingestion (PowerShell)
 
 No Postgres needed on this machine at all — `build_index.py` never touches
-it, and `extract_entities.py` defaults to JSON-only here (see below).
+it, and plain `extract_entities.py` (no `--write-postgres`) writes only its
+JSON registry.
 
+Each book is OCR, then reindex, then extract — three separate commands
+(the `make ingest-book-native` target on a `make`-capable machine bundles
+the last two; here they're just spelled out):
+
+```powershell
+# 1. OCR (once per book — skips already-OCR'd books unless --force)
+.\.venv\Scripts\python.exe scripts\ocr_ingest.py --file "docs\raw\done\D&D 5E - Dungeon Master's Guide.pdf" --output docs\source\core
+
+# 2. Reindex (contextualize + embed + BM25)
+.\.venv\Scripts\python.exe scripts\build_index.py --book "D&D 5E - Dungeon Master's Guide" --source-type core --context-model gemma4:e4b
+
+# 3. Extract lore/monsters (JSON only — no --write-postgres, no Postgres on this machine)
+.\.venv\Scripts\python.exe scripts\extract_entities.py --book "D&D 5E - Dungeon Master's Guide" --source-type core --model gemma4:e4b
 ```
-make ingest-book-native adventure="Curse of Strahd" context_model=gemma4:e4b model=gemma4:e4b
-make ingest-book-native book="D&D 5E - Dungeon Master's Guide" source_type=core context_model=gemma4:e4b model=gemma4:e4b
-make ingest-book-native book="D&D 5E - Volo's Guide to Monsters" source_type=core kinds=monster context_model=gemma4:e4b model=gemma4:e4b
-```
 
-Same resumability guarantees as the Docker version (both scripts are
-identical — only the runner differs): OCR-side chunking/checkpointing is in
-`ocr_ingest.py` itself (run that separately first, same as on the laptop —
-`ingest-book-native` starts from already-OCR'd `docs/source/`), and
-`build_index.py`/`extract_entities.py`'s own per-batch/per-entity
-checkpointing is unchanged.
+For an adventure instead of a core book, swap `--book "..." --source-type core`
+for `--adventure "Curse of Strahd"` on the `build_index.py` call, and
+`--book "Curse of Strahd"` (default `--source-type adventure`) on
+`extract_entities.py`. For the Monster Manual specifically, add
+`--kinds monster` to the `extract_entities.py` call (see
+`nightly-ingestion-commands.md` for why).
 
-`extract_entities.py` writes to Postgres only if you explicitly pass
-`write_postgres=1` (and have a native Postgres reachable — not set up by
-anything in this doc, since it's simpler to just sync the JSON back and load
-it on the laptop instead — see next section).
+Same resumability guarantees as the Docker version (identical scripts, only
+the runner differs): `ocr_ingest.py`'s own per-window chunking/checkpointing,
+and `build_index.py`/`extract_entities.py`'s per-batch/per-entity
+checkpointing, are all unchanged — safe to Ctrl-C and re-run any of the
+three commands above.
 
 ## Syncing back to the laptop
 

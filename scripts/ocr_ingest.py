@@ -68,12 +68,15 @@ def _partial_path(out_path: Path) -> Path:
     return out_path.with_suffix(out_path.suffix + ".partial")
 
 
-def _run_mineru_range(mineru_bin: Path, pdf_path: Path, first: int, last: int) -> str:
-    """Run MinerU's vlm-engine over pages [first, last) (0-based, half-open)
-    and return the resulting markdown text for just that range. MinerU
-    writes into its own <stem>/vlm/<stem>.md layout (plus images/ and
-    various json sidecars) inside a scratch directory; only the final .md's
-    text is kept. Raises CalledProcessError on failure."""
+DEFAULT_MINERU_BACKEND = "vlm-engine"
+
+
+def _run_mineru_range(mineru_bin: Path, pdf_path: Path, first: int, last: int, backend: str) -> str:
+    """Run MinerU over pages [first, last) (0-based, half-open) and return
+    the resulting markdown text for just that range. MinerU writes into its
+    own <stem>/vlm/<stem>.md layout (plus images/ and various json sidecars)
+    inside a scratch directory; only the final .md's text is kept. Raises
+    CalledProcessError on failure."""
     with tempfile.TemporaryDirectory() as scratch:
         subprocess.run(
             [
@@ -82,7 +85,7 @@ def _run_mineru_range(mineru_bin: Path, pdf_path: Path, first: int, last: int) -
                 "-o", scratch,
                 "-s", str(first),
                 "-e", str(last - 1),
-                "-b", "vlm-engine",
+                "-b", backend,
             ],
             check=True,
         )
@@ -90,7 +93,10 @@ def _run_mineru_range(mineru_bin: Path, pdf_path: Path, first: int, last: int) -
         return produced.read_text(encoding="utf-8")
 
 
-def _extract_with_mineru(pdf_path: Path, out_path: Path, first: int, last: int, force: bool) -> int:
+def _extract_with_mineru(
+    pdf_path: Path, out_path: Path, first: int, last: int, force: bool,
+    backend: str = DEFAULT_MINERU_BACKEND,
+) -> int:
     """Run MinerU over pages [first, last) (0-based, half-open) in
     <= _CHUNK_PAGES windows, checkpointing each window's raw text to a cache
     dir next to out_path before concatenating everything into out_path.
@@ -130,7 +136,7 @@ def _extract_with_mineru(pdf_path: Path, out_path: Path, first: int, last: int, 
             print(f"    pages {pos + 1}-{chunk_end}: cached, skipping")
         else:
             print(f"    pages {pos + 1}-{chunk_end}: extracting...")
-            text = _run_mineru_range(mineru_bin, pdf_path, pos, chunk_end)
+            text = _run_mineru_range(mineru_bin, pdf_path, pos, chunk_end, backend)
             chunk_partial = _partial_path(chunk_path)
             chunk_partial.write_text(text, encoding="utf-8")
             chunk_partial.replace(chunk_path)
@@ -154,6 +160,16 @@ def main() -> None:
     ap.add_argument("--pages",      type=int, default=None, help="max pages to process (default: all)")
     ap.add_argument("--start-page", type=int, default=1,    help="1-based page to start from (default: 1)")
     ap.add_argument("--force",      action="store_true",    help="re-process even if .md already exists")
+    ap.add_argument("--mineru-backend", default=DEFAULT_MINERU_BACKEND,
+                     help=f"MinerU -b/--backend value (default: {DEFAULT_MINERU_BACKEND}). This isn't "
+                          "stable across MinerU versions/platforms — confirmed live that a fresh "
+                          "`pip install -U \"mineru[all]\"` on Windows resolved a newer MinerU release "
+                          "whose valid choices are pipeline/vlm-http-client/hybrid-http-client/"
+                          "vlm-auto-engine/hybrid-auto-engine (no bare \"vlm-engine\"/\"hybrid-engine\" "
+                          "at all), while this project's Mac install (3.4.2) only has the un-\"auto\" "
+                          "names. Run `mineru --help` and check the -b/--backend line's valid-choices "
+                          "list if you hit 'invalid value for -b' — pass whichever local-compute engine "
+                          "name it actually lists (e.g. --mineru-backend vlm-auto-engine).")
     args = ap.parse_args()
 
     in_dir   = Path(args.input)
@@ -192,7 +208,7 @@ def main() -> None:
         print(f"── {pdf.name}  ({total} pages, converting {last - first}) ──")
 
         try:
-            chars = _extract_with_mineru(pdf, out_path, first, last, args.force)
+            chars = _extract_with_mineru(pdf, out_path, first, last, args.force, args.mineru_backend)
         except subprocess.CalledProcessError as e:
             print(f"  FAILED: mineru exited with code {e.returncode}", file=sys.stderr)
             had_failure = True

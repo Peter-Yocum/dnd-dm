@@ -95,9 +95,16 @@ Each book is OCR, then reindex, then extract — three separate commands
 (the `make ingest-book-native` target on a `make`-capable machine bundles
 the last two; here they're just spelled out):
 
+**Known Windows quirk, confirmed live:** a fresh `pip install -U "mineru[all]"`
+on Windows can resolve a newer MinerU release than the Mac's (3.4.2) — its
+`-b`/`--backend` flag has different valid choices (`vlm-auto-engine`/
+`hybrid-auto-engine` instead of `vlm-engine`/`hybrid-engine`). If OCR fails
+with `invalid value for -b`, run `mineru --help`, check the `-b` line's
+actual choices, and pass the right one via `--mineru-backend`:
+
 ```powershell
 # 1. OCR (once per book — skips already-OCR'd books unless --force)
-.\.venv\Scripts\python.exe scripts\ocr_ingest.py --file "docs\raw\done\D&D 5E - Dungeon Master's Guide.pdf" --output docs\source\core
+.\.venv\Scripts\python.exe scripts\ocr_ingest.py --file "docs\raw\done\D&D 5E - Dungeon Master's Guide.pdf" --output docs\source\core --mineru-backend vlm-auto-engine
 
 # 2. Reindex (contextualize + embed + BM25)
 .\.venv\Scripts\python.exe scripts\build_index.py --book "D&D 5E - Dungeon Master's Guide" --source-type core --context-model gemma4:e4b

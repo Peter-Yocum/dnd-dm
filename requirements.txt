@@ -74,6 +74,7 @@ multidict==6.7.1
 nbclient==0.11.0
 nbconvert==7.17.1
 nbformat==5.10.4
+networkx==3.4.2
 numpy==2.5.0
 oauthlib==3.3.1
 ollama==0.6.2
@@ -113,6 +114,8 @@ python-dotenv==1.2.2
 python-multipart==0.0.32
 PyYAML==6.0.3
 pyzmq==27.1.0
+rank-bm25==0.2.2
+rapidfuzz==3.10.1
 referencing==0.37.0
 requests==2.34.2
 requests-oauthlib==2.0.0
@@ -129,9 +132,16 @@ stack-data==0.6.3
 starlette==1.3.1
 tenacity==9.1.4
 tinycss2==1.5.1
+# Re-added — the earlier removal comment here was wrong. Verified live via
+# `pip show tokenizers`: chromadb itself requires tokenizers>=0.13.2 (not a
+# leftover from the old sentence-transformers/torch chain that was removed
+# elsewhere in this file); pip installs it either way, pinning it here just
+# keeps it reproducible instead of resolving to whatever's newest at install time.
 tokenizers==0.23.1
 tornado==6.5.7
 tqdm==4.68.3
+# tqdm already present above (pulled in transitively) — used directly now by
+# build_index.py/extract_entities.py for a real progress bar on long ingest jobs
 traitlets==5.15.1
 typer==0.25.1
 typing-inspection==0.4.2

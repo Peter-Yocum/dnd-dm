@@ -5,6 +5,7 @@ from backend.models import (
     Encounter, InitiativeEntry, Monster, MonsterSize, MonsterType, ZoneType,
 )
 from backend.stores.campaign_store import CampaignStore
+from backend.stores.lore_store import LoreStore
 from backend.tools._helpers import (
     advance_combatant_turn, apply_damage_to_monster, find_char, find_monster,
     monster_summary, roll_notation,
@@ -48,7 +49,12 @@ def build_encounter_context(campaign: Campaign) -> str | None:
     return "\n".join(lines)
 
 
-def make_tools(campaign_id: str, store: CampaignStore) -> list:
+def make_tools(
+    campaign_id: str,
+    store: CampaignStore,
+    lore_store: LoreStore | None = None,
+    books_in_play: list[str] | None = None,
+) -> list:
 
     @tool
     async def create_monster(
@@ -65,11 +71,15 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
     ) -> str:
         """Create a monster stat block and add it to the campaign, so it can
         actually take damage in combat via resolve_attack/update_monster_hp. Call
-        this for every new opponent BEFORE start_encounter — search_rules first for
-        the real Monster Manual stat block (AC, HP, attacks) and pass those
-        grounded numbers here; never invent them. If a monster has no indexed
-        stat block (homebrew, an adventure-unique creature), it's fine to
-        author reasonable numbers — just be prepared to say so is a DM
+        this for every new opponent BEFORE start_encounter — pass your best
+        AC/HP/attacks estimate; if this name matches a canonical stat block in
+        the precomputed Lore Registry (Monster Manual, Volo's, Mordenkainen's,
+        Tasha's — see scripts/extract_entities.py --source-type core), those
+        EXACT numbers silently override whatever you passed, so you don't need
+        to get every digit right yourself — just get the name right. If no
+        canonical entry exists (homebrew, an adventure-unique creature), your
+        passed numbers are used as-is — search_rules first for a real stat
+        block when one might exist, and be prepared to say so is a DM
         improvisation if asked, same as an ungrounded rules ruling.
 
         count: create this many identical copies in one call (e.g. 3 goblins),
@@ -90,6 +100,21 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         collisions = [n for n in names if n.lower() in existing_lower]
         if collisions:
             return f"A monster named '{collisions[0]}' already exists — use a different name (e.g. '{name} 2')."
+
+        canon_note = ""
+        if lore_store is not None:
+            canon = await lore_store.find_by_name_or_alias(books_in_play or [], name, entity_type="monster")
+            if canon:
+                profile = canon.rolled_up_profile
+                if profile.get("ac"):
+                    ac = int(profile["ac"])
+                if profile.get("hp"):
+                    max_hp = int(profile["hp"])
+                if profile.get("challenge_rating"):
+                    cr = str(profile["challenge_rating"])
+                if profile.get("attacks"):
+                    attacks = profile["attacks"]
+                canon_note = f" [canonical stats from '{canon.book_slug}']"
 
         try:
             size_enum = MonsterSize(size.lower())
@@ -131,7 +156,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
             campaign.monsters.append(monster)
             created.append(monster)
         await store.save(campaign)
-        return f"{', '.join(m.name for m in created)} created (AC {ac}, {max_hp} HP, CR {cr})."
+        return f"{', '.join(m.name for m in created)} created (AC {ac}, {max_hp} HP, CR {cr}){canon_note}."
 
     @tool
     async def start_encounter(

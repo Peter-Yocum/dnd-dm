@@ -278,7 +278,20 @@ class SpellSlotLevel(BaseModel):
         return self.max - self.used
 
 
-class Item(BaseModel):
+class LoreLinked(BaseModel):
+    """Shared registry-provenance fields for any entity that can be traced
+    back to a precomputed canon Lore Registry entry (see
+    scripts/extract_entities.py / backend/stores/lore_store.py). A live
+    campaign entity's lore_entity_id is set once at creation/backfill time
+    and never silently re-synced afterward — the point of these fields is
+    provenance, not a live mirror of canon."""
+    lore_entity_id: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    source_chunk_ids: list[str] = Field(default_factory=list)
+    spoiler_tier: str = "public"   # "public" | "player_discovered" | "dm_only"
+
+
+class Item(LoreLinked):
     id: str = Field(default_factory=lambda: uuid4().hex)
     name: str
     quantity: int = 1
@@ -289,6 +302,8 @@ class Item(BaseModel):
     requires_attunement: bool = False
     attuned_to: str | None = None
     notes: str = ""
+    item_type: str = "misc"   # "weapon" | "armor" | "wondrous" | "consumable" | "quest" | "misc"
+    rarity: str = ""          # "" (mundane) | "common".."legendary"/"artifact"
 
 
 class SpellResolutionType(str, Enum):
@@ -493,7 +508,7 @@ class Relationship(BaseModel):
     description: str   # "old rivals", "owes a debt to", "sister of"
 
 
-class NPC(BaseModel):
+class NPC(LoreLinked):
     id: str = Field(default_factory=lambda: uuid4().hex)
 
     # Identity
@@ -647,6 +662,14 @@ class Session(BaseModel):
     real_date: date | None = None
     summary: str = ""
     key_events: list[str] = Field(default_factory=list)
+    # Free-text: what part of the adventure module (chapter/section if known,
+    # else a plain description of the current story beat) this session's
+    # events leave the party at — used to re-ground the next session's
+    # kickoff via a fresh search_rules query instead of relying only on the
+    # narrative chronicle. Empty for sessions recorded before this field
+    # existed; build_session_kickoff_message treats that as "nothing to
+    # re-ground on" rather than an error.
+    adventure_progress: str = ""
     xp_awarded: int = 0
     loot_gained: list[Item] = Field(default_factory=list)
     quests_started: list[str] = Field(default_factory=list)    # quest IDs
@@ -672,7 +695,7 @@ class LocationConnection(BaseModel):
     notes: str = ""
 
 
-class Location(BaseModel):
+class Location(LoreLinked):
     id: str = Field(default_factory=lambda: uuid4().hex)
     name: str
     description: str = ""

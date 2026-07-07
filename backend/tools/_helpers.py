@@ -34,7 +34,20 @@ def read_adventure_meta(slug: str) -> dict:
     for "the adventure's opening" was tested live and found unreliable
     (surfaced the wrong section for several adventures, e.g. Icewind Dale,
     Ghosts of Saltmarsh), so a curated field beats an auto-retrieved one for
-    this specific purpose."""
+    this specific purpose.
+
+    opening_location / opening_section_marker (added 2026-07-05): same
+    "hand-curate what RAG proved unreliable for" precedent as opening_hook,
+    one level deeper — world_prep.py's opening-scene NPC/site-detail seeding
+    needs the exact name of the starting location (opening_location, e.g.
+    "Velkynvelve") and the exact `## Chapter N: <title>` heading marking
+    where the opening chapter begins in the source markdown
+    (opening_section_marker, e.g. "## Chapter 1: Prisoners of the Drow") so
+    it can deterministically extract the whole chapter — a name-proximity
+    search (semantic or literal) was confirmed to miss most of a roster
+    whose entries don't repeat the location's own name nearby. Both default
+    to "" for any adventure without this curation yet; world_prep.py treats
+    that as "skip this phase," not an error."""
     meta_file = ADVENTURES_DIR / slug / "_meta.json"
     if meta_file.exists():
         meta = json.loads(meta_file.read_text())
@@ -46,6 +59,8 @@ def read_adventure_meta(slug: str) -> dict:
         "levels": meta.get("levels", ""),
         "recommended_players": meta.get("recommended_players", ""),
         "opening_hook": meta.get("opening_hook", ""),
+        "opening_location": meta.get("opening_location", ""),
+        "opening_section_marker": meta.get("opening_section_marker", ""),
     }
 
 
@@ -82,6 +97,41 @@ def find_container(campaign: Campaign, name: str) -> Container | None:
 def find_connection(loc: Location, destination_name: str) -> LocationConnection | None:
     n = destination_name.lower()
     return next((c for c in loc.connections if c.to_location_name.lower() == n), None)
+
+
+def find_item_anywhere(campaign: Campaign, name: str) -> tuple[Item, str] | None:
+    """Search every Item-holding place in the campaign — Character.inventory,
+    NPC.inventory, Container.contents — for an exact (case-insensitive) name
+    match. Returns (item, holder_description) or None. Unlike find_char/
+    find_npc/etc., items aren't a single top-level campaign list, so this
+    checks all three holder types rather than one."""
+    n = name.lower()
+    for char in campaign.party:
+        for item in char.inventory:
+            if item.name.lower() == n:
+                return item, f"{char.name}'s inventory"
+    for npc in campaign.npcs:
+        for item in npc.inventory:
+            if item.name.lower() == n:
+                return item, f"{npc.name}'s inventory"
+    for container in campaign.containers:
+        for item in container.contents:
+            if item.name.lower() == n:
+                return item, f"container '{container.name}'"
+    return None
+
+
+def all_campaign_item_names(campaign: Campaign) -> list[str]:
+    """All item names currently held anywhere in the campaign — used for
+    fuzzy dedup blocking before creating a new item."""
+    names = []
+    for char in campaign.party:
+        names += [i.name for i in char.inventory]
+    for npc in campaign.npcs:
+        names += [i.name for i in npc.inventory]
+    for container in campaign.containers:
+        names += [i.name for i in container.contents]
+    return names
 
 
 _OPPOSITES = {

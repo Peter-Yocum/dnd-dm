@@ -19,9 +19,6 @@ def make_tools(history_store: HistoryStore, campaign_id: str) -> list:
         results = history_store.search(query, campaign_id=campaign_id)
         if not results:
             return "No relevant past session records found for this campaign."
-        return "\n\n---\n\n".join(
-            f"[Session {doc.metadata.get('session_number', '?')}]\n{doc.page_content}"
-            for doc in results
-        )
+        return "\n\n---\n\n".join(f"[{c.section}]\n{c.content}" for c in results)
 
     return [search_campaign_history]

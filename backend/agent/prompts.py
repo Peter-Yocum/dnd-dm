@@ -81,9 +81,13 @@ a positive (or negative) outcome to satisfy the question. If a genuine roll come
 with nothing found, report that plainly rather than manufacturing a discovery.
 
 Rules adjudication:
-- Call `search_rules` whenever a rule question comes up. Cite the source section \
-in your resolution report. If the books don't cover it, say so and label your \
-ruling as a DM improvisation.
+- Call `search_rules` whenever a rule question comes up; call `lookup_entity` FIRST \
+whenever a query names a specific NPC/location/item, then `search_lore` for anything \
+broader. Cite the source section AND the literal `chunk_id` shown in the tool result \
+whenever you relay a fact from any of these into your resolution report (e.g. \
+"[chunk_id: abc123]") — this lets the citation be verified. If the books/registry \
+don't cover it, say so PLAINLY in your resolution report — do not invent an answer or \
+state an unverified guess as fact — and label your ruling as a DM improvisation.
 
 Campaign history:
 - Call `search_campaign_history` when a player references a past event, when an \
@@ -112,6 +116,17 @@ A party of four Rogues needs a healer or a frontliner, not a fifth Rogue.
 ability scores deliberately, the same way you would explain them to a player.
 
 NPC persistence:
+- Bright line: the INSTANT you give a previously-background character an actual name \
+and their own line of dialogue, STOP before writing that dialogue and call `create_npc` \
+(or `generate_companion_character` if they'll fight alongside the party) FIRST. This is \
+not optional or a matter of judgment — a named character speaking is, by definition, \
+no longer background scenery. Never write `"..." Name said` (or any equivalent) for a \
+character with no backing `create_npc`/`generate_companion_character` call this same \
+turn — the name and everything you decide about them (personality, motivation) has to \
+land in a real record in the same breath it's invented, not be trusted to a later pass. \
+Before picking that name, check it against the party roster and any existing NPCs (both \
+tools already refuse a collision) — reusing a name already in play is confusing and easy \
+to mix up in narration, exactly the kind of mistake this rule exists to prevent.
 - The moment a background character becomes individually plot-relevant — recruited, \
 gives unique information, will plausibly recur — call `create_npc` immediately (or \
 `generate_companion_character` if they'll take combat actions alongside the party) \
@@ -307,6 +322,19 @@ turn — if the scene hasn't changed, just note what's new (an NPC's reaction, a
 that came up), not the environment itself; the narrator already knows where they are.
 
 ## Loot
+
+Grounded loot takes priority over invented loot, always. Before deciding what a \
+named adventure NPC, a notable monster, or a searched location/container actually \
+holds — especially right after defeating them — call `search_rules` or \
+`search_adventure_literal` to check whether the module specifies what they carry. \
+The same "never invent, search first" discipline that already applies to monster \
+stat blocks (see `create_monster` above) applies here: a published adventure often \
+ties a specific item to a specific NPC for a real reason — a key, a letter, a \
+plot-relevant trinket — and silently substituting generic or no loot instead \
+throws away a story hook the module intended. This check costs nothing when there's \
+nothing to find; it only matters when there is. Only fall back to inventing \
+reasonable loot for a homebrew NPC/monster with nothing to look up, same as an \
+ungrounded rules ruling.
 
 Two paths, depending on whether more than one party member could plausibly claim \
 the find:
@@ -547,11 +575,25 @@ def build_session_kickoff_message(campaign: Campaign) -> str:
 
     last = campaign.sessions[-1]
     key_events = "\n".join(f"- {e}" for e in last.key_events) if last.key_events else "(none recorded)"
+    progress_instruction = (
+        (
+            f"The party's adventure progress as of last session: {last.adventure_progress}\n"
+            "Call search_rules with this in mind to refresh your grounding in the "
+            "relevant part of the adventure book before continuing — don't rely only "
+            "on the narrative recap above for what happens next.\n\n"
+        )
+        if last.adventure_progress else
+        # Sessions recorded before this field existed have nothing to re-ground
+        # on here — not an error, just less context than a session ended after
+        # this shipped.
+        ""
+    )
     return (
         "[SESSION START — internal note, not player dialogue]\n"
         f"This is session {campaign.session_count + 1}. Here is what happened last session:\n\n"
         f"{last.summary}\n\n"
         f"Key events:\n{key_events}\n\n"
+        f"{progress_instruction}"
         "Give the players a short \"previously on...\" recap of this, then re-establish "
         "where they currently are (check get_current_location / get_campaign_summary for "
         "up-to-date state — time may have passed) and end by asking what they do next."

@@ -1,7 +1,8 @@
 from sqlalchemy import (
     Boolean, Column, Date, ForeignKey, Integer, MetaData, String, Table, Text,
+    UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
 
 metadata = MetaData()
 
@@ -122,6 +123,60 @@ encounters = _entity(
     Column("round",      Integer, nullable=False),
     Column("difficulty", Text,    nullable=False),
 )
+
+# ── Lore Registry (canon — book-scoped, NOT campaign-scoped) ──────────────────
+# Populated offline by scripts/extract_entities.py --write-postgres. Read by
+# lookup_entity/search_lore (backend/tools/lore.py) and world_prep.py. Never
+# mutated by live play — a campaign's own NPC/Location/Item rows point back
+# at these via lore_entity_id (provenance), but this table itself only
+# changes when a book is (re-)extracted.
+
+lore_entities = Table(
+    "lore_entities", metadata,
+    Column("id",                UUID(as_uuid=False), primary_key=True),
+    Column("book_slug",         Text, nullable=False),
+    Column("source_type",       Text, nullable=False, server_default="adventure"),  # "core" | "adventure"
+    Column("entity_type",       Text, nullable=False),  # "npc" | "location" | "item" | "monster"
+    Column("canonical_name",    Text, nullable=False),
+    Column("rolled_up_profile", JSONB, nullable=False),
+    Column("source_chunk_ids",  ARRAY(Text), nullable=False, server_default="{}"),
+    Column("spoiler_tier",      Text, nullable=False, server_default="public"),
+    Column("created_at",        TIMESTAMP(timezone=True), nullable=False),
+    UniqueConstraint("book_slug", "entity_type", "canonical_name", name="uq_lore_entities_book_type_name"),
+)
+
+lore_entity_aliases = Table(
+    "lore_entity_aliases", metadata,
+    Column("id",              UUID(as_uuid=False), primary_key=True),
+    Column("lore_entity_id",  UUID(as_uuid=False),
+           ForeignKey("lore_entities.id", ondelete="CASCADE"), nullable=False),
+    Column("alias",           Text, nullable=False),
+    UniqueConstraint("lore_entity_id", "alias", name="uq_lore_entity_aliases_entity_alias"),
+)
+
+# ── Incremental relation graph (campaign-scoped — see Stage 1.5) ─────────────
+# Edges between entities (NPC<->location, NPC<->faction, item<->location, ...).
+# UniqueConstraint on (campaign_id, source_id, target_id, relation) IS the
+# set-merging mechanism: re-adding the same fact is a harmless upsert no-op.
+
+entity_relations = Table(
+    "entity_relations", metadata,
+    Column("id",               UUID(as_uuid=False), primary_key=True),
+    Column("campaign_id",      UUID(as_uuid=False),
+           ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False),
+    Column("source_type",      Text, nullable=False),  # npc | location | item | faction | quest
+    Column("source_id",        Text, nullable=False),
+    Column("source_name",      Text, nullable=False),
+    Column("target_type",      Text, nullable=False),
+    Column("target_id",        Text, nullable=False),
+    Column("target_name",      Text, nullable=False),
+    Column("relation",         Text, nullable=False),  # "member of", "located in", "allied with", ...
+    Column("description",      Text, nullable=False, server_default=""),
+    Column("source_chunk_ids", ARRAY(Text), nullable=False, server_default="{}"),
+    Column("created_at",       TIMESTAMP(timezone=True), nullable=False),
+    UniqueConstraint("campaign_id", "source_id", "target_id", "relation", name="uq_entity_relations_edge"),
+)
+
 
 # Append-only roll log — no data JSONB needed, all fields are flat.
 rolls = Table(

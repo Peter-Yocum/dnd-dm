@@ -1,7 +1,9 @@
 from langchain_core.tools import tool
 
 from backend.models import AreaType, Location, LocationConnection, LocationScale, TravelTerrain
+from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
+from backend.stores.lore_store import LoreStore
 from backend.tools._helpers import advance_clock, find_connection, find_container, find_location, opposite_direction
 
 
@@ -135,7 +137,12 @@ def _parse_enum(enum_cls, value: str, field_name: str):
         return None, f"Invalid {field_name} '{value}' — must be one of: {valid}."
 
 
-def make_authoring_tools(campaign_id: str, store: CampaignStore) -> list:
+def make_authoring_tools(
+    campaign_id: str,
+    store: CampaignStore,
+    lore_store: LoreStore | None = None,
+    books_in_play: list[str] | None = None,
+) -> list:
 
     @tool
     async def create_location(
@@ -145,6 +152,7 @@ def make_authoring_tools(campaign_id: str, store: CampaignStore) -> list:
         scale: str = "region",
         size: str | None = None,
         notes: str | None = None,
+        force: bool = False,
     ) -> str:
         """Create a new named location in the campaign world. area_type must
         be one of: indoor, outdoor, underground, aquatic, aerial — for a
@@ -155,12 +163,26 @@ def make_authoring_tools(campaign_id: str, store: CampaignStore) -> list:
         world-prep, mostly used once play begins. If a location with this
         exact name already exists, returns its existing details instead of
         creating a duplicate — call connect_locations to link it to another
-        place instead. Lighting, terrain features, and points of interest are
-        added later once play begins, not during world-prep."""
+        place instead. If a close-but-not-exact name match already exists (in
+        this campaign or the canon Lore Registry), returns a warning instead —
+        call lookup_entity to check first, or pass force=True if this is
+        genuinely a different place. Lighting, terrain features, and points
+        of interest are added later once play begins, not during world-prep."""
         campaign = await store.load(campaign_id)
         existing = find_location(campaign, name)
         if existing:
             return f"Location '{existing.name}' already exists (id={existing.id}, scale={existing.scale.value}). Use connect_locations to link it."
+        if not force:
+            existing_names = [l.name for l in campaign.locations]
+            if lore_store is not None:
+                existing_names += await lore_store.find_candidates(books_in_play or [], "location")
+            matches = find_candidate_matches(name, existing_names)
+            if matches:
+                return (
+                    f"'{name}' is a close match to existing location(s): {', '.join(matches)}. "
+                    f"Call lookup_entity('{name}') to check first, or call create_location again "
+                    f"with force=True if this is genuinely a different place."
+                )
         area_type_val, err = _parse_enum(AreaType, area_type, "area_type")
         if err:
             return err
@@ -330,10 +352,80 @@ def make_travel_tools(campaign_id: str, store: CampaignStore) -> list:
     return [get_travel_estimate, travel_to]
 
 
-def make_tools(campaign_id: str, store: CampaignStore) -> list:
+def make_opening_detail_tools(campaign_id: str, store: CampaignStore) -> list:
+    """Prep-only tool for the one-shot world-prep opening-scene seeding pass
+    (backend/agent/world_prep.py) — deliberately NOT included in make_tools()'s
+    live aggregate. create_location's own docstring defers site-scale detail
+    (points_of_interest/hidden_elements) to live play for every OTHER
+    location; this is the one deliberate, scoped exception, for the single
+    location where play actually begins, where a rich upfront description
+    grounded in the book directly prevents the DM improvising the very first
+    scene from nothing."""
+
+    @tool
+    async def set_opening_location_detail(
+        location_name: str,
+        description: str | None = None,
+        area_type: str = "outdoor",
+        scale: str = "region",
+        points_of_interest: list[str] | None = None,
+        hidden_elements: list[str] | None = None,
+        current_npcs: list[str] | None = None,
+        make_current: bool = True,
+    ) -> str:
+        """Set rich site detail on the opening scene's location — where play
+        actually begins — grounded in the adventure text. Finds the location
+        by name (falling back to a substring match in either direction, since
+        an earlier region-scale seeding pass may have created it under a
+        slightly different name, e.g. "Velkynvelve Outpost" vs "Velkynvelve"),
+        or creates it fresh if it doesn't exist yet. current_npcs should list
+        only who's actually present in THIS scene, not everyone mentioned
+        anywhere in the book. Sets this as the party's current location
+        (make_current=True, the default) so session 1 doesn't depend on the
+        live model separately calling move_party correctly."""
+        campaign = await store.load(campaign_id)
+        loc = find_location(campaign, location_name)
+        if not loc:
+            n = location_name.lower()
+            loc = next(
+                (l for l in campaign.locations if n in l.name.lower() or l.name.lower() in n),
+                None,
+            )
+        if not loc:
+            area_type_val, err = _parse_enum(AreaType, area_type, "area_type")
+            if err:
+                return err
+            scale_val, err = _parse_enum(LocationScale, scale, "scale")
+            if err:
+                return err
+            loc = Location(name=location_name, area_type=area_type_val, scale=scale_val)
+            campaign.locations.append(loc)
+        if description is not None:
+            loc.description = description
+        if points_of_interest:
+            loc.points_of_interest = points_of_interest
+        if hidden_elements:
+            loc.hidden_elements = hidden_elements
+        if current_npcs:
+            loc.current_npcs = current_npcs
+        if make_current:
+            campaign.current_location_id = loc.id
+        await store.save(campaign)
+        result = f"Set opening-scene detail for '{loc.name}' (id={loc.id})"
+        return result + (" and marked it as the party's current location." if make_current else ".")
+
+    return [set_opening_location_detail]
+
+
+def make_tools(
+    campaign_id: str,
+    store: CampaignStore,
+    lore_store: LoreStore | None = None,
+    books_in_play: list[str] | None = None,
+) -> list:
     """Full in-game world tool set — movement + authoring + travel."""
     return [
         *make_movement_tools(campaign_id, store),
-        *make_authoring_tools(campaign_id, store),
+        *make_authoring_tools(campaign_id, store, lore_store, books_in_play),
         *make_travel_tools(campaign_id, store),
     ]

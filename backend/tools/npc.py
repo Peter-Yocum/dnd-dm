@@ -1,8 +1,11 @@
 from langchain_core.tools import tool
 
 from backend.models import Attitude, Campaign, NPC
+from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
-from backend.tools._helpers import find_location, find_npc
+from backend.stores.graph_store import RelationGraphStore
+from backend.stores.lore_store import LoreStore
+from backend.tools._helpers import find_char, find_location, find_npc
 
 
 def build_traveling_npcs_context(campaign: Campaign) -> str | None:
@@ -21,7 +24,13 @@ def build_traveling_npcs_context(campaign: Campaign) -> str | None:
     return "\n".join(lines)
 
 
-def make_tools(campaign_id: str, store: CampaignStore) -> list:
+def make_runtime_tools(
+    campaign_id: str, store: CampaignStore, graph_store: RelationGraphStore | None = None,
+) -> list:
+    """Live-play NPC tools — reacting to/reading state as the party interacts
+    with an already-created NPC. Not exposed to the one-shot world-prep NPC
+    seeding pass (see make_authoring_tools), which has no ongoing
+    conversation/attitude/travel state to react to yet."""
 
     @tool
     async def get_npc(npc_name: str) -> str:
@@ -107,37 +116,6 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         return f"{npc.name} told the party: '{revealed}'."
 
     @tool
-    async def create_npc(
-        name: str,
-        race: str = "",
-        occupation: str = "",
-        attitude: str = "indifferent",
-        location: str = "",
-        notes: str = "",
-    ) -> str:
-        """Create a new NPC and add them to the campaign. Use when the party
-        encounters someone not yet in the campaign record — a shopkeeper, a
-        random guard, a bystander the players decided to befriend."""
-        campaign = await store.load(campaign_id)
-        if find_npc(campaign, name):
-            return f"An NPC named '{name}' already exists."
-        try:
-            att = Attitude(attitude.lower())
-        except ValueError:
-            att = Attitude.INDIFFERENT
-        npc = NPC(
-            name=name,
-            race=race,
-            occupation=occupation,
-            attitude=att,
-            location=location,
-            notes=notes,
-        )
-        campaign.npcs.append(npc)
-        await store.save(campaign)
-        return f"Created NPC '{name}' ({race} {occupation}, {att.value}) in {location or 'unknown location'}."
-
-    @tool
     async def set_npc_traveling_with_party(npc_name: str, traveling: bool = True) -> str:
         """Mark an NPC as currently traveling with the party (or no longer). Call
         once an NPC is recruited/joins the group for the road, so they keep showing
@@ -171,9 +149,115 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
             loc.current_npcs.append(npc.name)
         npc.location = loc.name
         await store.save(campaign)
+        if graph_store is not None:
+            await graph_store.add_edge(
+                campaign_id, "npc", npc.id, npc.name, "location", loc.id, loc.name, "located in",
+            )
         return f"{npc.name} is now placed at {loc.name} — will surface via get_current_location once the party arrives."
 
     return [
-        get_npc, update_npc_attitude, reveal_npc_knowledge, create_npc,
+        get_npc, update_npc_attitude, reveal_npc_knowledge,
         set_npc_traveling_with_party, place_npc_at_location,
+    ]
+
+
+def make_authoring_tools(
+    campaign_id: str,
+    store: CampaignStore,
+    lore_store: LoreStore | None = None,
+    books_in_play: list[str] | None = None,
+    graph_store: RelationGraphStore | None = None,
+) -> list:
+    """NPC-creation-only tool, for the one-shot world-prep NPC seeding pass
+    (backend/agent/world_prep.py) as well as live play — mirrors world.py's
+    make_movement_tools/make_authoring_tools/make_travel_tools split.
+    lore_store/books_in_play/graph_store are optional so this keeps working
+    anywhere it's constructed without them (e.g. before Stage 1/1.5 wiring
+    lands); fuzzy dedup and relation-graph recording are simply skipped in
+    that case."""
+
+    @tool
+    async def create_npc(
+        name: str,
+        race: str = "",
+        occupation: str = "",
+        attitude: str = "indifferent",
+        location: str = "",
+        notes: str = "",
+        personality_traits: list[str] | None = None,
+        motivations: list[str] | None = None,
+        secrets: list[str] | None = None,
+        force: bool = False,
+    ) -> str:
+        """Create a new NPC and add them to the campaign. Use when the party
+        encounters someone not yet in the campaign record — a shopkeeper, a
+        random guard, a bystander the players decided to befriend — or when
+        grounding a named character straight from adventure text (world-prep
+        seeding): personality_traits/motivations/secrets let you set real,
+        book-grounded detail in the same call that creates the record,
+        instead of a separate follow-up. A short, grounded NPC beats a
+        padded, invented one — omit a field rather than filling it with a
+        generic placeholder. If a close-but-not-exact name match already
+        exists (in this campaign or the canon Lore Registry), this returns a
+        warning instead of creating a duplicate — call lookup_entity to
+        check first, or pass force=True if this is genuinely a different
+        individual."""
+        campaign = await store.load(campaign_id)
+        if find_npc(campaign, name):
+            return f"An NPC named '{name}' already exists."
+        if find_char(campaign, name):
+            return (
+                f"'{name}' is already a party member's name — pick a different name "
+                f"for this NPC. Two characters sharing a name in the same scene is "
+                f"confusing and easy to mix up in play."
+            )
+        if not force:
+            existing_names = [n.name for n in campaign.npcs]
+            if lore_store is not None:
+                existing_names += await lore_store.find_candidates(books_in_play or [], "npc")
+            matches = find_candidate_matches(name, existing_names)
+            if matches:
+                return (
+                    f"'{name}' is a close match to existing NPC(s): {', '.join(matches)}. "
+                    f"Call lookup_entity('{name}') to check first, or call create_npc again "
+                    f"with force=True if this is genuinely a different individual."
+                )
+        try:
+            att = Attitude(attitude.lower())
+        except ValueError:
+            att = Attitude.INDIFFERENT
+        npc = NPC(
+            name=name,
+            race=race,
+            occupation=occupation,
+            attitude=att,
+            location=location,
+            notes=notes,
+            personality_traits=personality_traits or [],
+            motivations=motivations or [],
+            secrets=secrets or [],
+        )
+        campaign.npcs.append(npc)
+        await store.save(campaign)
+        if graph_store is not None and location:
+            loc = find_location(campaign, location)
+            if loc:
+                await graph_store.add_edge(
+                    campaign_id, "npc", npc.id, npc.name, "location", loc.id, loc.name, "located in",
+                )
+        return f"Created NPC '{name}' ({race} {occupation}, {att.value}) in {location or 'unknown location'}."
+
+    return [create_npc]
+
+
+def make_tools(
+    campaign_id: str,
+    store: CampaignStore,
+    lore_store: LoreStore | None = None,
+    books_in_play: list[str] | None = None,
+    graph_store: RelationGraphStore | None = None,
+) -> list:
+    return [
+        *make_runtime_tools(campaign_id, store, graph_store),
+        *make_authoring_tools(campaign_id, store, lore_store, books_in_play, graph_store),
     ]

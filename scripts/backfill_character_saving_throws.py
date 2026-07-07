@@ -26,6 +26,14 @@ Run inside the app container via:  docker compose exec app python backfill_chara
 
 import argparse
 import asyncio
+import sys
+from pathlib import Path
+
+# Allow running as `python scripts/backfill_character_saving_throws.py` from
+# anywhere — Python sets sys.path[0] to this script's own directory, not the
+# repo root, so `backend` wouldn't otherwise be importable after this script
+# moved out of the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy.ext.asyncio import create_async_engine
 

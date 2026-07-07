@@ -1,6 +1,3 @@
-import re
-from pathlib import Path
-
 from langchain_core.tools import tool
 
 from backend.stores.rules_store import RulesStore
@@ -11,9 +8,9 @@ def make_tools(rules_store: RulesStore, books_in_play: list[str]) -> list:
     def search_rules(query: str) -> str:
         """Look up D&D 5e rules, spells, monsters, or items in the indexed rulebooks.
         Use for ANY rules question — how a spell works, a condition's effects, a
-        monster's stat block, action economy, etc. Always cite the book and section
-        from the results. If the books don't cover it, say so and label any ruling
-        as your own improvisation."""
+        monster's stat block, action economy, etc. Always cite the book, section,
+        AND chunk_id from the results when relaying a fact. If the books don't
+        cover it, say so and label any ruling as your own improvisation."""
         if not rules_store.is_ready():
             return (
                 "Rulebook index is not ready. "
@@ -23,7 +20,7 @@ def make_tools(rules_store: RulesStore, books_in_play: list[str]) -> list:
         if not chunks:
             return f"No relevant rules found for '{query}'."
         return "\n\n---\n\n".join(
-            f"[{c.book} — {c.section}]\n{c.content}" for c in chunks
+            f"[{c.book} — {c.section} | chunk_id: {c.chunk_id}]\n{c.content}" for c in chunks
         )
 
     @tool
@@ -37,15 +34,9 @@ def make_tools(rules_store: RulesStore, books_in_play: list[str]) -> list:
         can easily miss a single scattered forward-reference; this won't."""
         if not books_in_play:
             return "No adventure books in play to search (core rulebooks only)."
-        results = []
-        for slug in books_in_play:
-            for path in Path(f"docs/source/adventures/{slug}").glob("*.md"):
-                text = path.read_text(encoding="utf-8")
-                for m in re.finditer(re.escape(query), text, re.IGNORECASE):
-                    start, end = max(0, m.start() - 200), min(len(text), m.end() + 200)
-                    results.append(f"[{path.stem}]\n…{text[start:end]}…")
-        if not results:
+        chunks = rules_store.search_adventure_literal(query, books_in_play=books_in_play)
+        if not chunks:
             return f"No mentions of '{query}' found in the adventure text."
-        return "\n\n---\n\n".join(results)
+        return "\n\n---\n\n".join(f"[{c.section}]\n{c.content}" for c in chunks)
 
     return [search_rules, search_adventure_literal]

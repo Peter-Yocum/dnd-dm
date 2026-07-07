@@ -1,12 +1,35 @@
+import re
+
 from langchain_core.tools import tool
 
 from backend.data.equipment import ARMOR, SHIELD_AC_BONUS, WEAPONS
 from backend.models import Attack, ConditionType, Container, Currency, Item, SpellSlotLevel
+from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
-from backend.tools._helpers import apply_damage_to_character, char_summary, find_char
+from backend.stores.graph_store import RelationGraphStore
+from backend.stores.lore_store import LoreStore
+from backend.tools._helpers import all_campaign_item_names, apply_damage_to_character, char_summary, find_char
+
+# Matches an item_name that's actually currency mislabeled as a physical item
+# ("Silver piece", "5 gp", "gold coins") — observed live: a mechanics model
+# called add_item_to_character(item_name="Silver piece", quantity=5) instead
+# of update_character_currency, landing 5 silver pieces in the inventory list
+# with the Currency field left untouched at 0 gp.
+_CURRENCY_ITEM_RE = re.compile(
+    r"^\s*(?:gp|sp|cp|pp|ep)\s*$"
+    r"|^\s*(?:gold|silver|copper|platinum|electrum)\s+pieces?\s*$"
+    r"|^\s*(?:gold|silver|copper|platinum|electrum)\s+coins?\s*$",
+    re.IGNORECASE,
+)
 
 
-def make_tools(campaign_id: str, store: CampaignStore) -> list:
+def make_tools(
+    campaign_id: str,
+    store: CampaignStore,
+    lore_store: LoreStore | None = None,
+    books_in_play: list[str] | None = None,
+    graph_store: RelationGraphStore | None = None,
+) -> list:
 
     @tool
     async def get_party_status() -> str:
@@ -156,20 +179,49 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
 
     @tool
     async def add_item_to_character(
-        character_name: str, item_name: str, quantity: int = 1
+        character_name: str, item_name: str, quantity: int = 1, force: bool = False,
     ) -> str:
         """Add an item to a character's inventory. Use when a character picks up,
-        purchases, or is given an item."""
+        purchases, or is given an item. Refuses if item_name is actually currency
+        (e.g. "Silver piece", "gp") — call update_character_currency instead. If
+        a close-but-not-exact name match already exists somewhere in the
+        campaign (in this campaign or the canon Lore Registry), returns a
+        warning instead of adding a possible duplicate item under a slightly
+        different name — call lookup_entity to check first, or pass
+        force=True if this is genuinely a different item."""
+        if _CURRENCY_ITEM_RE.match(item_name):
+            return (
+                f"'{item_name}' is currency, not a physical item — call "
+                f"update_character_currency instead so it lands in {character_name}'s "
+                f"actual gold total, not a fake inventory entry."
+            )
         campaign = await store.load(campaign_id)
         char = find_char(campaign, character_name)
         if not char:
             return f"No character named '{character_name}' in the party."
         existing = next((i for i in char.inventory if i.name.lower() == item_name.lower()), None)
+        if not existing and not force:
+            existing_names = all_campaign_item_names(campaign)
+            if lore_store is not None:
+                existing_names += await lore_store.find_candidates(books_in_play or [], "item")
+            matches = find_candidate_matches(item_name, existing_names)
+            if matches:
+                return (
+                    f"'{item_name}' is a close match to existing item(s): {', '.join(matches)}. "
+                    f"Call lookup_entity('{item_name}') to check first, or call "
+                    f"add_item_to_character again with force=True if this is genuinely a different item."
+                )
         if existing:
             existing.quantity += quantity
+            new_item = existing
         else:
-            char.inventory.append(Item(name=item_name, quantity=quantity))
+            new_item = Item(name=item_name, quantity=quantity)
+            char.inventory.append(new_item)
         await store.save(campaign)
+        if graph_store is not None:
+            await graph_store.add_edge(
+                campaign_id, "character", char.id, char.name, "item", new_item.id, new_item.name, "owns",
+            )
         return f"Added {quantity}x {item_name} to {char.name}'s inventory."
 
     @tool
@@ -228,6 +280,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         bonus: int = 0,
         description: str = "",
         requires_attunement: bool = False,
+        force: bool = False,
     ) -> str:
         """Give a character a special/magical item — found in a hoard, given as
         a reward, etc. If it's a magic weapon or armor variant (a "+1 Longsword",
@@ -241,11 +294,25 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         and just describe it — it's added to inventory as flavor with no
         mechanical effect; narrate and resolve its powers reactively with the
         normal tools (update_character_hp, add_condition, etc.) if/when they
-        trigger in play."""
+        trigger in play. If a close-but-not-exact name match already exists
+        elsewhere in the campaign, returns a warning instead — call
+        lookup_entity to check first, or pass force=True if this is genuinely
+        a different item (e.g. a second +1 Longsword)."""
         campaign = await store.load(campaign_id)
         char = find_char(campaign, character_name)
         if not char:
             return f"No character named '{character_name}' in the party."
+        if not force:
+            existing_names = all_campaign_item_names(campaign)
+            if lore_store is not None:
+                existing_names += await lore_store.find_candidates(books_in_play or [], "item")
+            matches = find_candidate_matches(item_name, existing_names)
+            if matches:
+                return (
+                    f"'{item_name}' is a close match to existing item(s): {', '.join(matches)}. "
+                    f"Call lookup_entity('{item_name}') to check first, or call "
+                    f"create_magic_item again with force=True if this is genuinely a different item."
+                )
 
         base_key = base_item.strip()
         weapon = WEAPONS.get(base_key) if base_key else None
@@ -270,13 +337,18 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         else:
             result = f"{item_name} added to {char.name}'s inventory (no mechanical effect — narrate its power as needed)."
 
-        char.inventory.append(Item(
+        new_item = Item(
             name=item_name,
             description=description,
             magical=True,
             requires_attunement=requires_attunement,
-        ))
+        )
+        char.inventory.append(new_item)
         await store.save(campaign)
+        if graph_store is not None:
+            await graph_store.add_edge(
+                campaign_id, "character", char.id, char.name, "item", new_item.id, new_item.name, "owns",
+            )
         return result
 
     @tool
@@ -291,12 +363,15 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         the same way create_magic_item grounds a magical weapon's stats, just
         with no enchantment bonus. Refuses if item_name isn't already in the
         character's inventory (add_item_to_character/reveal_loot distribution
-        first) or if base_item isn't a recognized weapon. For a magical weapon,
-        use create_magic_item instead."""
+        first) or if base_item isn't a recognized weapon, or if this character
+        already has an attack with this exact name (no-op, not a duplicate).
+        For a magical weapon, use create_magic_item instead."""
         campaign = await store.load(campaign_id)
         char = find_char(campaign, character_name)
         if not char:
             return f"No character named '{character_name}' in the party."
+        if any(a.name.lower() == item_name.lower() for a in char.attacks):
+            return f"{char.name} already has an attack named '{item_name}' — not adding a duplicate."
         if not any(i.name.lower() == item_name.lower() for i in char.inventory):
             return f"{char.name} doesn't have '{item_name}' in their inventory — add it first."
         weapon = WEAPONS.get(base_item.strip())

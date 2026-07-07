@@ -18,9 +18,10 @@ arrive from the narrator node only, suitable for piping into an SSE response.
 Session management
 ------------------
 `get_thread_messages()` retrieves the full message history for a thread.
-`summarize_session()` generates a narrative chronicle + key events list from
-that history, suitable for storing as a session record and indexing in
-HistoryStore for future RAG retrieval.
+`summarize_session()` generates a narrative chronicle, key events list, an
+adventure-progress note, and any newly-stated entity relationships (Stage
+1.5's incremental relation graph) from that history, suitable for storing as
+a session record and indexing in HistoryStore for future RAG retrieval.
 """
 
 from __future__ import annotations
@@ -50,13 +51,15 @@ from backend.agent.prompts import get_mechanics_system_prompt, get_narrator_syst
 from backend.agent.session_zero_prompt import get_session_zero_mechanics_prompt, get_session_zero_narrator_prompt
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import DraftStore
+from backend.stores.graph_store import RelationGraphStore
 from backend.stores.history_store import HistoryStore
+from backend.stores.lore_store import LoreStore
 from backend.stores.rules_store import RulesStore
 from backend.tools import chargen, companion, dice, rules
 from backend.tools import campaign as campaign_tools  # aliased — `campaign` is used throughout this file as a Campaign instance
 from backend.tools.combat import build_encounter_context
 from backend.tools.npc import build_traveling_npcs_context
-from backend.tools.registry import get_tools, get_world_prep_tools
+from backend.tools.registry import get_npc_prep_tools, get_tools, get_world_prep_tools
 from backend.tools.resolution import resolve_pending_action_impl
 
 log = logging.getLogger(__name__)
@@ -355,6 +358,13 @@ class DMState(TypedDict):
                             # calls has no backstop but recursion_limit (60), which surfaces as an
                             # unhandled GraphRecursionError -> a generic "Lost connection to the
                             # model backend" error that silently drops the turn.
+    lore_guardrail_count: int  # caps retries for Stage 2's lore guardrails (fabricated citation,
+                                # abstention violation, spoiler leak) — a separate budget from
+                                # correction_count for the same starvation-avoidance reason
+                                # tool_error_count/narrator_correction_count already document: a
+                                # combat/loot correction spending the turn's one correction_count
+                                # retry shouldn't leave zero budget for a lore check later the
+                                # same turn.
 
 
 # ── agent factory ──────────────────────────────────────────────────────────────
@@ -519,6 +529,44 @@ async def _detect_missing_followup(
     return None
 
 
+_COMBAT_ROLL_TOOLS = {
+    "resolve_attack", "resolve_saving_throw", "cast_spell",
+    "resolve_pending_action", "roll_dice",
+}
+
+_COMBAT_ROLL_MENTION_RE = re.compile(
+    r"\battack roll\b|\bdamage roll\b|\bsaving throw\b|\brolls?\s+(?:to hit|damage)\b|"
+    r"\b\d+\s*(?:slashing|piercing|bludgeoning|fire|cold|lightning|acid|poison|psychic|"
+    r"radiant|necrotic|force|thunder)\s+damage\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_missing_combat_roll_followup(notes: str, called: set[str]) -> str | None:
+    """Catches the mechanics model's own resolution report narrating a combat
+    roll (an attack roll, damage, a saving throw) with NO backing
+    resolve_attack/resolve_saving_throw/cast_spell/resolve_pending_action/
+    roll_dice call this turn. Observed live: an entire multi-message "combat"
+    (attack rolls, damage, a fabricated "Round 1 / Initiative Order" block)
+    was narrated with zero tool calls — no monster, no encounter, nothing
+    ever actually created or persisted. Deliberately NOT gated to an active
+    encounter, unlike _detect_missing_followup — that gate is exactly what
+    let this slip through: the bug is precisely that no encounter/monster
+    ever gets created in the first place, so there's nothing to gate on."""
+    if called & _COMBAT_ROLL_TOOLS:
+        return None
+    if not _COMBAT_ROLL_MENTION_RE.search(notes):
+        return None
+    return (
+        "Your resolution report describes a combat roll (an attack, damage, or a "
+        "saving throw), but no resolve_attack / resolve_saving_throw / cast_spell / "
+        "resolve_pending_action / roll_dice call backs it up this turn. Never narrate "
+        "a die roll or damage that didn't actually happen through a real tool call. "
+        "If this is combat, register any new opponents with create_monster and call "
+        "start_encounter if needed, then resolve the action for real before reporting it."
+    )
+
+
 _LOOT_TOOLS = {"update_character_currency", "add_item_to_character", "create_magic_item", "reveal_loot"}
 
 # Gain-verbs broadened beyond "finds/receives" to cover mundane handoffs/pickups
@@ -573,6 +621,41 @@ def _detect_missing_loot_followup(notes: str, called: set[str]) -> str | None:
     )
 
 
+_MONSTER_DEFEATED_RE = re.compile(r"—\s*DEFEATED\b")
+
+
+def _detect_missing_loot_consideration_followup(state: DMState, called: set[str]) -> str | None:
+    """Catches a monster reduced to 0 HP this turn with NO loot tool
+    (reveal_loot/add_item_to_character/update_character_currency/
+    create_magic_item) called at all. Distinct from
+    _detect_missing_loot_followup, which catches a FALSE claim of loot —
+    this catches SILENCE: the model kills something and moves on without
+    ever considering whether it drops anything. Observed live: a group of
+    guards the actual adventure text confirms carry a specific plot-relevant
+    key (Out of the Abyss's Velkynvelve slave-pen key) could easily be
+    killed and looted-for-nothing if the model simply never thinks to check,
+    losing a real story hook with no narrated claim to even catch."""
+    if called & _LOOT_TOOLS:
+        return None
+    defeated = any(
+        isinstance(m, ToolMessage) and _MONSTER_DEFEATED_RE.search(_extract_text(m.content))
+        for m in _messages_since_last_human(state["messages"])
+    )
+    if not defeated:
+        return None
+    return (
+        "You defeated a monster this turn but didn't call reveal_loot / "
+        "add_item_to_character / update_character_currency / create_magic_item, "
+        "and didn't note in your report that a check turned up nothing. Before "
+        "moving on: if this is a named adventure NPC or monster, call "
+        "search_rules or search_adventure_literal to check what the module "
+        "says they carry — never silently skip loot the book actually "
+        "specifies just because it wasn't the first thing that came to mind. "
+        "Either call the appropriate loot tool now, or explicitly state in "
+        "your resolution report that nothing of value was found."
+    )
+
+
 _COMBAT_RESOLUTION_TOOLS = {"resolve_attack", "resolve_saving_throw"}
 
 
@@ -616,11 +699,144 @@ async def _detect_missing_encounter_followup(
     )
 
 
+# ── Stage 2 lore guardrails ─────────────────────────────────────────────────
+# Same guardrail-chain shape as the combat/loot detectors above, but for the
+# lore/retrieval path specifically: forced citations, abstention enforcement,
+# and spoiler-tier non-leakage — the report's CRAG/Self-RAG discipline
+# layered onto the existing mechanics loop rather than a new graph node. Given
+# their own separate lore_guardrail_count budget (see DMState) rather than
+# sharing correction_count, for the same starvation-avoidance reason
+# tool_error_count/narrator_correction_count already document: a combat/loot
+# correction spending the turn's one correction_count retry shouldn't zero
+# out the budget a lore check needs later the same turn.
+
+_LORE_TOOLS = {"search_lore", "lookup_entity", "search_rules"}
+
+
+def _lore_tool_outputs_since_last_human(messages: list[BaseMessage]) -> list[str]:
+    """Contents of this turn's search_lore/lookup_entity/search_rules
+    ToolMessages — the source of truth for citation verification and
+    spoiler-leak detection below."""
+    return [
+        _extract_text(m.content)
+        for m in _messages_since_last_human(messages)
+        if isinstance(m, ToolMessage) and getattr(m, "name", None) in _LORE_TOOLS
+    ]
+
+
+_CHUNK_ID_CLAIM_RE = re.compile(r'chunk_id:\s*([a-f0-9]+)', re.IGNORECASE)
+
+
+def _detect_uncited_or_invalid_lore_claim(notes: str, messages: list[BaseMessage]) -> str | None:
+    """Extracts every 'chunk_id: X' token the mechanics model wrote into its
+    own resolution notes (i.e. a claimed citation), and checks each against
+    the set of chunk_ids ACTUALLY present in this turn's search_lore/
+    lookup_entity/search_rules tool outputs. Fires only on a genuinely
+    fabricated citation — an id that was never actually returned this turn —
+    not on the mere presence/absence of a citation (that's
+    _detect_abstention_violation's job, right below)."""
+    cited = set(_CHUNK_ID_CLAIM_RE.findall(notes))
+    if not cited:
+        return None
+    real_ids: set[str] = set()
+    for output in _lore_tool_outputs_since_last_human(messages):
+        real_ids.update(_CHUNK_ID_CLAIM_RE.findall(output))
+    fake = cited - real_ids
+    if not fake:
+        return None
+    return (
+        f"Your resolution notes cite chunk_id(s) {', '.join(sorted(fake))} that were NOT "
+        "actually returned by any search_lore/lookup_entity/search_rules call this turn — "
+        "a fabricated citation. Only cite a chunk_id that genuinely appeared in a tool "
+        "result this turn, or drop the citation and rephrase as your own improvisation."
+    )
+
+
+# Heuristic, same spirit as _LOOT_MENTION_RE above: a regex can't perfectly
+# detect "this is a confident, ungrounded factual claim," but a reasonable
+# set of phrasings that typically accompany one is enough to catch the real
+# failure mode (a rules/lore fact stated as if verified, with nothing behind
+# it) without needing an extra LLM judge call on every single turn.
+_LORE_CLAIM_HINT_RE = re.compile(
+    r"\b(?:according to the|the rules state|the book (?:says|states)|per the (?:phb|dmg|"
+    r"player'?s handbook|dungeon master'?s guide|monster manual)|has an ac of \d|"
+    r"\d+\s*hit points?\b|spell save dc (?:is|of) \d|is a(?:n)? cr \d)\b",
+    re.IGNORECASE,
+)
+
+_ABSTENTION_RE = re.compile(
+    r"\b(?:don'?t have (?:that|this) in|not (?:in|covered by) the (?:sources?|books?|text)|"
+    r"sources? don'?t (?:cover|mention)|no (?:relevant )?(?:rules?|lore) (?:found|available)|"
+    r"can'?t find (?:that|this) in|nothing in the (?:sources?|books?|text))\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_abstention_violation(notes: str, called_this_turn: set[str]) -> str | None:
+    """Catches the mechanics model stating a specific rules/lore fact with NO
+    backing search_rules/search_lore/lookup_entity call at all this turn. An
+    explicit 'not in the source' abstention SATISFIES this check — that's the
+    report's required behavior, not a violation — so this only fires on a
+    confident, ungrounded claim, never on a genuine abstention."""
+    if called_this_turn & _LORE_TOOLS:
+        return None
+    if _ABSTENTION_RE.search(notes):
+        return None
+    if not _LORE_CLAIM_HINT_RE.search(notes):
+        return None
+    return (
+        "Your resolution notes state a specific rules/lore fact, but no "
+        "search_rules/search_lore/lookup_entity call backs it up this turn. If this "
+        "is genuinely grounded, call the right tool now before finalizing. If you "
+        "don't actually have a source for it, say so plainly instead of stating it "
+        "as verified fact."
+    )
+
+
+_DM_ONLY_TAG = "[DM-ONLY — do not reveal directly]"
+
+
+def _detect_spoiler_leak(notes: str, messages: list[BaseMessage]) -> str | None:
+    """Scans this turn's lookup_entity/search_lore ToolMessages for any
+    '[DM-ONLY — do not reveal directly]'-labeled text, and checks whether
+    notes states that same fact near-verbatim without going through the
+    existing reveal_npc_knowledge/reveal_hidden_element pattern this turn
+    (the sanctioned way to actually reveal something to the party). This is
+    the deterministic enforcement point for spoiler tiering — the mechanics
+    model necessarily SEES DM-only facts (it needs them to run the game
+    consistently) but must never STATE them outright in narration."""
+    dm_only_facts: list[str] = []
+    for output in _lore_tool_outputs_since_last_human(messages):
+        for line in output.splitlines():
+            if _DM_ONLY_TAG in line:
+                fact = line.split(_DM_ONLY_TAG, 1)[1].strip()
+                if fact:
+                    dm_only_facts.append(fact.lower())
+    if not dm_only_facts:
+        return None
+
+    notes_lower = notes.lower()
+    # Guard against trivially short fragments matching by coincidence.
+    leaked = [f for f in dm_only_facts if len(f) > 8 and f in notes_lower]
+    if not leaked:
+        return None
+    return (
+        "Your resolution notes appear to state a DM-only fact almost verbatim "
+        "(flagged '[DM-ONLY — do not reveal directly]' in a lookup_entity/search_lore "
+        "result this turn) without going through reveal_npc_knowledge or "
+        "reveal_hidden_element first. Never state a DM-only fact outright in narration "
+        "unless the party has genuinely discovered/been told it — rephrase to withhold "
+        "it, or call the proper reveal tool first if this is a legitimate reveal."
+    )
+
+
 def get_agent(
     campaign: Campaign,
     store: CampaignStore,
     rules_store: RulesStore,
     history_store: HistoryStore,
+    lore_store: LoreStore,
+    graph_store: RelationGraphStore,
 ):
     """Build the in-game DM agent: a mechanics node (tool-calling loop) that
     hands off to a narrator node (prose, no tools) once its tool calls are
@@ -629,7 +845,7 @@ def get_agent(
     if _checkpointer is None:
         raise RuntimeError("Agent lifespan not started — call agent_lifespan() first.")
 
-    tools = get_tools(campaign.id, store, rules_store, history_store, campaign.books_in_play)
+    tools = get_tools(campaign.id, store, rules_store, history_store, campaign.books_in_play, lore_store, graph_store)
     mechanics_modifier = _make_mechanics_modifier(get_mechanics_system_prompt(campaign), campaign.id, store)
     narrator_modifier = _make_narrator_modifier(get_narrator_system_prompt(campaign), campaign.id, store)
     mechanics_model = _get_mechanics_model().bind_tools(tools)
@@ -689,28 +905,64 @@ def get_agent(
                     await store.save(live_campaign)
                     notes = (notes + "\n" if notes else "") + f"[Stale pending reaction auto-declined] {decline_note}"
 
-        # Guardrail: catch the mechanics model stopping mid-resolution during
-        # combat (rolling/narrating an outcome without the tool call that
-        # actually applies it — see _detect_missing_followup), or claiming a
+        # Guardrail chain: catch the mechanics model stopping mid-resolution
+        # during an already-active encounter (rolling/narrating an outcome
+        # without the tool call that actually applies it — see
+        # _detect_missing_followup); narrating a combat roll (attack/damage/
+        # save) with NO tool call at all, active encounter or not — see
+        # _detect_missing_combat_roll_followup, which exists precisely because
+        # the encounter-gated check above can't catch a "combat" that never
+        # got a real encounter/monster created in the first place; claiming a
         # loot/currency gain with no backing tool call at all, combat or not
-        # (see _detect_missing_loot_followup). Capped at one retry per PLAYER
-        # TURN via correction_count (reset in stream_response), not per
+        # (see _detect_missing_loot_followup); silently skipping loot
+        # entirely after a kill, with no claim to even catch (see
+        # _detect_missing_loot_consideration_followup — a real adventure NPC
+        # can carry book-specified loot that's lost for good if the model
+        # never thinks to check); or resolving an attack/save against a
+        # surviving monster with no active encounter backing it (see
+        # _detect_missing_encounter_followup). Capped at one retry per
+        # PLAYER TURN via correction_count (reset in stream_response), not per
         # no-tool-calls cycle — a model that stops short after nearly every
         # real tool call could otherwise re-trigger this every loop iteration
         # and never reach the recursion limit's stop condition.
         if correction_count < 1:
             issue = await _detect_missing_followup(state, campaign.id, store)
             if not issue:
+                issue = _detect_missing_combat_roll_followup(notes, called_this_turn)
+            if not issue:
                 issue = _detect_missing_loot_followup(notes, called_this_turn)
+            if not issue:
+                issue = _detect_missing_loot_consideration_followup(state, called_this_turn)
             if not issue:
                 issue = await _detect_missing_encounter_followup(state, campaign.id, store)
             if issue:
-                log.debug("guardrail fired: %s", issue)
+                log.info("guardrail fired: %s", issue)
                 return Command(
                     goto="mechanics",
                     update={
                         "correction_note": issue,
                         "correction_count": correction_count + 1,
+                        "tool_error_count": 0,
+                    },
+                )
+
+        # Stage 2 lore guardrails — same shape as the chain above, own
+        # separate budget (lore_guardrail_count) for the starvation reason
+        # documented on DMState.lore_guardrail_count.
+        lore_guardrail_count = state.get("lore_guardrail_count", 0)
+        if lore_guardrail_count < 1:
+            lore_issue = _detect_uncited_or_invalid_lore_claim(notes, state["messages"])
+            if not lore_issue:
+                lore_issue = _detect_abstention_violation(notes, called_this_turn)
+            if not lore_issue:
+                lore_issue = _detect_spoiler_leak(notes, state["messages"])
+            if lore_issue:
+                log.info("lore guardrail fired: %s", lore_issue)
+                return Command(
+                    goto="mechanics",
+                    update={
+                        "correction_note": lore_issue,
+                        "lore_guardrail_count": lore_guardrail_count + 1,
                         "tool_error_count": 0,
                     },
                 )
@@ -1049,11 +1301,31 @@ def get_world_prep_agent(
     store: CampaignStore,
     rules_store: RulesStore,
     books_in_play: list[str],
+    lore_store: LoreStore,
 ):
     """One-shot, non-interactive agent for automatic world-prep. No
     checkpointer — this isn't a resumable conversation, just a single
     bounded tool-calling run whose prompt is passed directly as a HumanMessage."""
-    tools = get_world_prep_tools(campaign.id, store, rules_store, books_in_play)
+    tools = get_world_prep_tools(campaign.id, store, rules_store, books_in_play, lore_store)
+
+    return create_react_agent(
+        model=_get_model(),
+        tools=_make_tool_node(tools, campaign.id),
+    )
+
+
+def get_npc_prep_agent(
+    campaign: Campaign,
+    store: CampaignStore,
+    rules_store: RulesStore,
+    books_in_play: list[str],
+    lore_store: LoreStore,
+):
+    """One-shot, non-interactive agent for the opening-scene NPC/site-detail
+    seeding pass — same shape as get_world_prep_agent, restricted instead to
+    get_npc_prep_tools (create_npc + set_opening_location_detail + rules
+    search, no party/combat/quest/movement/travel/NPC-runtime tools)."""
+    tools = get_npc_prep_tools(campaign.id, store, rules_store, books_in_play, lore_store)
 
     return create_react_agent(
         model=_get_model(),
@@ -1280,16 +1552,18 @@ async def stream_response(
     history_store: HistoryStore,
     user_message: str,
     thread_id: str,
+    lore_store: LoreStore,
+    graph_store: RelationGraphStore,
 ) -> AsyncIterator[str]:
     """Yield plain-text tokens from the narrator node as they stream. The
     mechanics node's tool-calling loop runs first and is never streamed —
     filtering by langgraph_node keeps its tool-call JSON and reasoning off
     the wire entirely."""
-    agent = get_agent(campaign, store, rules_store, history_store)
+    agent = get_agent(campaign, store, rules_store, history_store, lore_store, graph_store)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
 
     async for event in agent.astream_events(
-        {"messages": [HumanMessage(content=user_message)], "correction_count": 0, "tool_error_count": 0},
+        {"messages": [HumanMessage(content=user_message)], "correction_count": 0, "tool_error_count": 0, "lore_guardrail_count": 0},
         config=config,
         version="v2",
     ):
@@ -1375,8 +1649,35 @@ Below is a session transcript. Write a detailed chronicle (5-10 paragraphs) cove
 Focus on narrative significance. A random combat deserves one sentence; meeting
 a key NPC and learning a secret deserves a full paragraph.
 
+Actual current party state (ground truth — the transcript's own prose can
+narrate things that were never actually applied to a character; do NOT claim
+any item, weapon, or currency gain in your chronicle or key events unless
+it's actually reflected here):
+{party_state}
+
+Relevant adventure text retrieved for context (use this ONLY to help judge
+which transcript events are most significant to the module's actual
+structure — do not invent plot content or connections beyond what the
+transcript itself describes):
+{book_context}
+
 After the chronicle, list 5-10 KEY EVENTS as short bullet points capturing the
 most plot-relevant moments.
+
+Then, in one or two sentences, describe what part of the adventure module
+this session's events leave the party at — a chapter/section name if you can
+identify one, otherwise a plain description of the current story beat (where
+they are, what they're about to do next). This will be used to re-ground the
+next session in the right part of the book.
+
+Finally, list any NEW relationships between named entities (NPCs, locations,
+factions, items) that this session's events established or revealed — e.g. an
+NPC joining a faction, an NPC being placed at a new location, an item
+changing hands, two NPCs turning out to be allied or related. Only include a
+relationship the transcript actually states or clearly implies — do not
+invent connections. One line per relationship, in the form:
+NEW_RELATION: <source entity name> | <short relation phrase> | <target entity name>
+If there are none, output nothing after the marker.
 
 Format your response EXACTLY as:
 {chronicle_marker}
@@ -1384,25 +1685,93 @@ Format your response EXACTLY as:
 {events_marker}
 - event 1
 - event 2
+{progress_marker}
+<one or two sentences on the party's current point in the adventure>
+{relations_marker}
+NEW_RELATION: <source> | <relation> | <target>
 
 Transcript:
 {transcript}"""
 
 
+def _party_ground_truth(campaign: Campaign) -> str:
+    """Real persisted party state — HP, inventory, currency — handed to the
+    summarizer as ground truth. summarize_session has no tool access of its
+    own (unlike the mechanics node), so the transcript's own prose is
+    otherwise its only source of truth — exactly what let a fabricated
+    "stole their weapons" claim slip into a chronicle with no backing loot
+    tool call anywhere in the actual game state."""
+    if not campaign.party:
+        return "(no party members)"
+    lines = []
+    for c in campaign.party:
+        inv = ", ".join(
+            f"{i.name} x{i.quantity}" if i.quantity > 1 else i.name for i in c.inventory
+        ) or "(none)"
+        coins = ", ".join(
+            f"{v} {k}" for k, v in (
+                ("pp", c.currency.pp), ("gp", c.currency.gp), ("ep", c.currency.ep),
+                ("sp", c.currency.sp), ("cp", c.currency.cp),
+            ) if v
+        ) or "none"
+        lines.append(f"- {c.name}: {c.current_hp}/{c.max_hp} HP. Inventory: {inv}. Currency: {coins}.")
+    return "\n".join(lines)
+
+
+def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore) -> str:
+    """Retrieve adventure text relevant to where the party currently stands,
+    for the summarizer to use in judging which transcript events are actually
+    plot-salient — without this, "salience" is purely the summarizer's own
+    guess from prose, with no connection to what the module itself considers
+    important. Query preference: the prior session's own adventure_progress
+    note (closes the loop with build_session_kickoff_message, which uses this
+    same field to re-ground the NEXT session) — falling back to the party's
+    current location for a first session, since there's no prior progress
+    note yet. Returns a graceful placeholder, never raises, if nothing usable
+    is available (no query, index not built, no books in play)."""
+    query = None
+    if campaign.sessions and campaign.sessions[-1].adventure_progress:
+        query = campaign.sessions[-1].adventure_progress
+    elif campaign.current_location_id:
+        loc = next((l for l in campaign.locations if l.id == campaign.current_location_id), None)
+        if loc:
+            query = f"{loc.name}. {loc.description}".strip()
+
+    if not query or not rules_store.is_ready():
+        return "(none retrieved)"
+
+    chunks = rules_store.search(query, books_in_play=campaign.books_in_play)
+    if not chunks:
+        return "(none retrieved)"
+    return "\n\n---\n\n".join(f"[{c.book} — {c.section}]\n{c.content}" for c in chunks)
+
+
+_NEW_RELATION_RE = re.compile(
+    r'^\s*NEW_RELATION:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*$', re.MULTILINE,
+)
+
+
 async def summarize_session(
     thread_id: str,
-    campaign_name: str,
-) -> tuple[str, list[str]]:
-    """Generate a narrative chronicle and key-events list for a session.
+    campaign: Campaign,
+    rules_store: RulesStore,
+) -> tuple[str, list[str], str, list[tuple[str, str, str]]]:
+    """Generate a narrative chronicle, key-events list, adventure-progress
+    note, and any newly-stated entity relationships for a session.
 
-    Returns (summary_text, key_events_list). Both are empty strings / lists
-    if the thread has no dialogue.
+    Returns (summary_text, key_events_list, adventure_progress,
+    relations — a list of (source_name, relation, target_name) tuples for
+    Stage 1.5's incremental relation graph). All empty if the thread has no
+    dialogue. This piggybacks on the one LLM call this function already
+    makes — zero new round-trips, and only the just-ended session's
+    transcript is scanned, the genuinely incremental property Stage 1.5
+    needs (see backend/stores/graph_store.py).
     """
     messages = await get_thread_messages(thread_id)
     turns = format_transcript(messages)
 
     if not turns:
-        return "Session contained no dialogue to summarize.", []
+        return "Session contained no dialogue to summarize.", [], "", []
 
     transcript = "\n\n".join(
         f"{'PLAYER' if t['role'] == 'player' else 'DM'}: {t['content']}"
@@ -1414,12 +1783,18 @@ async def summarize_session(
     token = secrets.token_hex(8)
     chronicle_marker = f"---CHRONICLE-{token}---"
     events_marker = f"---EVENTS-{token}---"
+    progress_marker = f"---PROGRESS-{token}---"
+    relations_marker = f"---RELATIONS-{token}---"
 
     prompt = _SUMMARY_PROMPT.format(
-        campaign_name=campaign_name,
+        campaign_name=campaign.name,
         transcript=transcript,
         chronicle_marker=chronicle_marker,
         events_marker=events_marker,
+        progress_marker=progress_marker,
+        relations_marker=relations_marker,
+        party_state=_party_ground_truth(campaign),
+        book_context=_book_context_for_summary(campaign, rules_store),
     )
 
     llm = _get_model()
@@ -1429,13 +1804,31 @@ async def summarize_session(
     # Parse the structured response
     chronicle = text.strip()
     key_events: list[str] = []
+    adventure_progress = ""
+    relations: list[tuple[str, str, str]] = []
 
     if chronicle_marker in text and events_marker in text:
         parts = text.split(events_marker, 1)
         chronicle = parts[0].replace(chronicle_marker, "").strip()
-        for line in parts[1].splitlines():
+        rest = parts[1]
+        if progress_marker in rest:
+            events_part, rest = rest.split(progress_marker, 1)
+        else:
+            events_part = rest
+            rest = ""
+        for line in events_part.splitlines():
             line = line.lstrip("-•* \t").strip()
             if line:
                 key_events.append(line)
 
-    return chronicle, key_events
+        if relations_marker in rest:
+            progress_part, relations_part = rest.split(relations_marker, 1)
+            adventure_progress = progress_part.strip()
+            relations = [
+                (m.group(1), m.group(2), m.group(3))
+                for m in _NEW_RELATION_RE.finditer(relations_part)
+            ]
+        else:
+            adventure_progress = rest.strip()
+
+    return chronicle, key_events, adventure_progress, relations

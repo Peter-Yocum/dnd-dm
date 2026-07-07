@@ -63,10 +63,13 @@ from backend.agent.world_prep import run_world_prep
 from backend.config import settings
 from backend.data.fivee_options import CLASSES
 from backend.models import Campaign, Session
-from backend.tools._helpers import apply_long_rest, apply_short_rest, read_adventure_meta
+from backend.rag.reranker import LLMJudgeReranker
+from backend.tools._helpers import apply_long_rest, apply_short_rest, find_char, find_location, find_npc, read_adventure_meta
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import draft_store
+from backend.stores.graph_store import PostgresRelationGraphStore
 from backend.stores.history_store import HistoryStore
+from backend.stores.lore_store import LoreStore
 from backend.stores.rules_store import RulesStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -90,17 +93,31 @@ templates = Jinja2Templates(directory="templates")
 def _store() -> CampaignStore:
     return CampaignStore(_engine)
 
-_rules_store = RulesStore(settings.chroma_persist_dir)
+# One reranker instance shared by both stores (constructor injection).
+# LLMJudgeReranker (Ollama-based), not CrossEncoderReranker — this is a
+# low-throughput single-user app, so the extra Ollama round-trip's latency
+# is negligible next to the mechanics/narrator calls already made every
+# turn, and it keeps the container light: no torch/sentence-transformers,
+# which real testing showed OOM-killing under Docker Desktop's default
+# memory allocation anyway.
+_reranker = LLMJudgeReranker()
+_rules_store = RulesStore(settings.chroma_persist_dir, reranker=_reranker)
 _rules_store.load()  # opens the existing ChromaDB collection — without this, is_ready() is
                       # permanently False and every search_rules call fails with "not ready",
                       # silently undermining every "ground it via search_rules" instruction.
-_history_store = HistoryStore(settings.chroma_persist_dir, settings.ollama_base_url)
+_history_store = HistoryStore(settings.chroma_persist_dir, settings.ollama_base_url, reranker=_reranker)
 
 def _rules() -> RulesStore:
     return _rules_store
 
 def _history() -> HistoryStore:
     return _history_store
+
+def _lore() -> LoreStore:
+    return LoreStore(_engine)
+
+def _graph() -> PostgresRelationGraphStore:
+    return PostgresRelationGraphStore(_engine)
 
 def _scan_adventures() -> list[dict]:
     adv_dir = Path("docs/source/adventures")
@@ -131,7 +148,7 @@ def _queue(campaign_id: str) -> asyncio.Queue:
 _background_tasks: set[asyncio.Task] = set()
 
 def _spawn_world_prep(campaign_id: str) -> None:
-    task = asyncio.create_task(run_world_prep(campaign_id, _store(), _rules()))
+    task = asyncio.create_task(run_world_prep(campaign_id, _store(), _rules(), _lore(), _graph()))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
@@ -252,7 +269,7 @@ async def stream(request: Request, campaign_id: str, thread_id: str):
 
             try:
                 async for token in watch_for_stalls(
-                    stream_response(campaign, store, rules, history, message, thread_id)
+                    stream_response(campaign, store, rules, history, message, thread_id, _lore(), _graph())
                 ):
                     if token is STALL:
                         yield {"event": "stall", "data": STALL_MESSAGE}
@@ -311,7 +328,7 @@ async def end_session(campaign_id: str, thread_id: str = Form(...)):
             "summary_preview": existing.summary[:400],
         })
 
-    summary, key_events = await summarize_session(thread_id, campaign.name)
+    summary, key_events, adventure_progress, relations = await summarize_session(thread_id, campaign, _rules())
 
     session_number = len(campaign.sessions) + 1
     session = Session(
@@ -319,18 +336,39 @@ async def end_session(campaign_id: str, thread_id: str = Form(...)):
         real_date=date.today(),
         summary=summary,
         key_events=key_events,
+        adventure_progress=adventure_progress,
         thread_id=thread_id,
     )
     campaign.sessions.append(session)
     campaign.session_count = session_number
     await store.save(campaign)
 
+    # Stage 1.5: best-effort incremental relation-graph update from this
+    # session's newly-stated relationships — resolves each name against
+    # live NPCs/Locations/party characters, silently skipping any name that
+    # doesn't resolve to a known entity (the summarizer has no tool access,
+    # so it can occasionally paraphrase a name slightly).
+    if relations:
+        graph_store = _graph()
+        for source_name, relation, target_name in relations:
+            src = find_npc(campaign, source_name) or find_location(campaign, source_name) or find_char(campaign, source_name)
+            dst = find_npc(campaign, target_name) or find_location(campaign, target_name) or find_char(campaign, target_name)
+            if src and dst:
+                src_type = "npc" if src in campaign.npcs else ("location" if src in campaign.locations else "character")
+                dst_type = "npc" if dst in campaign.npcs else ("location" if dst in campaign.locations else "character")
+                try:
+                    await graph_store.add_edge(
+                        campaign_id, src_type, src.id, src.name, dst_type, dst.id, dst.name, relation,
+                    )
+                except Exception:
+                    log.exception("Failed to record session-end relation %s -> %s for campaign %s", source_name, target_name, campaign_id)
+
     # Fix 4: OllamaEmbeddings.embed_documents is a blocking httpx call — run it
     # off the event loop. Fix 5: if Ollama is down, log and continue; the chronicle
     # is already in Postgres and the route must not fail silently on retry.
     try:
         await asyncio.to_thread(
-            lambda: _history().add_session(campaign_id, session.id, session_number, summary)
+            lambda: _history().add_session(campaign_id, session.id, session_number, summary, key_events)
         )
     except Exception:
         log.exception("ChromaDB indexing failed for session %s (campaign %s); chronicle is safe in Postgres", session.id, campaign_id)

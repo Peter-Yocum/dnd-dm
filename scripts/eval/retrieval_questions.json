@@ -1,0 +1,19 @@
+[
+  {"query": "What is an Aboleth?", "expected_book": "Monster Manual", "expected_section_contains": "Aboleth"},
+  {"query": "Tell me about Ankhegs", "expected_book": "Monster Manual", "expected_section_contains": "Ankheg"},
+  {"query": "What are Animated Objects in D&D?", "expected_book": "Monster Manual", "expected_section_contains": "Animated Objects"},
+  {"query": "What are Planetars?", "expected_book": "Monster Manual", "expected_section_contains": "Planetar"},
+  {"query": "How do settlements work when building a world?", "expected_book": "Dungeon Master'S Guide", "expected_section_contains": "Settlements"},
+  {"query": "How do I create a campaign as a DM?", "expected_book": "Dungeon Master'S Guide", "expected_section_contains": "Creating A Campaign"},
+  {"query": "How do I come up with character names?", "expected_book": "Dungeon Master'S Guide", "expected_section_contains": "Character Names"},
+  {"query": "What is the Bard class like?", "expected_book": "Xanathar", "expected_section_contains": "Bard"},
+  {"query": "What is the Cleric class like?", "expected_book": "Xanathar", "expected_section_contains": "Cleric"},
+  {"query": "What is the Druid class like?", "expected_book": "Xanathar", "expected_section_contains": "Druid"},
+  {"query": "What is the Fighter class like?", "expected_book": "Xanathar", "expected_section_contains": "Fighter"},
+  {"query": "Tell me about Beholder lairs", "expected_book": "Volo", "expected_section_contains": "Beholder Lairs"},
+  {"query": "What are Hill Giants like?", "expected_book": "Volo", "expected_section_contains": "Hill Giants"},
+  {"query": "How do ability checks work?", "expected_book": "Player'S Handbook", "expected_section_contains": "Ability Check"},
+  {"query": "How do saving throws work?", "expected_book": "Player'S Handbook", "expected_section_contains": "Saving Throw"},
+  {"query": "What skills exist for characters in D&D?", "expected_book": "Player'S Handbook", "expected_section_contains": "Skills"},
+  {"query": "How does exploration work as a game mechanic?", "expected_book": "Player'S Handbook", "expected_section_contains": "Exploration"}
+]

@@ -16,6 +16,7 @@ from backend.models import AbilityScores, Character
 from backend.stores.campaign_store import CampaignStore
 from backend.tools._helpers import (
     build_spells_known, derive_level1_stats, derive_saving_throw_proficiencies, derive_spellcasting_stats,
+    find_npc,
 )
 
 
@@ -76,6 +77,12 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         existing = next((c for c in campaign.party if c.name.lower() == name.lower()), None)
         if existing:
             return f"A character named '{name}' already exists in the party. Choose a different name."
+        if find_npc(campaign, name):
+            return (
+                f"'{name}' is already an NPC's name in this campaign — pick a different "
+                f"name for this companion. Two characters sharing a name is confusing "
+                f"and easy to mix up in play."
+            )
 
         ab = AbilityScores(
             strength=strength, dexterity=dexterity, constitution=constitution,

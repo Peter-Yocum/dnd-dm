@@ -2,58 +2,61 @@
 """
 ocr_ingest.py — Convert PDF rulebooks to clean Markdown for the DM RAG pipeline.
 
-Two-tier extraction, macOS only:
-  Tier 1 — PyMuPDF native text  (digital PDFs — instant, perfect quality)
-  Tier 2 — Apple Vision OCR     (scanned/photo PDFs — on-device, the same
-                                 engine behind Preview's Live Text)
+Uses MinerU's vlm-engine backend (MLX-accelerated on Apple Silicon): a
+purpose-built PDF→Markdown pipeline with a real layout/reading-order model,
+so it handles multi-column pages and strips running headers/footers/page
+numbers natively. This replaced an earlier PyMuPDF-native-text +
+Apple-Vision-OCR pipeline, which had neither: raw PyMuPDF text extraction has
+no layout awareness at all, and Vision (the engine behind Live Text) scrambled
+some multi-column pages and let running headers bleed into body text.
 
-Vision reads in its own layout-aware result order — verified correct on
-genuine two-column pages, do not "improve" this with a manual position
-sort, it makes column pages worse (see _ocr_page_with_vision). It
-occasionally garbles stylized/decorative sidebar text; clean_source.py's
-LLM cleanup pass is the intended fix-up step for that.
-
-Per-PDF detection: the script samples the first few pages. If embedded text
-is dense enough, it uses Tier 1. Otherwise it falls through to Tier 2. Most
-purchased D&D PDFs (DMs Guild, official releases) are digital and hit Tier 1
-immediately. Photographed or photocopied books use Tier 2. Note a PDF that's
-*visually* selectable in a viewer isn't necessarily digital at the file
-level — macOS Live Text does its own on-the-fly OCR over pure page-image
-PDFs, which can look identical to real embedded text until you check the
-file itself.
+Every PDF — digital or scanned — goes through the same MinerU vlm-engine
+path. This costs meaningfully more time on already-digital PDFs than the old
+fast PyMuPDF path did (MinerU is a page-image VLM read, tens of seconds per
+page, regardless of whether the PDF already had a clean text layer), but a
+uniform path is what actually fixes the reading-order/header bugs, and
+per-PDF speed isn't the bottleneck for a personal library ingested once.
 
 Usage:
     python ocr_ingest.py                         # whole docs/raw/ folder
     python ocr_ingest.py --file docs/raw/foo.pdf
     python ocr_ingest.py --file docs/raw/foo.pdf --start-page 306 --pages 1
     python ocr_ingest.py --force                 # re-process even if .md exists
-    python ocr_ingest.py --no-ocr                # skip scanned PDFs entirely
 
 Requirements:
-    pip install pyobjc-framework-Vision pyobjc-framework-Quartz
+    uv pip install -U "mineru[all]"
+
+    The MLX backend needs macOS 13.5+ on Apple Silicon and `mlx-vlm` to
+    import cleanly, or MinerU silently falls back to a much slower
+    CPU/transformers path. Verify before running a big job:
+        python -c "from mineru.utils.engine_utils import _select_mac_engine; print(_select_mac_engine())"
+    This must print "mlx", not "transformers". If it prints "transformers",
+    `import mlx_vlm` is failing (check for a broken transformers/torchvision
+    import chain — e.g. a Python built without _lzma support breaks this).
 """
 
 import argparse
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-import fitz  # PyMuPDF — already in requirements.txt
+import fitz  # PyMuPDF — only used here for page counts, not extraction
 
-DEFAULT_INPUT       = "docs/raw"
-DEFAULT_OUTPUT      = "docs/source"
-DIGITAL_THRESHOLD   = 100   # avg chars/page below this → treat as scanned
-DETECTION_SAMPLE    = 5     # pages sampled to decide digital vs scanned
-DEFAULT_VISION_DPI  = 300   # page render resolution for Vision OCR
+DEFAULT_INPUT  = "docs/raw"
+DEFAULT_OUTPUT = "docs/source"
 
-
-# ── Tier 1: native text extraction ────────────────────────────────────────────
-
-def _is_scanned(doc: fitz.Document) -> bool:
-    sample = min(len(doc), DETECTION_SAMPLE)
-    total  = sum(len(doc[i].get_text().strip()) for i in range(sample))
-    avg    = total / sample if sample else 0
-    return avg < DIGITAL_THRESHOLD
+# MinerU's vlm-engine batches a multi-page run into internal 64-page
+# "windows" and hands off between them. That handoff was confirmed live to
+# crash reproducibly ("Timed out waiting for result of task") at exactly
+# page 128 (= 2 * 64) on two separate full-book (387-page) runs of the same
+# PDF, while an isolated 15-page run spanning that exact page range
+# completed cleanly — i.e. it's the window-to-window handoff itself that's
+# broken, not any particular page. Keeping every individual mineru
+# invocation at or under one window's worth of pages sidesteps the handoff
+# entirely.
+_CHUNK_PAGES = 60
 
 
 def _partial_path(out_path: Path) -> Path:
@@ -65,198 +68,85 @@ def _partial_path(out_path: Path) -> Path:
     return out_path.with_suffix(out_path.suffix + ".partial")
 
 
-def _extract_digital(doc: fitz.Document, out_path: Path, first: int, last: int) -> int:
-    """Write native markdown from embedded PDF text. Returns char count."""
-    total  = len(doc)
-    chars  = 0
-    partial = _partial_path(out_path)
-
-    with partial.open("w", encoding="utf-8") as fh:
-        for i in range(first, last):
-            md = doc[i].get_text("text").strip()
-            if not md:
-                md = f"<!-- page {i + 1}/{total}: no embedded text -->"
-            fh.write(md + ("\n\n" if i < last - 1 else ""))
-            fh.flush()
-            chars += len(md)
-            print(f"    page {i + 1}/{total}")
-
-    partial.replace(out_path)
-    return chars
-
-
-# ── Tier 2: Apple Vision OCR (macOS only) ──────────────────────────────────────
-
-def _load_vision():
-    """Import pyobjc's Vision/Quartz bindings. macOS-only — the Vision
-    framework isn't available on other platforms, so this fails fast with a
-    clear message rather than letting an ImportError look like a real bug."""
-    if sys.platform != "darwin":
-        print("Scanned-PDF OCR requires macOS (uses Apple's Vision framework).", file=sys.stderr)
-        sys.exit(1)
-    try:
-        import Quartz
-        import Vision
-        from Foundation import NSURL
-        return Vision, Quartz, NSURL
-    except ImportError:
-        print(
-            "pyobjc Vision bindings not installed. Run:\n"
-            "  pip install pyobjc-framework-Vision pyobjc-framework-Quartz",
-            file=sys.stderr,
+def _run_mineru_range(mineru_bin: Path, pdf_path: Path, first: int, last: int) -> str:
+    """Run MinerU's vlm-engine over pages [first, last) (0-based, half-open)
+    and return the resulting markdown text for just that range. MinerU
+    writes into its own <stem>/vlm/<stem>.md layout (plus images/ and
+    various json sidecars) inside a scratch directory; only the final .md's
+    text is kept. Raises CalledProcessError on failure."""
+    with tempfile.TemporaryDirectory() as scratch:
+        subprocess.run(
+            [
+                str(mineru_bin),
+                "-p", str(pdf_path),
+                "-o", scratch,
+                "-s", str(first),
+                "-e", str(last - 1),
+                "-b", "vlm-engine",
+            ],
+            check=True,
         )
-        sys.exit(1)
+        produced = Path(scratch) / pdf_path.stem / "vlm" / f"{pdf_path.stem}.md"
+        return produced.read_text(encoding="utf-8")
 
 
-MAX_RENDER_DIMENSION = 6000  # pixels — comfortably under MuPDF's internal size cap
-
-
-def _render_page_safely(page: "fitz.Page", dpi: int) -> "fitz.Pixmap":
-    """Render a page to a pixmap, capping the effective DPI so the output
-    never exceeds MAX_RENDER_DIMENSION per side.
-
-    Most pages are normal book-page sized and render at the requested DPI
-    unchanged. But some adventure PDFs bind fold-out maps/posters as pages
-    sized to their full physical print dimensions (observed: a page with
-    rect 6000x4215 *points* — roughly 83x58 inches — versus ~565x780 points
-    for a normal page). Rendering a page that size at 300 DPI asks MuPDF for
-    a ~25000x17500px pixmap, well past its internal safety limit, and it
-    raises FzErrorLimit("Overly large image") instead of returning one. Map
-    labels are low-value for RAG search anyway, so scaling down to fit is an
-    acceptable tradeoff, not a quality-critical page.
+def _extract_with_mineru(pdf_path: Path, out_path: Path, first: int, last: int, force: bool) -> int:
+    """Run MinerU over pages [first, last) (0-based, half-open) in
+    <= _CHUNK_PAGES windows, checkpointing each window's raw text to a cache
+    dir next to out_path before concatenating everything into out_path.
+    A crash loses at most one window's work (a few minutes), not the whole
+    book — re-running the same command skips windows whose cache file
+    already exists, same discipline as extract_entities.py's per-entity
+    checkpointing.
     """
-    rect = page.rect
-    scale = dpi / 72.0
-    px_w, px_h = rect.width * scale, rect.height * scale
-    longest = max(px_w, px_h)
-    if longest > MAX_RENDER_DIMENSION:
-        dpi = int(dpi * (MAX_RENDER_DIMENSION / longest))
-    return page.get_pixmap(dpi=dpi)
-
-
-def _ocr_page_with_vision(pix: "fitz.Pixmap", Vision, Quartz, NSURL) -> str:
-    """Run on-device Vision OCR against a rendered page image, returning
-    recognized text in reading order.
-
-    Deliberately does NOT re-sort Vision's `request.results()` order — Vision
-    already does its own layout-aware ordering internally (verified: on a
-    genuine two-column page, its natural result order reads correctly
-    top-to-bottom within each column, while re-sorting purely by y-position
-    interleaves the two columns line-by-line and scrambles the text). Trust
-    it. Any remaining rough edges (stylized/decorative sidebar text in
-    particular) are exactly what clean_source.py's LLM pass is designed to
-    catch and fix afterward.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
-        pix.save(tmp.name)
-        url = NSURL.fileURLWithPath_(tmp.name)
-        source = Quartz.CGImageSourceCreateWithURL(url, None)
-        cg_image = Quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
-
-        observations = []
-
-        def handler(request, error):
-            if error:
-                return
-            observations.extend(request.results())
-
-        request = Vision.VNRecognizeTextRequest.alloc().initWithCompletionHandler_(handler)
-        request.setRecognitionLevel_(1)       # VNRequestTextRecognitionLevelAccurate
-        request.setUsesLanguageCorrection_(True)
-        req_handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, None)
-        req_handler.performRequests_error_([request], None)
-
-        return _join_as_markdown(observations)
-
-
-_PARAGRAPH_GAP_MULTIPLIER = 1.8  # line gap this many times the page's typical
-                                  # line spacing is treated as a paragraph break
-
-
-def _join_as_markdown(observations: list) -> str:
-    """Join Vision's line observations into real markdown — a blank line
-    between paragraphs, a single newline within one. Vision returns
-    line-level text with no paragraph grouping, so paragraph breaks are
-    inferred from vertical spacing: line gaps cluster tightly around the
-    page's typical line-to-line spacing (verified: stddev is tiny — a real
-    body-text page's gaps bunch around one value with a handful of clear
-    outliers at 2-5x that value, which are genuine paragraph/section
-    breaks). This matters beyond readability — clean_source.py's paragraph
-    splitter (`text.split("\\n\\n")`) depends on real paragraph boundaries
-    existing; without this, it saw "one page = one paragraph" and merged
-    hundreds of pages into single LLM calls that blew past the model's
-    context window.
-
-    A negative gap (jumping from the bottom of one column back to the top
-    of the next) is excluded from the "typical spacing" baseline but still
-    only gets a single newline, not a paragraph break — imperfect at true
-    column boundaries, but doesn't reintroduce the group-explosion problem.
-    """
-    lines = [o.topCandidates_(1)[0].string() for o in observations]
-    if len(observations) < 3:
-        return "\n".join(lines)
-
-    ys = [o.boundingBox().origin.y for o in observations]  # bottom-left origin
-    gaps = [ys[i] - ys[i + 1] for i in range(len(ys) - 1)]  # positive = moving down the page
-    positive_gaps = sorted(g for g in gaps if g > 0)
-    if not positive_gaps:
-        return "\n".join(lines)
-    median_gap = positive_gaps[len(positive_gaps) // 2]
-
-    out = [lines[0]]
-    for i, gap in enumerate(gaps):
-        out.append("\n\n" if gap > median_gap * _PARAGRAPH_GAP_MULTIPLIER else "\n")
-        out.append(lines[i + 1])
-    return "".join(out)
-
-
-def _extract_with_vision(pdf_path: Path, out_path: Path, first: int, last: int, dpi: int) -> int:
-    """Run Apple Vision OCR on a scanned PDF and write the resulting markdown.
-
-    A single bad page (rendering failure, corrupt image data, etc.) doesn't
-    abort a multi-hundred-page run — it's recorded as a placeholder comment
-    and extraction continues, matching how a genuinely textless page is
-    already handled.
-    """
-    Vision, Quartz, NSURL = _load_vision()
-    doc = fitz.open(pdf_path)
-    total = len(doc)
-    chars = 0
     partial = _partial_path(out_path)
 
-    with partial.open("w", encoding="utf-8") as fh:
-        for i in range(first, last):
-            try:
-                pix = _render_page_safely(doc[i], dpi)
-                text = _ocr_page_with_vision(pix, Vision, Quartz, NSURL).strip()
-            except Exception as e:
-                print(f"    page {i + 1}/{total}: FAILED ({e}) — writing placeholder")
-                text = ""
-            if not text:
-                text = f"<!-- page {i + 1}/{total}: no text recognized -->"
-            fh.write(text + ("\n\n" if i < last - 1 else ""))
-            fh.flush()
-            chars += len(text)
-            print(f"    page {i + 1}/{total}")
+    # Resolve mineru relative to the running interpreter rather than trusting
+    # PATH — invoking this script via a venv's python (e.g. .venv/bin/python
+    # scripts/ocr_ingest.py) does not put that venv's bin/ on PATH, so a bare
+    # "mineru" lookup fails even though it's installed right next to it.
+    mineru_bin = Path(sys.executable).parent / "mineru"
+    if not mineru_bin.exists():
+        mineru_bin = Path("mineru")  # fall back to PATH lookup
 
-    doc.close()
+    cache_dir = out_path.parent / f".{pdf_path.stem}.ocr_chunks"
+    if force and cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    texts: list[str] = []
+    pos = first
+    while pos < last:
+        chunk_end = min(last, pos + _CHUNK_PAGES)
+        chunk_path = cache_dir / f"{pos:04d}_{chunk_end:04d}.md"
+        if chunk_path.exists():
+            print(f"    pages {pos + 1}-{chunk_end}: cached, skipping")
+        else:
+            print(f"    pages {pos + 1}-{chunk_end}: extracting...")
+            text = _run_mineru_range(mineru_bin, pdf_path, pos, chunk_end)
+            chunk_partial = _partial_path(chunk_path)
+            chunk_partial.write_text(text, encoding="utf-8")
+            chunk_partial.replace(chunk_path)
+        texts.append(chunk_path.read_text(encoding="utf-8"))
+        pos = chunk_end
+
+    combined = "\n\n".join(texts)
+    partial.write_text(combined, encoding="utf-8")
     partial.replace(out_path)
-    return chars
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    return len(combined)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Convert PDFs to Markdown for the DM RAG pipeline.")
-    ap.add_argument("--input",             default=DEFAULT_INPUT,  help="folder of source PDFs")
-    ap.add_argument("--output",            default=DEFAULT_OUTPUT, help="folder for .md output")
-    ap.add_argument("--file",              default=None,           help="process a single PDF instead of the whole folder")
-    ap.add_argument("--pages",             type=int, default=None, help="max pages to process (default: all)")
-    ap.add_argument("--start-page",        type=int, default=1,    help="1-based page to start from (default: 1)")
-    ap.add_argument("--force",             action="store_true",    help="re-process even if .md already exists")
-    ap.add_argument("--no-ocr",            action="store_true",    help="skip scanned PDFs rather than running OCR")
-    ap.add_argument("--dpi",               type=int, default=DEFAULT_VISION_DPI,
-                     help=f"page render resolution for OCR (default: {DEFAULT_VISION_DPI})")
+    ap.add_argument("--input",      default=DEFAULT_INPUT,  help="folder of source PDFs")
+    ap.add_argument("--output",     default=DEFAULT_OUTPUT, help="folder for .md output")
+    ap.add_argument("--file",       default=None,           help="process a single PDF instead of the whole folder")
+    ap.add_argument("--pages",      type=int, default=None, help="max pages to process (default: all)")
+    ap.add_argument("--start-page", type=int, default=1,    help="1-based page to start from (default: 1)")
+    ap.add_argument("--force",      action="store_true",    help="re-process even if .md already exists")
     args = ap.parse_args()
 
     in_dir   = Path(args.input)
@@ -276,9 +166,9 @@ def main() -> None:
 
     first = max(0, args.start_page - 1)  # convert to 0-based
 
-    scanned_skipped = 0
-
     print(f"{len(pdfs)} PDF(s) to process\n")
+
+    had_failure = False
 
     for pdf in pdfs:
         out_path = out_dir / f"{pdf.stem}.md"
@@ -287,26 +177,19 @@ def main() -> None:
             print(f"SKIP  {pdf.name}  (already done — use --force to redo)")
             continue
 
-        doc  = fitz.open(pdf)
+        doc   = fitz.open(pdf)
         total = len(doc)
         last  = min(total, first + args.pages) if args.pages else total
+        doc.close()
 
-        print(f"── {pdf.name}  ({total} pages) ──")
+        print(f"── {pdf.name}  ({total} pages, converting {last - first}) ──")
 
-        if _is_scanned(doc):
-            print(f"  Type: SCANNED")
-            if args.no_ocr:
-                print(f"  Skipped (--no-ocr set)")
-                scanned_skipped += 1
-                doc.close()
-                continue
-            doc.close()
-            print(f"  Engine: Vision (on-device OCR)")
-            chars = _extract_with_vision(pdf, out_path, first, last, args.dpi)
-        else:
-            print(f"  Type: DIGITAL (native text)")
-            chars = _extract_digital(doc, out_path, first, last)
-            doc.close()
+        try:
+            chars = _extract_with_mineru(pdf, out_path, first, last, args.force)
+        except subprocess.CalledProcessError as e:
+            print(f"  FAILED: mineru exited with code {e.returncode}", file=sys.stderr)
+            had_failure = True
+            continue
 
         size_kb = out_path.stat().st_size // 1024
         print(f"  Wrote {out_path.name}  ({chars:,} chars, {size_kb} KB)")
@@ -319,10 +202,13 @@ def main() -> None:
 
         print()
 
-    if scanned_skipped:
-        print(f"\n{scanned_skipped} scanned PDF(s) skipped. Re-run without --no-ocr to process them.")
-
     print("Done.")
+    # A caller chaining this into a pipeline (e.g. an overnight ingest queue)
+    # needs the exit code to actually reflect failure — a caught
+    # CalledProcessError was silently swallowed here before, so a crashed
+    # mineru run still reported success (exit 0) up the chain.
+    if had_failure:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

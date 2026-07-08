@@ -18,6 +18,27 @@ class RuleChunk(BaseModel):
     parent_chunk_id: str = ""
 
 
+# A decorative drop-cap (the oversized first letter of a flavor-text
+# paragraph, e.g. the "W" in "WIZARDS ARE DEFINED...") occasionally gets
+# OCR'd/parsed as its own one-character "# W" section header instead of
+# staying part of the paragraph it belongs to — confirmed live via
+# eval_retrieval.py: PHB has 3 of these, Monster Manual 26, DMG 0
+# (`grep -c '^# [A-Z]$'` against the indexed markdown). The resulting
+# section is short and keyword-dense (it's the start of the real prose,
+# just missing its first letter), which can out-rank the correctly-parsed
+# section on BM25's length-normalized scoring — confirmed live: "What is
+# the Wizard class like?" hybrid-ranked the bogus "W" section above the
+# real "WIZARD CLASS FEATURES" section. A real OCR/chunking fix belongs
+# upstream (the markdown header-detection step) and would need a reindex;
+# this is the cheap retrieval-time mitigation — drop any single-letter
+# section from the candidate pool before it can compete for a rank slot.
+_DROP_CAP_SECTION_RE = re.compile(r"^[A-Za-z]$")
+
+
+def _is_drop_cap_artifact(chunk: "RuleChunk") -> bool:
+    return bool(_DROP_CAP_SECTION_RE.match(chunk.section))
+
+
 class RulesStore:
     def __init__(
         self,
@@ -113,23 +134,37 @@ class RulesStore:
             )
         return result
 
-    def _expand_to_parents(self, chunks: list[RuleChunk]) -> list[RuleChunk]:
+    def _expand_to_parents(self, chunks: list[RuleChunk], k: int) -> list[RuleChunk]:
         """Replace each child chunk with its full parent section (one Chroma
         get() call for all needed parents), deduping if two surviving
         children share a parent — the "parent-document retrieval" pattern,
-        achieved via existing metadata rather than a second docstore."""
+        achieved via existing metadata rather than a second docstore.
+
+        `chunks` should be reranked-in-full (not pre-truncated to k) so this
+        can backfill: walks the reranked order and stops once k DISTINCT
+        parents are collected, rather than truncating to k children first
+        and deduping after. Confirmed live (recall@k eval, 2026-07-08) that
+        truncate-then-dedupe can silently shrink well below k — a short
+        section (e.g. a class's flavor-text intro) split across several
+        child sub-chunks can occupy most of the pre-dedup top-k on its own,
+        crowding out a more relevant, differently-titled section (e.g. that
+        same class's "CLASS FEATURES" section) that ranked just below the
+        old cutoff. Backfilling from the fuller reranked order fixes that
+        without changing the reranker itself."""
         parent_ids = [c.parent_chunk_id for c in chunks if c.parent_chunk_id]
         parents = self._hydrate(list(dict.fromkeys(parent_ids))) if parent_ids else {}
 
         results: list[RuleChunk] = []
         seen_parents: set[str] = set()
         for c in chunks:
+            if len(results) >= k:
+                break
             if c.parent_chunk_id and c.parent_chunk_id in parents:
                 if c.parent_chunk_id in seen_parents:
                     continue
                 seen_parents.add(c.parent_chunk_id)
                 results.append(parents[c.parent_chunk_id])
-            else:
+            elif not c.parent_chunk_id:
                 # No parent on record (e.g. this hit already was a parent,
                 # or the index predates the parent/child split) — return it
                 # as-is rather than dropping it.
@@ -172,10 +207,15 @@ class RulesStore:
             return []
 
         hydrated = self._hydrate(fused_ids)
-        candidates = [hydrated[cid] for cid in fused_ids if cid in hydrated]
+        candidates = [hydrated[cid] for cid in fused_ids if cid in hydrated and not _is_drop_cap_artifact(hydrated[cid])]
 
-        reranked = self._reranker.rerank(query, candidates, top_n=k)
-        return self._expand_to_parents(reranked)
+        # Rerank the FULL candidate set (top_n=len(candidates), not k) —
+        # _expand_to_parents needs the fuller order to backfill past a
+        # dedup collapse; both Reranker implementations already compute the
+        # complete ranking internally before slicing to top_n, so this costs
+        # nothing extra (same single LLM/cross-encoder call either way).
+        reranked = self._reranker.rerank(query, candidates, top_n=len(candidates))
+        return self._expand_to_parents(reranked, k)
 
     def search_adventure_only(self, query: str, adventure: str, k: int = 4) -> list[RuleChunk]:
         """Search only the given adventure's indexed text — no core rulebook

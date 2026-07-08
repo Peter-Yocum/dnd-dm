@@ -284,36 +284,55 @@ complete. Output exactly one line per distinct entity, nothing else."""
 _CANON_LINE_RE = re.compile(r'^\s*CANONICAL:\s*(.+?)\s*\|\s*ALIASES:\s*(.+?)\s*$', re.MULTILINE)
 
 
+CANONICALIZE_BATCH_SIZE = 150
+
+
 def canonicalize(names: set[str], kind: str, model: str, ollama_url: str) -> dict[str, list[str]]:
     """Returns {canonical_name: [aliases...]}. Skip-on-doubt: any name the
     LLM response doesn't account for becomes its own canonical entity with
-    no aliases — worse for dedup, but never silently drops an entity."""
+    no aliases — worse for dedup, but never silently drops an entity.
+
+    Batched at CANONICALIZE_BATCH_SIZE names/call rather than one call over
+    the whole set — confirmed live against the DMG's magic-item tables (a
+    single-call canonicalize with no output cap and temperature=0) ran for
+    5+ hours with zero progress visibility before being killed. Batches are
+    sliced off the SORTED name list so alias variants of the same name
+    (which usually share a prefix, e.g. "Rose"/"Rosavalda") tend to land in
+    the same or an adjacent batch; canonicalization across a batch boundary
+    is not attempted — same skip-on-doubt tradeoff as always, worse dedup
+    but no silent drops."""
     if not names:
         return {}
 
     from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
+    from tqdm import tqdm
 
-    numbered = "\n".join(sorted(names))
+    sorted_names = sorted(names)
+    batches = [sorted_names[i:i + CANONICALIZE_BATCH_SIZE] for i in range(0, len(sorted_names), CANONICALIZE_BATCH_SIZE)]
     llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
-    response = llm.invoke([
-        SystemMessage(content=_CANON_SYSTEM),
-        HumanMessage(content=_CANON_PROMPT.format(kind=kind, numbered=numbered)),
-    ])
 
     result: dict[str, list[str]] = {}
-    seen_raw: set[str] = set()
-    for m in _CANON_LINE_RE.finditer(response.content):
-        canonical = m.group(1).strip()
-        aliases_raw = m.group(2).strip()
-        aliases = [] if aliases_raw.lower() == "none" else [a.strip() for a in aliases_raw.split(",")]
-        result[canonical] = aliases
-        seen_raw.add(canonical)
-        seen_raw.update(aliases)
+    desc = f"  Canonicalizing {kind}"
+    for batch in (tqdm(batches, desc=desc, unit="batch", dynamic_ncols=True) if len(batches) > 1 else batches):
+        numbered = "\n".join(batch)
+        response = llm.invoke([
+            SystemMessage(content=_CANON_SYSTEM),
+            HumanMessage(content=_CANON_PROMPT.format(kind=kind, numbered=numbered)),
+        ])
 
-    for name in names:
-        if name not in seen_raw:
-            result[name] = []
+        batch_seen: set[str] = set()
+        for m in _CANON_LINE_RE.finditer(response.content):
+            canonical = m.group(1).strip()
+            aliases_raw = m.group(2).strip()
+            aliases = [] if aliases_raw.lower() == "none" else [a.strip() for a in aliases_raw.split(",")]
+            result[canonical] = aliases
+            batch_seen.add(canonical)
+            batch_seen.update(aliases)
+
+        for name in batch:
+            if name not in batch_seen:
+                result[name] = []
 
     return result
 

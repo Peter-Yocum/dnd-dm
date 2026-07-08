@@ -9,7 +9,37 @@ from __future__ import annotations
 
 import os
 import pickle
+import re
 from pathlib import Path
+
+# Confirmed live (eval_retrieval.py, 2026-07-08): the old tokenizer was a
+# bare `text.lower().split()` — no punctuation stripping, no stopword
+# filtering. A natural-language query like "What is the Wizard class like?"
+# tokenized to ['what','is','the','wizard','class','like?'] — five
+# near-universal filler tokens (one, "like?", couldn't even match anything,
+# since the corpus's own naive tokenizer would never emit a token with a
+# trailing "?" attached) drowning out the one actually distinctive term.
+# BM25Okapi sums a score per query token, so "class" alone (common across
+# every "X CLASS FEATURES" section, plus loads of unrelated DMG prose) was
+# enough to rank several completely unrelated sections above the real
+# "WIZARD CLASS FEATURES" section, which never appeared in the top 30 at
+# all. Fix: strip punctuation (regex word-extraction) and drop a small
+# stopword list, applied identically to corpus text at build time and to
+# queries at search time — they must stay in lockstep or scores become
+# meaningless. No new dependency; this is deliberately not a full NLP
+# stopword list (e.g. NLTK's), just enough to stop query-filler words from
+# competing with content words for score weight.
+_STOPWORDS = frozenset("""
+    a an the of in on at is are was were be been being to for with and or
+    as that this these those it its i you your my me do does did how what
+    which who whom tell me about like
+""".split())
+
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def _tokenize(text: str) -> list[str]:
+    return [t for t in _WORD_RE.findall(text.lower()) if t not in _STOPWORDS]
 
 
 def _matches_where(metadata: dict, where: dict) -> bool:
@@ -52,7 +82,7 @@ class BM25Index:
         idx = cls()
         idx._chunk_ids = list(chunk_ids)
         idx._metadatas = list(metadatas)
-        idx._bm25 = BM25Okapi([t.lower().split() for t in texts]) if texts else None
+        idx._bm25 = BM25Okapi([_tokenize(t) for t in texts]) if texts else None
         return idx
 
     def save(self, path: str) -> None:
@@ -83,7 +113,7 @@ class BM25Index:
         """Returns [(chunk_id, score), ...], highest score first."""
         if self._bm25 is None or not self._chunk_ids:
             return []
-        scores = self._bm25.get_scores(query.lower().split())
+        scores = self._bm25.get_scores(_tokenize(query))
         candidates = [
             (self._chunk_ids[i], float(scores[i]))
             for i in range(len(self._chunk_ids))

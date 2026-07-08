@@ -5,6 +5,18 @@
 # rather than cascading bad/missing data into the next stage. Safe to leave
 # running unattended; re-running any of the underlying steps by hand later
 # is also safe (build_index.py/extract_entities.py are both resumable).
+#
+# Contextualization deliberately SKIPPED (skip_context=1 on every book) —
+# PHB's own contextualization pass was projected at ~56 more hours (110,061
+# chunks at ~2s/chunk), and the laptop needs to be turned off, not run for
+# days unattended. Reasonable tradeoff: contextualization matters most for
+# prose-heavy narrative content, much less for structured reference content
+# (spell lists, stat blocks, tables) that's mostly self-contained and already
+# covered by BM25 keyword search regardless — exactly what PHB/MM/DMG are.
+# One side effect: PHB already has ~3,792 chunks indexed WITH contextual
+# blurbs from before this switch (see chunk_id-based resumability — those
+# already-done ids are skipped, not re-indexed) — a harmless one-time
+# inconsistency, not worth a slower full re-embed to "fix."
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,14 +44,18 @@ verify_md() {
 spot_check() {
   local path="$1"
   log "--- spot-check sample from $path (eyeball this for column garbling in the morning) ---"
+  # Path passed as argv, not interpolated into the Python source itself —
+  # book names with an apostrophe (e.g. "Dungeon Master's Guide") broke the
+  # single-quoted Python string literal when interpolated directly.
   ./.venv/bin/python -c "
-t = open('$path', encoding='utf-8').read()
+import sys
+t = open(sys.argv[1], encoding='utf-8').read()
 i = t.find('Armor Class')
 if i == -1:
     print('(no \"Armor Class\" occurrence found to sample)')
 else:
     print(t[max(0, i - 200):i + 500])
-"
+" "$path"
 }
 
 # Root-caused the earlier crash: MinerU's vlm-engine hands off between
@@ -72,20 +88,20 @@ ocr_with_retry() {
 
 ocr_with_retry "docs/raw/done/D&D 5.5E - Player's Handbook.pdf" "docs/source/core/D&D 5.5E - Player's Handbook.md" "Player's Handbook" || exit 1
 
-log "=== [1/6] make ingest-book: Player's Handbook ==="
-make ingest-book book="D&D 5.5E - Player's Handbook" source_type=core || { log "ABORT: PHB ingest failed"; exit 1; }
+log "=== [1/6] make ingest-book-native: Player's Handbook (contextualization SKIPPED — speed over quality, see below) ==="
+make ingest-book-native book="D&D 5.5E - Player's Handbook" source_type=core skip_context=1 write_postgres=1 || { log "ABORT: PHB ingest failed"; exit 1; }
 log "PHB ingest complete"
 
 ocr_with_retry "docs/raw/done/D&D 5E - Monster Manual.pdf" "docs/source/core/D&D 5E - Monster Manual.md" "Monster Manual" || exit 1
 
-log "=== [3/6] make ingest-book: Monster Manual (monster-only extraction) ==="
-make ingest-book book="D&D 5E - Monster Manual" source_type=core kinds=monster || { log "ABORT: MM ingest failed"; exit 1; }
+log "=== [3/6] make ingest-book-native: Monster Manual (monster-only extraction, contextualization SKIPPED) ==="
+make ingest-book-native book="D&D 5E - Monster Manual" source_type=core kinds=monster skip_context=1 write_postgres=1 || { log "ABORT: MM ingest failed"; exit 1; }
 log "MM ingest complete"
 
 ocr_with_retry "docs/raw/done/D&D 5E - Dungeon Master's Guide.pdf" "docs/source/core/D&D 5E - Dungeon Master's Guide.md" "Dungeon Master's Guide" || exit 1
 
-log "=== [5/6] make ingest-book: Dungeon Master's Guide ==="
-make ingest-book book="D&D 5E - Dungeon Master's Guide" source_type=core || { log "ABORT: DMG ingest failed"; exit 1; }
+log "=== [5/6] make ingest-book-native: Dungeon Master's Guide (contextualization SKIPPED) ==="
+make ingest-book-native book="D&D 5E - Dungeon Master's Guide" source_type=core skip_context=1 write_postgres=1 || { log "ABORT: DMG ingest failed"; exit 1; }
 log "DMG ingest complete"
 
 log "=== [6/6] ALL DONE — PHB + Monster Manual + Dungeon Master's Guide fully re-OCR'd and re-ingested ==="

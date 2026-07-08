@@ -727,6 +727,376 @@ Also fixed along the way, discovered by this testing:
 
 ---
 
+## Evolution: From Naive RAG to a Hybrid Retrieval Pipeline
+
+This section exists because the re-architecture described below happened in
+one large commit and was never written up anywhere — the code changed, this
+doc didn't. Written retroactively (2026-07-08) as a record of what the first
+version got right/wrong and what specifically replaced it, for anyone
+(including future-me) who wants the reasoning, not just the current state.
+
+### Phase 0 — the naive baseline (through 2026-07-05)
+
+The first working version's RAG was about as simple as it gets:
+`RulesStore.search()` was one call — `Chroma.similarity_search(query, k=4,
+filter=where)` — plain dense-vector top-k, nothing else. Ingestion
+(`build_index.py`) chunked each `.md` file on `##`/`###` headers, capped at
+1500 chars, embedded with `nomic-embed-text`, done. No BM25, no reranking,
+no contextualization, no parent/child structure, no entity extraction, no
+relationship graph. It was enough to stand up Session 0, combat, and
+exploration end-to-end — the point of a first pass — but it inherited every
+well-known weakness of pure dense retrieval: exact-name lookups (a spell,
+a monster, a specific magic item) compete on semantic similarity against
+paraphrases instead of just matching the term, and nothing caught a chunk
+that read fine in isolation but lost its subject once split out of its
+section ("she agreed" — who?).
+
+It's worth noting the *agent* side of the project was already further along
+than the *retrieval* side at this point — the two-model mechanics/narrator
+split (`dm_agent.py`) and tool-level guardrails already existed before any of
+the RAG work below, built on the same underlying instinct (don't trust one
+LLM pass to get retrieval-grounded correctness and free-form prose right in
+the same shot) that the RAG re-architecture later applied to search itself.
+The lesson landed in one part of the codebase before it generalized to
+another.
+
+### The self-review that forced a stop (2026-06-30 bug audit)
+
+Before any RAG redesign, an internal review of `backend/` surfaced 10 bugs
+(`docs/engineering-notes/2026-06-30-bug-audit.md`) — general correctness
+issues, not RAG-specific, but the very first one was foundational: **the
+rules RAG pipeline was silently dead**. `RulesStore` was constructed but
+`.load()` was never called — the only method that actually opens the Chroma
+collection — so `is_ready()` was always `False` and `search_rules` returned
+"index not ready" on *every single call*, regardless of whether indexing had
+even run. The entire grounding story the README leads with ("RAG-grounded
+rules, not invented ones") had never actually worked in a live session until
+this was fixed. That's the kind of finding that justifies stepping back
+instead of patching forward — if the foundational plumbing was broken, no
+amount of tuning the retrieval algorithm on top of it would have mattered.
+
+### The re-architecture (`b7d6c73`, 2026-07-07) — pulling in named industry techniques
+
+One large commit (49 files, +5378/-479) rebuilt retrieval from that naive
+baseline into a multi-stage pipeline. The code itself groups the change into
+stages (see docstrings in `reranker.py`/`grading.py`/`lore_store.py`), which
+is a useful way to read it:
+
+**Stage 0 — ingest & retrieval core** (`backend/rag/hybrid.py`,
+`contextualizer.py`, `reranker.py`; `backend/stores/rules_store.py`):
+
+- **Parent/child chunking.** Each `##`/`###` section becomes one PARENT
+  (≤1500 chars, oversized ones split with 50-word overlap between parts —
+  fixing a real bug in the old size-split, which had *zero* overlap and lost
+  continuity right at the seam), further split into ~350-char CHILDREN. Only
+  children are embedded/BM25-indexed; a retrieved child expands back to its
+  full parent via `parent_chunk_id` before reaching the agent — small chunks
+  for precise matching, full sections for actual context.
+- **Hybrid search via Reciprocal Rank Fusion.** Dense (Chroma) and sparse
+  (`rank_bm25.BM25Okapi`, built from the same stored text, pickled to
+  `data/bm25_rules.pkl`) each return a top-`wide_k` (30) ranked list;
+  `reciprocal_rank_fusion()` merges them by the standard RRF formula
+  (`score = Σ 1/(k + rank + 1)`, `k=60`) — no learned weighting, no tuning
+  knob, just the well-known formula. This is the direct fix for the
+  naive baseline's exact-name-lookup weakness: BM25 catches "Aboleth" as a
+  literal token match even when the dense embedding ranks something
+  semantically-similar-but-wrong higher.
+- **Contextual Retrieval** (the module docstring names it explicitly as
+  Anthropic's published technique): before embedding, each child chunk gets
+  a one-sentence LLM-generated blurb situating it ("who/what/where, using
+  proper names") prepended — but **only to the text that gets embedded**;
+  the stored/citable text stays the raw, unmodified original. This is the
+  fix for the "she agreed — who?" problem. Uses the main 26B model rather
+  than a cheaper one, on the strength of an earlier documented reliability
+  incident with a smaller model (`qwen2.5:14b`) producing garbled/fake
+  tool-call output under sustained use — not worth reintroducing that risk
+  to save a few seconds per chunk.
+- **Reranking**, over the RRF-fused 30 candidates down to the caller-facing
+  `k=6`. Two implementations exist behind a `Reranker` protocol —
+  **LLM-as-judge is the default** (batched Ollama call, ranks candidates by
+  relevance), with a cross-encoder (`sentence-transformers`
+  `cross-encoder/ms-marco-MiniLM-L-6-v2`) implemented as an opt-in
+  alternative but explicitly *not* wired in by default. Why: the module's
+  own docstring records that loading the cross-encoder OOM-killed under
+  Docker Desktop's constrained memory allocation — **the same
+  small-Docker-VM failure mode documented below in the 2026-07-07/08
+  ingestion incidents, just discovered earlier and in a different subsystem.**
+  This project has now hit that ceiling twice in two different parts of the
+  pipeline before actually fixing the ceiling itself.
+
+**Stage 1/1.5 — canon lore, once per book** (`scripts/extract_entities.py`,
+`backend/stores/lore_store.py`, `backend/stores/graph_store.py`,
+`backend/rag/entity_resolution.py`):
+
+- `extract_entities.py` exists because of a measured, specific failure: a
+  single live-agent pass asked to both *discover* and *profile* every named
+  entity in a chapter in one shot missed 4 of 5 expected NPCs on Curse of
+  Strahd — everyone whose only evidence was scattered mentions rather than
+  one concentrated scene. The fix, same principle as the two-model agent
+  split again: separate the jobs. A five-stage offline pipeline (windowed
+  discovery → canonicalize/alias-merge → reference collation → type-specific
+  profile generation → checkpointed JSON write) runs once per book, not live
+  per campaign, and writes into `LoreStore` (Postgres), a canon registry the
+  live agent reads from but never mutates.
+- `graph_store.py` adds a lightweight relationship graph on top —
+  self-described in its own docstring as **LightRAG-style, set-merging,
+  campaign-scoped** (NPC↔faction, NPC↔location, item↔location). No full
+  rebuilds: a Postgres unique constraint on `(campaign_id, source_id,
+  target_id, relation)` with `ON CONFLICT DO NOTHING` *is* the merge/dedup
+  mechanism, and `networkx` graphs are rebuilt fresh from Postgres on demand
+  — cheap at the actual scale involved (tens to low-hundreds of edges per
+  campaign).
+- `entity_resolution.py` is the live-play guard that keeps campaign-specific
+  entities from silently duplicating canon — RapidFuzz's `WRatio` (chosen
+  over `token_sort_ratio` after checking real examples: "Toblen" vs. "Toblen
+  Stonehill" scored ~55 on the token-sort metric, too low to flag, vs. ~90 on
+  `WRatio`) flags likely duplicates at insert time; it never auto-merges,
+  only warns, leaving the actual merge decision to the calling agent.
+
+**Stage 2 — query-time self-correction** (`backend/rag/grading.py`,
+wired into `search_lore` in `backend/tools/lore.py`):
+
+- A CRAG/Self-RAG-style pattern: retrieve → an LLM grades whether the
+  top-5 results plausibly answer the query → if not, reformulate the query
+  once and re-retrieve at a wider `wide_k=50` → re-grade. Exactly **one**
+  bounded retry, matching this codebase's established no-unbounded-retry
+  discipline (the same pattern as the agent's `tool_error_count`/
+  `correction_count` retry caps). If still insufficient after the retry, the
+  tool doesn't silently drop the results or fail — it returns what it found
+  with an explicit disclaimer appended (`"[Note: retrieval may be incomplete
+  for this query — consider saying so rather than filling gaps with
+  invention.]"`), i.e. abstention-signaling over false confidence.
+
+### What didn't need to change
+
+The campaign-scoping logic (`books_in_play` → a `$or` filter of
+`source_type: core` OR `adventure: {$in: books_in_play}`) predates this
+re-architecture and was left untouched — it was already correct, and the
+new hybrid pipeline just inherited the same `where` filter on both its dense
+and BM25 legs. Not every naive-v1 decision was wrong; the re-architecture
+targeted retrieval quality specifically, not the scoping model around it.
+
+### Measured, not assumed (2026-07-08): running `eval_retrieval.py` for real
+
+First pass, 17 hand-labeled questions: baseline (plain dense) 64.7%, hybrid
+58.8% — hybrid nominally worse. Investigating *why* surfaced a real
+methodology bug in the eval itself, not just a quirk of small-n: **5 of the
+17 questions targeted books (*Xanathar's Guide to Everything*, *Volo's Guide
+to Monsters*) that are indexed under the pre-Stage-0 schema — no
+`granularity`/`chunk_id`/`parent_chunk_id` metadata at all**, because they
+were ingested before the RAG re-architecture and never migrated. That
+metadata gap isn't cosmetic: `RulesStore.search()` hard-filters on
+`granularity: {"$eq": "child"}` (`rules_store.py:162`) for *both* its dense
+and BM25 legs, so books without that field are **structurally invisible to
+the hybrid pipeline** — not deprioritized, not scored lower, literally never
+in the candidate set. Confirmed directly: `docs/source/adventures/` has 10
+adventures, and only Lost Mine of Phandelver has real parent-granularity
+chunks; the other 9 are in the same un-migrated state as Volo's/Xanathar's.
+This is a known, already-documented gap (see the docstring on
+`RulesStore.is_ready()`) — a full `make reindex-full` across the whole
+library, not yet done, is the actual fix — but it means the original
+eval's baseline-vs-hybrid comparison on those 5 questions wasn't measuring
+retrieval quality at all, just "does this book happen to still be
+findable by unfiltered dense search." Baseline "won" those by accident, not
+by being smarter, and hybrid "lost" them by construction, not by being
+worse — which is the precise mechanism behind the intuition that prompted
+rechecking this in the first place.
+
+**Fix: rebuilt `retrieval_questions.json` from 17 to 62 questions, scoped
+exclusively to the four fully Stage-0-migrated books** (PHB, Monster Manual,
+DMG, Lost Mine of Phandelver) — every `expected_book`/`expected_section`
+pulled from a real `# `-header confirmed present in the actual indexed
+markdown, not guessed. The 4 class questions and the Hill Giants question
+were retargeted to their real current home (PHB, Monster Manual) instead of
+dropped. Re-ran both modes on the clean set:
+
+| Mode | Recall@6 |
+|---|---|
+| `--baseline` (plain dense `similarity_search`) | **58/62 = 93.5%** |
+| current hybrid pipeline (RRF + LLM rerank + parent expansion) | **55/62 = 88.7%** |
+
+With the confound removed and the sample nearly 4x larger, hybrid *still*
+trails baseline — by enough now (4.8 points, on a clean same-corpus
+comparison) to treat as signal, not noise. Category breakdown:
+
+| Book | Baseline | Hybrid |
+|---|---|---|
+| Monster Manual (16 qs) | 16/16 = 100% | 16/16 = 100% |
+| DMG (17 qs) | 16/17 = 94.1% | 15/17 = 88.2% |
+| PHB (13 qs) | 11/13 = 84.6% | 8/13 = 61.5% |
+| Lost Mine of Phandelver (9 qs) | 8/9 = 88.9% | **9/9 = 100%** |
+
+Lost Mine of Phandelver is hybrid's clean win (BM25 caught "Emerald Enclave"
+where dense search alone missed it — the exact class of fix hybrid search
+was built for). **PHB's 11-of-13-to-8-of-13 drop is the whole story**, and
+it clusters almost entirely on one query template: "What is the `{class}`
+class like?" Of 11 PHB classes tested, hybrid missed 5 (Barbarian, Bard,
+Fighter, Ranger, Wizard) that baseline got right.
+
+Traced the actual mechanism with a direct diagnostic (Fighter, which failed,
+vs. Cleric, which passed) rather than guessing:
+
+```
+Fighter — hybrid's final results (only 2, not 6):
+  PLAYER'S HANDBOOK | FIGHTER (2)
+  PLAYER'S HANDBOOK | FIGHTER (1)
+Cleric — hybrid's final results (4):
+  PLAYER'S HANDBOOK | CLERIC (2)
+  PLAYER'S HANDBOOK | CLERIC (1)
+  PLAYER'S HANDBOOK | CLERIC CLASS FEATURES   <- the one the eval wants
+  PLAYER'S HANDBOOK | LEVEL 1: SPELLCASTING (3)
+```
+
+Each class has two competing sections: a short flavor-text intro titled just
+`"{CLASS}"`, and the actually-substantive `"{CLASS} CLASS FEATURES"` section
+the eval questions target. Two things compound against the latter for
+Fighter specifically: (1) hybrid's post-rerank, post-parent-expansion result
+set can come back **shorter than the requested k** once duplicate parents
+collapse (2 final results for Fighter vs. 6 requested) — a much narrower
+funnel than baseline's raw, undeduplicated top-6; (2) BM25's exact-token
+scoring rewards a *short* section whose entire heading is just the matched
+word ("FIGHTER") at least as strongly as a longer, differently-titled
+section that merely contains it ("FIGHTER CLASS FEATURES") — so the flavor
+text can crowd out the more useful content within that narrower funnel.
+Baseline's plain dense search doesn't have either problem: no BM25 exact-
+token bias, and no post-expansion dedup shrinking its result count. This is
+a real, reproducible weakness in the current hybrid pipeline for
+short-title-vs-long-title section pairs, not an artifact and not something
+the LLM reranker is likely responsible for (it operates on whatever survived
+RRF fusion — the fusion/dedup stage is what's actually narrowing the field).
+**Concrete follow-up, not yet done:** widen `wide_k` and/or fix
+`_expand_to_parents()` to backfill toward the requested `k` when
+deduplication shrinks the candidate set below it, so classes like Fighter
+get the same headroom Cleric happened to get.
+
+**Answering the original question directly:** no, this isn't the naive
+baseline "knowing" something via hallucination — `eval_retrieval.py`
+measures pure retrieval (which indexed chunk came back), no generation
+happens in the eval at all. What actually happened was two unrelated
+effects layered together: an eval-methodology bug (comparing against
+un-migrated, structurally-invisible-to-hybrid books) that made hybrid look
+worse than it is, *and*, once that was fixed, a real, narrower, reproducible
+hybrid weakness on one specific query shape that makes it genuinely worse
+in that case — both true at once, and only separable by actually tracing
+individual queries rather than trusting the aggregate number either time.
+
+### The fix (2026-07-08): backfill past the dedup collapse, retrieval-time only
+
+Implemented the "concrete follow-up" above: `RulesStore.search()` now
+reranks the **full** candidate set (`top_n=len(candidates)`, not `top_n=k`)
+— free, since both `Reranker` implementations already compute the whole
+ordering internally before slicing — and hands that fuller order to
+`_expand_to_parents(reranked, k)`, which now walks it and stops once **k
+distinct parents** are collected, instead of truncating to k children and
+deduping after (where dedup collapse could silently shrink the result count
+below k with no way to recover). Purely a query-time fix — `search()` and
+`_expand_to_parents()` are the only two touched, both in
+`backend/stores/rules_store.py`. No change to chunking, embedding,
+contextualization, or BM25 indexing, so nothing needed re-running against
+the already-built index — `make reindex-full` was not required, and the fix
+took effect on the next `RulesStore.search()` call.
+
+Verified directly: re-ran the Fighter query that motivated the fix.
+Before: 2 results (`FIGHTER (2)`, `FIGHTER (1)` — the flavor-text intro,
+twice, no `FIGHTER CLASS FEATURES`). After: 6 results, with
+`FIGHTER CLASS FEATURES` restored at position 3. Re-ran the full 62-question
+suite:
+
+| Mode | Recall@6 |
+|---|---|
+| `--baseline` (plain dense) | 58/62 = 93.5% |
+| hybrid, pre-fix | 55/62 = 88.7% |
+| **hybrid, post-fix** | **60/62 = 96.8%** |
+
+Hybrid now beats baseline outright — 5 of the 6 pre-fix regressions
+(Barbarian, Bard, Cleric already passed, Druid already passed, Fighter,
+Ranger — all now correct) are fixed; only "What is the Wizard class like?"
+still misses, and "What are a villain's methods?" remains a miss in *both*
+modes (not a hybrid-specific issue — likely a genuinely weak semantic/lexical
+match for that particular phrasing against the source section, a separate
+question from anything fixed here). This is the first point in tonight's
+work where hybrid search has an actual measured, apples-to-apples advantage
+over the naive baseline on a same-corpus, non-trivial (n=62) benchmark —
+worth having, given the whole point of building Stage 0 was that it should
+outperform plain dense search, not just cost more per query.
+
+### Chasing the last miss (2026-07-08): two more bugs, one retrieval-time, one needing a cheap rebuild
+
+Asked "why does Wizard still miss" rather than accepting 96.8% as good
+enough. Found two separate, unrelated bugs stacked on top of each other:
+
+**Bug 1 — OCR drop-cap artifacts.** The PHB's Wizard section opens with a
+decorative oversized first letter ("**W**IZARDS ARE DEFINED BY THEIR
+exhaustive study of magic..."), and the OCR/markdown pipeline parsed that
+lone "W" as its own one-character section header — splitting the real
+opening paragraph into a bogus `"# W"` section. `grep -c '^# [A-Z]$'`
+against the indexed markdown found **3 in PHB, 26 in Monster Manual, 0 in
+DMG** — not a one-off. A short, keyword-dense bogus section like this can
+out-rank a real, differently-titled section on BM25's length-normalized
+scoring. The real fix belongs upstream (the OCR/header-detection step,
+requiring a reindex); shipped the cheap retrieval-time mitigation instead —
+`RulesStore.search()` now drops any single-letter-section candidate
+(`_is_drop_cap_artifact()`) before reranking, covering all 29 known
+instances without touching the index.
+
+**Bug 2 — no punctuation stripping or stopword filtering in the BM25
+tokenizer, and it was the bigger one.** `BM25Index`'s tokenizer
+(`backend/rag/hybrid.py`) was a bare `text.lower().split()`. Diagnosed by
+inspecting BM25's raw top-30 for "What is the Wizard class like?" directly
+— it came back **completely unrelated to Wizard**: sections like
+"CREATING A RACE OR SUBRACE," "SETTLEMENTS," "INVOLVING THE CHARACTERS."
+Root cause: that query tokenizes to `['what','is','the','wizard','class',
+'like?']` — five near-universal filler tokens (one, `"like?"`, couldn't
+match anything at all, since the corpus's own equally-naive tokenizer would
+never produce a token with a trailing `?`) diluting the one token that
+actually mattered. BM25Okapi sums a score per query token with no concept
+of which ones carry signal, so "class" alone — common across every
+`"{CLASS} CLASS FEATURES"` section *and* loads of unrelated prose — was
+enough to outrank the real match, which never appeared anywhere in BM25's
+top 30. Fix: a shared `_tokenize()` (regex word-extraction + a small
+stopword list) applied identically to corpus text at build time and queries
+at search time — the two absolutely must stay in lockstep, or scores stop
+being comparable at all. Unlike the drop-cap fix, this one **isn't**
+purely retrieval-time — the corpus side of the tokenization changed, so
+`data/bm25_rules.pkl` needed rebuilding. Ran `_rebuild_bm25()` directly
+(bypassing the full `build_index.py` CLI) — pure CPU, reads already-indexed
+Chroma text, no LLM/embedding calls — done in well under a minute for
+227,776 child chunks. No `make reindex-full` needed; embeddings and Chroma
+itself were untouched.
+
+Verified directly: BM25 alone now ranks "WIZARD CLASS FEATURES" #1 for that
+query (was absent from the top 30). Re-ran the full 62-question suite:
+
+| Mode | Recall@6 |
+|---|---|
+| `--baseline` (plain dense) | 58/62 = 93.5% |
+| hybrid, after backfill fix only | 60/62 = 96.8% |
+| **hybrid, after drop-cap + tokenizer fixes** | **61/62 = 98.4%** |
+
+Wizard now passes. The one remaining miss ("What are a villain's methods?")
+fails identically in baseline, unrelated to anything fixed tonight. Three
+fixes, three different root causes, three different remediation costs
+(retrieval-logic-only, retrieval-logic-only, cheap-CPU-only rebuild) — worth
+keeping straight, since "fixed the reranker" would have been a wrong and
+much vaguer description of any of them.
+
+### Tonight's chapter: the pipeline was sound, its ingestion path wasn't yet proven at real scale (2026-07-07/08)
+
+The Stage 0–2 techniques above had only been exercised against adventure
+books (thousands to tens of thousands of chunks). Running the same pipeline
+against the full core rulebooks (PHB: 110k+ chunks) surfaced two separate
+reliability gaps that smaller runs never hit — a Docker Desktop VM memory
+ceiling that OOM-killed the indexing process partway through (root-caused
+and fixed by running natively instead, see the "Prep Scripts" incident
+write-up below), and an unbounded, non-batched LLM call in
+`extract_entities.py`'s `canonicalize()` step that stalled for 5+ hours
+against DMG's unusually large candidate list with zero progress visibility
+(fixed by batching, same write-up). Neither was a flaw in the retrieval
+design itself — both were ingestion-pipeline robustness gaps that only
+showed up at a scale the pipeline hadn't been proven against before.
+
+---
+
 ## Prep Scripts
 
 All scripts below live in `scripts/` (moved from repo root 2026-07-05 for a
@@ -760,9 +1130,9 @@ Heuristic validation: OCR failure comments, repeated-line clusters, garbled numb
 
 ### `build_index.py` — ChromaDB indexer
 
-Reads `docs/source/core/` and `docs/source/adventures/{slug}/`, chunks on `##`/`###` headers (max 1500 chars), embeds with `nomic-embed-text`, writes to `data/chroma_db/` in batches of 64.
+Reads `docs/source/core/` and `docs/source/adventures/{slug}/`, splits each `##`/`###` section into a parent chunk (max 1500 chars, 50-word overlap on size-split oversized parents) and further into ~350-char child chunks, contextualizes each child (Anthropic-style — see "Evolution" section above) unless `--skip-contextualization`, embeds children with `nomic-embed-text`, and writes to `data/chroma_db/` in batches of 8 (small on purpose — a kill loses at most one small in-flight batch; resumability is via Chroma's own existing-chunk-id check, not a separate cache). Also rebuilds `data/bm25_rules.pkl` (the sparse half of hybrid search) from the same indexed text.
 
-Metadata per chunk: `book`, `section`, `source_type` (`"core"` | `"adventure"`), `adventure` (slug, empty for core).
+Metadata per chunk: `book`, `section`, `source_type` (`"core"` | `"adventure"`), `adventure` (slug, empty for core), `granularity` (`"parent"` | `"child"`), `chunk_id`, `parent_chunk_id` (child only).
 
 ```bash
 make index                                         # full reindex
@@ -779,6 +1149,86 @@ python clean_source.py --model qwen2.5:3b
 python validate_source.py
 make index
 ```
+
+### Incident (2026-07-07/08): bulk ingestion via Docker OOM-killed repeatedly — use `ingest-book-native` even on the canonical machine
+
+A three-book overnight batch (PHB + Monster Manual + DMG, `scripts/overnight_queue_phb_mm.sh`,
+routed through `make ingest-book` → `docker compose exec app python
+build_index.py`) died from an OOM kill (`Killed: 9` / `Error 137`) on three
+separate attempts — at 5%, then 35% through PHB's reindex, and once by
+killing the `app`/`db` containers outright mid-session. Root cause, confirmed
+via `docker info`: this laptop's Docker Desktop VM had **~965MB of total
+RAM**, shared across Postgres + the app + any `docker compose exec` process.
+Nowhere near enough for embedding 100k+ chunks, and flaky enough that it also
+killed unrelated containers under casual diagnostic load (a plain `chromadb`
+metadata query over `docker exec` triggered the same 137).
+
+**Fix: run the heavy scripts natively instead of through `docker compose
+exec`.** `make ingest-book-native` + `make setup-venv` already existed in the
+Makefile for a *different* reason — `docs/engineering-notes/desktop-native-ingestion.md`
+built them so a second, Docker-less desktop could do offline bulk OCR/ingestion.
+Turns out the exact same escape hatch fixes the Docker-VM-memory problem on
+the **primary** laptop too, and required zero config changes to work here:
+- `data/chroma_db` is a bind mount (`./data/chroma_db:/app/data/chroma_db` in
+  `docker-compose.yml`), so native and containerized processes read/write the
+  identical files on disk.
+- `docker-compose.yml` publishes Postgres to `localhost:5432`, and
+  `backend/config.py`'s own defaults already point at `localhost` (the
+  container-only hostnames — `db`, `host.docker.internal` — are env-var
+  overrides layered on top for the containerized app) — so
+  `make ingest-book-native ... write_postgres=1` writes straight into the
+  same canonical Postgres the live app uses, no JSON-registry round-trip
+  needed (that round-trip is for the genuinely-Docker-less desktop case).
+- Ollama already runs natively on the host, not in Docker, so no networking
+  change needed there either.
+
+Net effect: the native process runs against the host's full 32GB of RAM
+instead of the VM's ~1GB ceiling. Re-run of the same PHB job natively
+finished clean end-to-end (no OCR needed, cached from before) in 3h19m —
+indexing 110,061 chunks + extracting 587 entities — with memory staying flat
+around 1.3–1.6GB throughout (confirmed by sampling RSS over time: growth was
+front-loaded startup cost — BM25 pickle load, Chroma/HNSW init — not a
+per-chunk leak). **Takeaway: prefer `make ingest-book-native` over
+`make ingest-book` for any bulk/overnight ingestion job on this machine too,
+not just the secondary desktop** — the Docker route only makes sense for
+small one-off scoped runs where the VM's memory ceiling won't matter, or
+until that ceiling is deliberately raised in Docker Desktop's settings
+(untested — 4–8GB would likely be plenty given 32GB host RAM, but no
+profiling was done to confirm a minimum).
+
+### Incident (2026-07-08): `extract_entities.py`'s `canonicalize()` had no batching or output cap — silent multi-hour stall on DMG
+
+Same overnight run, next symptom: after PHB and Monster Manual finished
+clean (native), DMG's entity-extraction step went **5+ hours with zero new
+log output** after its per-window discovery pass completed. Not actually
+hung — `ollama ps` showed the model pinned at 100% GPU and the runner
+process's cumulative CPU time was still climbing when sampled — but there
+was no way to tell from outside whether it was almost done or stuck forever.
+
+Root cause, found by reading `canonicalize()`: it sent the **entire**
+deduped candidate-name list for a kind (`npc`/`location`/`item`) as **one**
+`temperature=0`, no-`max_tokens` LLM call, expecting one output line per
+distinct entity back. Fine for a book with a few hundred candidates; DMG's
+item/table-heavy chapters (huge magic-item tables, sample treasure, etc.)
+almost certainly produced a candidate list far larger than anything
+previously run through this path, and the resulting single call had no
+progress bar and no ceiling on how long it could run.
+
+**Fix:** `canonicalize()` now batches the sorted candidate list at
+`CANONICALIZE_BATCH_SIZE = 150` names per LLM call (see `scripts/extract_entities.py`),
+with a `tqdm` progress bar per batch when there's more than one. Batching
+over the *sorted* list (not a random split) was a deliberate choice — alias
+variants of the same name usually share a prefix (e.g. "Rose" /
+"Rosavalda"), so sorting keeps them likely to land in the same or an
+adjacent batch even though canonicalization is no longer attempted *across*
+a batch boundary. That's the same skip-on-doubt tradeoff the function
+already made pre-fix (worse dedup in rare cases, but an entity is never
+silently dropped) — just applied per-batch instead of globally. **Takeaway:
+any single-shot LLM call whose input size scales with book content (not a
+fixed small prompt) needs either a hard batch size or an explicit token cap
+before it's trusted on the biggest/densest book in the corpus (DMG, not
+PHB/MM) — "worked fine on the first two books" isn't evidence it'll work on
+the third.**
 
 ---
 
@@ -823,6 +1273,11 @@ Source is volume-mounted (`./:/app`) so `uvicorn --reload` picks up changes with
 | `make index` | Full ChromaDB reindex from `docs/source/` |
 | `make index-if-empty` | Reindex only if `data/chroma_db/` is empty (safe on fresh clone) |
 | `make setup` | `migrate` + `index-if-empty` — the one-command new-machine bootstrap |
+| `make ingest-book book="…" source_type=core` | Reindex + extract lore/monsters for one book, via `docker compose exec` — fine for small scoped runs, but see the ingestion-incident writeup above before using this for a big overnight job |
+| `make ingest-book-native book="…" source_type=core write_postgres=1` | Same, but native (host `.venv`, no Docker) — bypasses the Docker Desktop VM's memory ceiling entirely; **preferred for bulk/overnight ingestion, even on this machine** |
+| `make setup-venv` | Create/refresh the host `.venv` used by the `-native` targets |
+| `make merge-chroma source=…` | Merge a second machine's `data/chroma_db/` into this one's (native) |
+| `make load-lore-json book="…"` | Load a `-native` run's JSON entity registry (from a Postgres-less machine) into this machine's canonical Postgres |
 
 ---
 

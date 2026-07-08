@@ -11,6 +11,7 @@ bottom of run_world_prep. Confirmed live that a generic region-scale seed
 pass alone leaves the DM to invent the opening's cast from nothing.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -210,7 +211,18 @@ async def run_world_prep(
         for book in campaign.books_in_play:
             seed_chunks = []
             for query in _SEED_QUERIES:
-                seed_chunks += rules_store.search_adventure_only(query, adventure=book, k=4)
+                # asyncio.to_thread — RulesStore.search_adventure_only() is
+                # synchronous and makes a blocking Ollama embed call; called
+                # bare here it would freeze this process's single event loop
+                # for every request, not just this background task. Confirmed
+                # live, 2026-07-08: a stuck Ollama call here froze the entire
+                # app (every route, every user) until the container was
+                # restarted — same bug class as the 2026-06-30 audit's
+                # add_session finding, just a second call site that sweep
+                # missed. See design.md's Evolution section.
+                seed_chunks += await asyncio.to_thread(
+                    rules_store.search_adventure_only, query, adventure=book, k=4
+                )
             seed_context = "\n\n---\n\n".join(
                 f"[{c.book} — {c.section}]\n{c.content}" for c in seed_chunks
             )
@@ -238,7 +250,11 @@ async def run_world_prep(
             if book == first_book and not campaign.current_location_id:
                 meta = read_adventure_meta(book)
                 opening_location = meta.get("opening_location", "")
-                npc_context = _gather_opening_scene_context(
+                # asyncio.to_thread — same reasoning as the _SEED_QUERIES
+                # loop above: this function makes a blocking Chroma/Ollama
+                # call (search_adventure_literal) synchronously.
+                npc_context = await asyncio.to_thread(
+                    _gather_opening_scene_context,
                     rules_store, book, opening_location,
                     meta.get("opening_section_marker", ""), meta.get("opening_hook", ""),
                     meta.get("opening_section_end_marker", ""),

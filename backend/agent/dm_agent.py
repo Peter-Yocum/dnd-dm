@@ -1786,6 +1786,15 @@ async def summarize_session(
     progress_marker = f"---PROGRESS-{token}---"
     relations_marker = f"---RELATIONS-{token}---"
 
+    # asyncio.to_thread — _book_context_for_summary calls RulesStore.search()
+    # (the full hybrid pipeline: dense + BM25 + an LLM rerank call),
+    # synchronous end to end. Called bare here it would freeze this
+    # process's single event loop for every request, not just this session-
+    # end call — same bug class as the 2026-06-30 audit's add_session
+    # finding and world_prep.py's two call sites; see design.md's Evolution
+    # section for the live incident (2026-07-08) that surfaced this one.
+    book_context = await asyncio.to_thread(_book_context_for_summary, campaign, rules_store)
+
     prompt = _SUMMARY_PROMPT.format(
         campaign_name=campaign.name,
         transcript=transcript,
@@ -1794,7 +1803,7 @@ async def summarize_session(
         progress_marker=progress_marker,
         relations_marker=relations_marker,
         party_state=_party_ground_truth(campaign),
-        book_context=_book_context_for_summary(campaign, rules_store),
+        book_context=book_context,
     )
 
     llm = _get_model()

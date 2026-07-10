@@ -774,6 +774,13 @@ class Encounter(BaseModel):
     monster_count_hint: int | None = None
     notes: str = ""
     pending_action: PendingAction | None = None
+    # Set by reveal_loot/add_item_to_character/update_character_currency/
+    # create_magic_item (backend/tools/party.py) whenever one fires while this
+    # encounter is active — end_encounter's automatic loot generation
+    # (backend/tools/loot_generator.py) checks this and skips its own roll if
+    # loot was already granted manually mid-fight, so a narrated treasure pile
+    # and the automatic roll can't both pay out for the same encounter.
+    loot_already_granted: bool = False
 
 
 # ─── Campaign (root object) ───────────────────────────────────────────────────

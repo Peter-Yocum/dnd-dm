@@ -29,11 +29,7 @@ from backend.tools._helpers import find_location, find_npc, read_adventure_meta
 
 log = logging.getLogger(__name__)
 
-_SEED_QUERIES = [
-    "regional overview and map",
-    "travel distances and days between locations",
-    "major settlements and landmarks",
-]
+_SEED_CONTEXT_MAX_CHARS = 20_000
 
 # Out of the Abyss's full Chapter 1 is 65,615 chars; Curse of Strahd:
 # Reloaded's Death House arc (Act I - Arc A) is 105,411 chars — both need to
@@ -49,6 +45,66 @@ _SEED_QUERIES = [
 # check total prompt size against the model's real ceiling before doing so.
 _OPENING_SECTION_CHARS = 110_000
 _MAX_LITERAL_MATCHES = 15
+
+
+def _gather_seed_context(book: str, max_chars: int = _SEED_CONTEXT_MAX_CHARS) -> str:
+    """Deterministic, zero-Ollama-call seed context for the region-scale
+    world-prep agent — replaces an earlier embedding-search version
+    (search_adventure_only over "regional overview and map" / "travel
+    distances..." / "major settlements..."). Root cause, confirmed live
+    2026-07-08: alternating nomic-embed-text calls with gemma4:26b-mlx calls
+    within one background task forces Ollama to swap models on every single
+    world-prep run, and this codebase already has one documented prior
+    incident of that exact transition leaving the MLX runner stuck
+    ("Stopping..." indefinitely — see _get_mechanics_model()'s docstring in
+    dm_agent.py). Removing the embedding call from world-prep removes the
+    trigger itself, not just the odds of hitting it — every remaining Ollama
+    call in this file's whole pipeline is gemma4:26b-mlx, no swap needed.
+
+    Two deterministic sources, both a plain local file read:
+      1. The adventure's own introduction — everything before its curated
+         opening_section_marker (or the first max_chars, if that marker
+         isn't curated for this book yet). Confirmed against Lost Mine of
+         Phandelver: its Introduction/Background/Overview/Adventure Hook
+         section is exactly the ~19K chars before "PART 1" — reliably where
+         "regional overview"/"major settlements" content already lives,
+         without needing to search for it.
+      2. LocationExtractor's own pre-computed "_connections" (extract_
+         entities.py's _entities.json) — already-grounded travel routes
+         between named locations, extracted once at ingest time. This is
+         *better* grounded than a fresh semantic search would have been
+         (real source citations went into producing it), and it's the exact
+         "travel distances and days between locations" content the old
+         embedding query was trying to find live.
+    """
+    meta = read_adventure_meta(book)
+    marker = meta.get("opening_section_marker", "")
+
+    intro_text = ""
+    for path in Path(f"docs/source/adventures/{book}").glob("*.md"):
+        text = path.read_text(encoding="utf-8")
+        end = text.find(marker) if marker else -1
+        intro_text += (text[:end] if end != -1 else text[:max_chars])[:max_chars]
+
+    connections_text = ""
+    entities_path = Path(f"docs/source/adventures/{book}/_entities.json")
+    if entities_path.exists():
+        try:
+            registry = json.loads(entities_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            registry = {}
+        conns = registry.get("_connections", [])
+        if conns:
+            connections_text = "\n".join(
+                f"{c.get('from', '')} -> {c.get('to', '')}: {c.get('via', '')}" for c in conns
+            )
+
+    parts = []
+    if intro_text:
+        parts.append(f"[Adventure introduction/overview]\n{intro_text}")
+    if connections_text:
+        parts.append(f"[Known location connections/travel routes]\n{connections_text}")
+    return "\n\n===\n\n".join(parts)
 
 
 def _read_opening_section(
@@ -186,6 +242,27 @@ async def _seed_relation_graph_for_book(
                 )
 
 
+async def _ainvoke_with_retry(agent, payload: dict, config: dict, *, label: str):
+    """Retry a one-shot world-prep agent invocation once on an Ollama
+    timeout. Confirmed live, 2026-07-08: even with a proper client-level
+    httpx timeout configured (see dm_agent.py's _get_model()), the
+    underlying MLX engine occasionally hangs on a single request — the
+    timeout now fires cleanly (httpx.TimeoutException) instead of freezing
+    the whole app, but the request itself still fails. Two live tests in a
+    row both failed on the first attempt and would very likely have
+    succeeded on a second try, so a bounded retry meaningfully improves the
+    success rate rather than just the failure mode. One retry, not a loop —
+    same discipline as Stage 2's CRAG grading (backend/rag/grading.py) and
+    the live agent's correction_count/tool_error_count caps."""
+    import httpx
+
+    try:
+        return await agent.ainvoke(payload, config=config)
+    except httpx.TimeoutException:
+        log.warning("world-prep agent step timed out, retrying once: %s", label)
+        return await agent.ainvoke(payload, config=config)
+
+
 async def run_world_prep(
     campaign_id: str, store: CampaignStore, rules_store: RulesStore,
     lore_store: LoreStore, graph_store: RelationGraphStore,
@@ -209,32 +286,21 @@ async def run_world_prep(
     try:
         first_book = campaign.books_in_play[0]
         for book in campaign.books_in_play:
-            seed_chunks = []
-            for query in _SEED_QUERIES:
-                # asyncio.to_thread — RulesStore.search_adventure_only() is
-                # synchronous and makes a blocking Ollama embed call; called
-                # bare here it would freeze this process's single event loop
-                # for every request, not just this background task. Confirmed
-                # live, 2026-07-08: a stuck Ollama call here froze the entire
-                # app (every route, every user) until the container was
-                # restarted — same bug class as the 2026-06-30 audit's
-                # add_session finding, just a second call site that sweep
-                # missed. See design.md's Evolution section.
-                seed_chunks += await asyncio.to_thread(
-                    rules_store.search_adventure_only, query, adventure=book, k=4
-                )
-            seed_context = "\n\n---\n\n".join(
-                f"[{c.book} — {c.section}]\n{c.content}" for c in seed_chunks
-            )
+            # Deterministic, zero-Ollama-call seed context — see
+            # _gather_seed_context's own docstring for why this replaced an
+            # earlier embedding-search version (2026-07-08 root cause: the
+            # embed-then-chat model swap it forced was the actual trigger
+            # for a recurring whole-app freeze, not just a slow call).
+            seed_context = _gather_seed_context(book)
 
             # Re-load: an earlier book's create_location/connect_locations
             # calls have already saved, so the agent sees prior progress.
             campaign = await store.load(campaign_id)
             agent = get_world_prep_agent(campaign, store, rules_store, books_in_play=[book], lore_store=lore_store)
             prompt = get_world_prep_prompt(campaign, book, seed_context)
-            await agent.ainvoke(
-                {"messages": [HumanMessage(content=prompt)]},
-                config={"recursion_limit": 60},
+            await _ainvoke_with_retry(
+                agent, {"messages": [HumanMessage(content=prompt)]},
+                {"recursion_limit": 60}, label=f"world-prep ({book})",
             )
 
             # Opening-scene NPC/site-detail seeding — "the opening scene" is
@@ -250,15 +316,26 @@ async def run_world_prep(
             if book == first_book and not campaign.current_location_id:
                 meta = read_adventure_meta(book)
                 opening_location = meta.get("opening_location", "")
-                # asyncio.to_thread — same reasoning as the _SEED_QUERIES
-                # loop above: this function makes a blocking Chroma/Ollama
-                # call (search_adventure_literal) synchronously.
-                npc_context = await asyncio.to_thread(
-                    _gather_opening_scene_context,
-                    rules_store, book, opening_location,
-                    meta.get("opening_section_marker", ""), meta.get("opening_hook", ""),
-                    meta.get("opening_section_end_marker", ""),
-                )
+                # asyncio.to_thread + asyncio.wait_for — same reasoning as
+                # the _SEED_QUERIES loop above (this function makes a
+                # blocking Chroma/Ollama call via search_adventure_literal).
+                # On timeout, npc_context stays "" — the function's own
+                # contract already treats an empty result as "skip this
+                # phase, not an error" (see its docstring), so this reuses
+                # an existing graceful-degradation path rather than a new one.
+                try:
+                    npc_context = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _gather_opening_scene_context,
+                            rules_store, book, opening_location,
+                            meta.get("opening_section_marker", ""), meta.get("opening_hook", ""),
+                            meta.get("opening_section_end_marker", ""),
+                        ),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("opening-scene context gathering timed out after 30s, skipping (book=%r)", book)
+                    npc_context = ""
                 if npc_context:
                     existing_npc_names = {n.name for n in campaign.npcs}
 
@@ -275,9 +352,9 @@ async def run_world_prep(
                     # the extra round-trip costs nothing but a little time.
                     npc_agent = get_npc_prep_agent(campaign, store, rules_store, books_in_play=[book], lore_store=lore_store)
                     npc_prompt = get_npc_prep_prompt(campaign, book, opening_location, npc_context)
-                    await npc_agent.ainvoke(
-                        {"messages": [HumanMessage(content=npc_prompt)]},
-                        config={"recursion_limit": 120},
+                    await _ainvoke_with_retry(
+                        npc_agent, {"messages": [HumanMessage(content=npc_prompt)]},
+                        {"recursion_limit": 120}, label=f"npc-prep ({book})",
                     )
 
                     campaign = await store.load(campaign_id)
@@ -286,9 +363,9 @@ async def run_world_prep(
                     location_prompt = get_opening_location_prompt(
                         campaign, book, opening_location, npc_context, new_npc_names
                     )
-                    await location_agent.ainvoke(
-                        {"messages": [HumanMessage(content=location_prompt)]},
-                        config={"recursion_limit": 60},
+                    await _ainvoke_with_retry(
+                        location_agent, {"messages": [HumanMessage(content=location_prompt)]},
+                        {"recursion_limit": 60}, label=f"opening-location ({book})",
                     )
 
             campaign = await store.load(campaign_id)
@@ -302,5 +379,11 @@ async def run_world_prep(
         campaign = await store.load(campaign_id)
         if campaign is not None:
             campaign.world_prep_status = WorldPrepStatus.FAILED
-            campaign.world_prep_error = str(e)[:2000]
+            # type(e).__name__ prefix, not bare str(e) — confirmed live,
+            # 2026-07-08: httpx's timeout exceptions (ReadTimeout etc.) carry
+            # no message text, so str(e) alone silently produces "" and the
+            # UI's failure banner shows nothing useful. The class name alone
+            # (e.g. "ReadTimeout") is still informative even when the
+            # instance has no message.
+            campaign.world_prep_error = f"{type(e).__name__}: {e}"[:2000]
             await store.save(campaign)

@@ -16,6 +16,11 @@ def make_tools(rules_store: RulesStore, books_in_play: list[str]) -> list:
                 "Rulebook index is not ready. "
                 "Run build_index.py first, then restart the app."
             )
+        # use_reranker=False (RulesStore.search()'s default) — deliberate:
+        # this is the most-called live-gameplay lookup (every combat start
+        # alone can trigger several), and the reranker's own separate
+        # ChatOllama call is the embed<->chat model swap already root-caused
+        # as the MLX-runner freeze trigger (see design.md's Evolution section).
         chunks = rules_store.search(query, books_in_play=books_in_play)
         if not chunks:
             return f"No relevant rules found for '{query}'."

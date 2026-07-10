@@ -19,6 +19,7 @@ POST /campaigns/{id}/safety-flag      → player X-card: flag a topic for the DM
 POST /campaigns/{id}/safety-flag/clear → DM-only: clear active safety flags
 GET  /campaigns/{id}/rolls            → JSON list of recent dice rolls
 GET  /campaigns/{id}/party/{char_id}  → JSON: full character sheet for the right-side detail panel
+GET  /campaigns/{id}/item-detail      → JSON: item stat block for the click-to-view popup (query: name)
 GET  /campaigns/{id}/messages         → JSON: prior turns for a thread, used to hydrate the chat panel on reload
 POST /campaigns/{id}/session-zero/fill-party → DM-triggered: generate a companion if the party is short
 POST /campaigns/{id}/rest/long        → whole-party long rest (deterministic, no LLM) — see apply_long_rest
@@ -61,10 +62,13 @@ from backend.agent.dm_agent import (
 from backend.agent.prompts import build_session_kickoff_message
 from backend.agent.world_prep import run_world_prep
 from backend.config import settings
+from backend.data.equipment import ARMOR, WEAPONS
 from backend.data.fivee_options import CLASSES
 from backend.models import Campaign, Session
 from backend.rag.reranker import LLMJudgeReranker
-from backend.tools._helpers import apply_long_rest, apply_short_rest, find_char, find_location, find_npc, read_adventure_meta
+from backend.tools._helpers import (
+    apply_long_rest, apply_short_rest, find_char, find_item_anywhere, find_location, find_npc, read_adventure_meta,
+)
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import draft_store
 from backend.stores.graph_store import PostgresRelationGraphStore
@@ -455,6 +459,59 @@ async def get_party_member(campaign_id: str, character_id: str):
     if not char:
         raise HTTPException(status_code=404, detail="Character not found")
     return JSONResponse(char.model_dump(mode="json"))
+
+
+@app.get("/campaigns/{campaign_id}/item-detail")
+async def get_item_detail(campaign_id: str, name: str):
+    """Stat block for the item-detail popup — click any [[Item Name]]-marked
+    mention in narration or an inventory entry (templates/game.html) to see it.
+    Resolution order, first hit wins: (1) a live instance of this exact item
+    somewhere in the campaign (find_item_anywhere) — real rarity/attunement/
+    description, merged with WEAPONS/ARMOR mechanical properties if it's a
+    weapon/armor; (2) the static WEAPONS/ARMOR reference data, for a mundane
+    item mentioned before anyone owns it (a shop listing, narration); (3) the
+    canon Lore Registry, for an adventure-specific item not yet instantiated
+    in this campaign. 404 if none match — expected/normal for a narration
+    name-match that isn't a real item; the frontend falls back to plain text."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    hit = find_item_anywhere(campaign, name)
+    if hit:
+        item, holder = hit
+        data = item.model_dump(mode="json")
+        data["source"] = "instance"
+        data["holder"] = holder
+        # Matched by name, not item.item_type — item_type defaults to "misc" and
+        # is rarely set correctly for mundane starting/looted gear (confirmed live:
+        # a granted "Shortbow" was stored with item_type "misc"), so gating the
+        # mechanical-data merge on it silently produced a blank stat block for any
+        # real weapon/armor whose item_type wasn't set right.
+        mechanical = WEAPONS.get(item.name) or ARMOR.get(item.name)
+        if mechanical:
+            data["mechanical"] = dict(mechanical)
+        return JSONResponse(data)
+
+    weapon = WEAPONS.get(name)
+    if weapon:
+        return JSONResponse({
+            "name": name, "source": "static", "item_type": "weapon",
+            "mechanical": {k: (v.value if hasattr(v, "value") else v) for k, v in weapon.items()},
+        })
+    armor = ARMOR.get(name)
+    if armor:
+        return JSONResponse({"name": name, "source": "static", "item_type": "armor", "mechanical": armor})
+
+    entity = await _lore().find_by_name_or_alias(campaign.books_in_play, name, "item")
+    if entity:
+        data = dict(entity.rolled_up_profile or {})
+        data["name"] = entity.canonical_name
+        data["source"] = "canon"
+        data["aliases"] = entity.aliases
+        return JSONResponse(data)
+
+    raise HTTPException(status_code=404, detail=f"No item data found for '{name}'.")
 
 
 @app.delete("/campaigns/{campaign_id}/party/{character_id}")

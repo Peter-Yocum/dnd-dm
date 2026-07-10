@@ -22,7 +22,12 @@ def grade_sufficiency(query: str, chunks: list[RuleChunk], model: str = settings
     from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    llm = ChatOllama(model=model, base_url=settings.ollama_base_url, temperature=0, reasoning=False)
+    # client_kwargs timeout — see rules_store.py's load() for why: an
+    # unbounded client leaks a thread-pool worker forever on a hung request.
+    llm = ChatOllama(
+        model=model, base_url=settings.ollama_base_url, temperature=0, reasoning=False,
+        client_kwargs={"timeout": 120.0},
+    )
     excerpt = "\n\n---\n\n".join(c.content[:500] for c in chunks[:5])
     response = llm.invoke([
         SystemMessage(content=(
@@ -48,7 +53,12 @@ def reformulate_query(query: str, model: str = settings.mechanics_model) -> str:
     from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    llm = ChatOllama(model=model, base_url=settings.ollama_base_url, temperature=0, reasoning=False)
+    # client_kwargs timeout — see rules_store.py's load() for why: an
+    # unbounded client leaks a thread-pool worker forever on a hung request.
+    llm = ChatOllama(
+        model=model, base_url=settings.ollama_base_url, temperature=0, reasoning=False,
+        client_kwargs={"timeout": 120.0},
+    )
     response = llm.invoke([
         SystemMessage(content=(
             "You rewrite a search query as one alternate phrasing that might "

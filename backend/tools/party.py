@@ -9,6 +9,16 @@ from backend.stores.campaign_store import CampaignStore
 from backend.stores.graph_store import RelationGraphStore
 from backend.stores.lore_store import LoreStore
 from backend.tools._helpers import all_campaign_item_names, apply_damage_to_character, char_summary, find_char
+from backend.tools.loot_generator import ARMOR_BONUS_RARITY, WEAPON_LIKE_BONUS_RARITY
+
+
+def _mark_loot_granted(campaign) -> None:
+    """Flag the active encounter (if any) as having had loot manually granted
+    mid-fight, so end_encounter's automatic roll (backend/tools/loot_generator.py)
+    skips itself instead of paying out a second, unrelated pile on top."""
+    enc = campaign.active_encounter
+    if enc and enc.is_active:
+        enc.loot_already_granted = True
 
 # Matches an item_name that's actually currency mislabeled as a physical item
 # ("Silver piece", "5 gp", "gold coins") — observed live: a mechanics model
@@ -217,6 +227,7 @@ def make_tools(
         else:
             new_item = Item(name=item_name, quantity=quantity)
             char.inventory.append(new_item)
+        _mark_loot_granted(campaign)
         await store.save(campaign)
         if graph_store is not None:
             await graph_store.add_edge(
@@ -266,6 +277,8 @@ def make_tools(
             )
         prev = char.currency.gp
         char.currency.gp += gp_delta
+        if gp_delta > 0:
+            _mark_loot_granted(campaign)
         await store.save(campaign)
         msg = f"{char.name}'s gold: {prev} → {char.currency.gp} gp"
         if reason:
@@ -280,13 +293,15 @@ def make_tools(
         bonus: int = 0,
         description: str = "",
         requires_attunement: bool = False,
+        rarity: str = "",
         force: bool = False,
     ) -> str:
         """Give a character a special/magical item — found in a hoard, given as
         a reward, etc. If it's a magic weapon or armor variant (a "+1 Longsword",
         "+2 Chain Mail", "+1 Shield"), pass base_item as the exact name of a real
-        weapon/armor (see list_options-style tools or get_option_details for
-        valid names) and bonus as the enchantment level — this grounds the
+        weapon/armor (see search_rules for valid names — get_option_details is
+        Session-0-only, not available mid-game) and bonus as the enchantment
+        level — this grounds the
         item's stats in real base weapon/armor data instead of inventing them,
         and automatically adds a usable attack (for a weapon) or raises AC (for
         armor/a shield). For a wholly custom magic item with no weapon/armor
@@ -297,7 +312,15 @@ def make_tools(
         trigger in play. If a close-but-not-exact name match already exists
         elsewhere in the campaign, returns a warning instead — call
         lookup_entity to check first, or pass force=True if this is genuinely
-        a different item (e.g. a second +1 Longsword)."""
+        a different item (e.g. a second +1 Longsword).
+
+        rarity: 'common', 'uncommon', 'rare', 'very rare', 'legendary', or
+        'artifact' — drives the item's color in the UI. Leave blank for a +N
+        weapon/shield/armor variant (base_item + bonus set) — the real DMG
+        scale is applied automatically (a +N weapon or shield is
+        uncommon/rare/very rare for N=1/2/3; the same bonus on body armor is
+        one tier higher, rare/very rare/legendary). Required for anything
+        else (a wand, an amulet) — there's no formula to derive it from."""
         campaign = await store.load(campaign_id)
         char = find_char(campaign, character_name)
         if not char:
@@ -318,6 +341,9 @@ def make_tools(
         weapon = WEAPONS.get(base_key) if base_key else None
         armor = ARMOR.get(base_key) if base_key else None
         is_shield = base_key.lower() == "shield"
+        if not rarity and bonus in (1, 2, 3):
+            scale = ARMOR_BONUS_RARITY if armor else WEAPON_LIKE_BONUS_RARITY
+            rarity = scale[bonus]
 
         if weapon:
             is_ranged = "/" in weapon["range_ft"]
@@ -342,8 +368,10 @@ def make_tools(
             description=description,
             magical=True,
             requires_attunement=requires_attunement,
+            rarity=rarity,
         )
         char.inventory.append(new_item)
+        _mark_loot_granted(campaign)
         await store.save(campaign)
         if graph_store is not None:
             await graph_store.add_edge(
@@ -358,7 +386,7 @@ def make_tools(
         actually fight with a looted/purchased mundane weapon, so resolve_attack
         has a grounded attack_name to use instead of falling back to Unarmed
         Strike or, worse, an invented one. base_item must be a real weapon name
-        (search_rules or get_option_details if unsure) — this grounds to-hit/
+        (search_rules if unsure) — this grounds to-hit/
         damage in the character's real proficiency bonus and STR/DEX modifier,
         the same way create_magic_item grounds a magical weapon's stats, just
         with no enchantment bonus. Refuses if item_name isn't already in the
@@ -376,7 +404,7 @@ def make_tools(
             return f"{char.name} doesn't have '{item_name}' in their inventory — add it first."
         weapon = WEAPONS.get(base_item.strip())
         if not weapon:
-            return f"'{base_item}' isn't a recognized weapon — check the exact name via search_rules/get_option_details."
+            return f"'{base_item}' isn't a recognized weapon — check the exact name via search_rules."
         is_ranged = "/" in weapon["range_ft"]
         to_hit_mod = char.ability_scores.dex_mod if (weapon["finesse"] or is_ranged) else char.ability_scores.str_mod
         to_hit_bonus = char.proficiency_bonus + to_hit_mod
@@ -427,6 +455,7 @@ def make_tools(
             currency=Currency(**(currency or {})),
         )
         campaign.containers.append(container)
+        _mark_loot_granted(campaign)
         await store.save(campaign)
 
         lines = [f"💰 Loot found — {source_name} (unassigned):"]

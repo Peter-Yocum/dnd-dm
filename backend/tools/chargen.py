@@ -18,6 +18,7 @@ from backend.data.fivee_options import (
     STANDARD_ARRAY,
 )
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS, SPELL_REQUIREMENTS
+from backend.data.equipment import ARMOR, WEAPONS
 from backend.models import AbilityScores, Character
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import DraftStore
@@ -175,14 +176,54 @@ def make_reference_tools() -> list:
 
     @tool
     def get_option_details(category: str, name: str) -> str:
-        """Get detailed information about a specific race, class, or background.
+        """Get detailed information about a specific race, class, background,
+        spell, weapon, or armor.
 
-        category: 'race', 'class', 'background', or 'spell'
-        name: the exact name (e.g. 'Elf', 'Wizard', 'Sage')
+        category: 'race', 'class', 'background', 'spell', 'weapon', or 'armor'
+        name: the exact name (e.g. 'Elf', 'Wizard', 'Sage', 'Shortsword', 'Chain Mail')
         """
         cat = category.lower().strip()
         raw_name = name.strip()
         name = raw_name.title()
+
+        if cat == "weapon":
+            weapon = WEAPONS.get(name)
+            if not weapon:
+                return f"No weapon named '{name}' in the starting-kit reference data."
+            lines = [
+                f"=== {name} ===",
+                f"{weapon['category'].title()} {weapon['weapon_type']} weapon",
+                f"Damage: {weapon['damage_dice']} {weapon['damage_type'].value}",
+            ]
+            if weapon["properties"]:
+                lines.append(f"Properties: {', '.join(p.title() for p in weapon['properties'])}")
+            if weapon.get("versatile_damage_dice"):
+                lines.append(f"Versatile damage (two-handed): {weapon['versatile_damage_dice']}")
+            if "/" in weapon["range_ft"]:
+                lines.append(f"Range: {weapon['range_ft']} ft")
+            lines.append(f"Weight: {weapon['weight_lbs']} lb.  Cost: {weapon['value_gp']} gp")
+            return "\n".join(lines)
+
+        if cat == "armor":
+            armor = ARMOR.get(name)
+            if not armor:
+                return f"No armor named '{name}' in the starting-kit reference data."
+            ac_line = f"AC: {armor['base_ac']}"
+            if armor["dex_cap"] is None:
+                ac_line += " + Dex modifier"
+            elif armor["dex_cap"] > 0:
+                ac_line += f" + Dex modifier (max {armor['dex_cap']})"
+            lines = [
+                f"=== {name} ===",
+                f"{armor['category'].title()} armor",
+                ac_line,
+            ]
+            if armor["str_requirement"]:
+                lines.append(f"Requires Strength {armor['str_requirement']}")
+            if armor["stealth_disadvantage"]:
+                lines.append("Imposes disadvantage on Stealth checks")
+            lines.append(f"Weight: {armor['weight_lbs']} lb.  Cost: {armor['value_gp']} gp")
+            return "\n".join(lines)
 
         if cat == "spell":
             spell = next((s for s in ALL_SPELLS.values() if s.name.lower() == raw_name.lower()), None)
@@ -274,7 +315,7 @@ def make_reference_tools() -> list:
             ]
             return "\n".join(lines)
 
-        return "Unknown category. Use 'race', 'class', or 'background'."
+        return "Unknown category. Use 'race', 'class', 'background', 'spell', 'weapon', or 'armor'."
 
     return [list_options, get_option_details]
 

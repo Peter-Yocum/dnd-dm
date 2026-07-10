@@ -67,6 +67,18 @@ class RulesStore:
         embeddings = OllamaEmbeddings(
             base_url=self._ollama_base_url,
             model="nomic-embed-text",
+            # client_kwargs -> httpx timeout. Confirmed live, 2026-07-08: with
+            # no timeout at all, an occasional hung Ollama request blocks its
+            # thread forever (a stuck socket read can't be interrupted by
+            # Python, even from asyncio.to_thread/wait_for — those only
+            # abandon the coroutine, not the thread), permanently leaking one
+            # slot from the shared default thread-pool executor every time.
+            # Enough leaks (a handful of campaign-creation attempts) exhaust
+            # that pool and freeze the *whole app* for every user, not just
+            # the request that triggered it. 60s is generous headroom — this
+            # call normally completes in well under a second — while still
+            # bounding the worst case instead of leaving it unbounded.
+            client_kwargs={"timeout": 60.0},
         )
         self._store = Chroma(
             collection_name="rules",
@@ -177,15 +189,33 @@ class RulesStore:
         k: int = 6,
         books_in_play: list[str] | None = None,
         wide_k: int = 30,
+        use_reranker: bool = False,
     ) -> list[RuleChunk]:
         """Hybrid search: dense (Chroma) + BM25, fused via Reciprocal Rank
-        Fusion, reranked down to k, then each surviving child chunk is
+        Fusion, optionally reranked, then each surviving child chunk is
         expanded to its full parent section.
 
         Core books are always included. Pass books_in_play (list of adventure
         slugs from Campaign.books_in_play) to also search those adventures.
         None means no filter — searches everything (useful for admin/debug).
-        """
+
+        use_reranker defaults to False — see design.md's Evolution section,
+        2026-07-09: the reranker (LLMJudgeReranker) makes its own separate
+        ChatOllama call, distinct from the embedding model this method's dense
+        step already uses, so calling it here forces Ollama to evict one
+        model and load the other on every single call — the exact embed<->chat
+        swap already root-caused as the trigger for the whole-app MLX-runner
+        freeze (world-prep's freeze, 2026-07-08; the same fix — search_rules/
+        search_lore, the two live-gameplay callers — is applied here rather
+        than only to the two call sites that got it back then). RRF-fused
+        dense+BM25 is a legitimate hybrid retrieval result on its own even
+        without a reranked reorder on top — this trades a bit of ranking
+        precision for not freezing the app on every rules/lore lookup, which
+        given how constantly this is called during live play (every combat
+        start alone can trigger several) is the right side of that trade.
+        Pass True explicitly for a lower-frequency, quality-sensitive caller
+        that can tolerate the swap risk (e.g. scripts/eval_retrieval.py,
+        which is specifically measuring reranked quality offline)."""
         if self._store is None:
             self.load()
         if not self._store:
@@ -209,13 +239,15 @@ class RulesStore:
         hydrated = self._hydrate(fused_ids)
         candidates = [hydrated[cid] for cid in fused_ids if cid in hydrated and not _is_drop_cap_artifact(hydrated[cid])]
 
-        # Rerank the FULL candidate set (top_n=len(candidates), not k) —
-        # _expand_to_parents needs the fuller order to backfill past a
-        # dedup collapse; both Reranker implementations already compute the
-        # complete ranking internally before slicing to top_n, so this costs
-        # nothing extra (same single LLM/cross-encoder call either way).
-        reranked = self._reranker.rerank(query, candidates, top_n=len(candidates))
-        return self._expand_to_parents(reranked, k)
+        if use_reranker:
+            # Rerank the FULL candidate set (top_n=len(candidates), not k) —
+            # _expand_to_parents needs the fuller order to backfill past a
+            # dedup collapse; both Reranker implementations already compute
+            # the complete ranking internally before slicing to top_n, so
+            # this costs nothing extra (same single LLM/cross-encoder call
+            # either way). See this method's docstring for why this is opt-in.
+            candidates = self._reranker.rerank(query, candidates, top_n=len(candidates))
+        return self._expand_to_parents(candidates, k)
 
     def search_adventure_only(self, query: str, adventure: str, k: int = 4) -> list[RuleChunk]:
         """Search only the given adventure's indexed text — no core rulebook

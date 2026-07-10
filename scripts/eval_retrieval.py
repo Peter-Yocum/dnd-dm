@@ -62,7 +62,10 @@ def run_eval(k: int, baseline: bool) -> None:
                 for d in docs
             ]
         else:
-            chunks = store.search(query, k=k, books_in_play=None)
+            # use_reranker=True — this eval specifically measures reranked
+            # quality; the live-gameplay callers (search_rules/search_lore)
+            # default to False now (see RulesStore.search()'s docstring).
+            chunks = store.search(query, k=k, books_in_play=None, use_reranker=True)
 
         found = any(_matches(c, q["expected_book"], q["expected_section_contains"]) for c in chunks)
         print(f"  [{'OK  ' if found else 'MISS'}] {query}")

@@ -46,7 +46,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from backend.config import settings
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS
-from backend.models import Campaign
+from backend.models import Campaign, CombatantType, InitiativeEntry
 from backend.agent.prompts import get_mechanics_system_prompt, get_narrator_system_prompt
 from backend.agent.session_zero_prompt import get_session_zero_mechanics_prompt, get_session_zero_narrator_prompt
 from backend.stores.campaign_store import CampaignStore
@@ -61,6 +61,7 @@ from backend.tools.combat import build_encounter_context
 from backend.tools.npc import build_traveling_npcs_context
 from backend.tools.registry import get_npc_prep_tools, get_tools, get_world_prep_tools
 from backend.tools.resolution import resolve_pending_action_impl
+from backend.tools._helpers import find_char
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +136,20 @@ def _get_model() -> ChatOllama:
         base_url=settings.ollama_base_url,
         temperature=0.7,
         reasoning=False,
+        # client_kwargs timeout (all three ChatOllama instances in this
+        # file, 2026-07-08) — this is very likely the same underlying issue
+        # as the "MLX runner stuck reporting 'Stopping...' indefinitely"
+        # hang noted in _get_mechanics_model()'s docstring below, just
+        # finally traced to its actual mechanism: with no client-level
+        # timeout, a hung request blocks its thread forever (unkillable —
+        # neither asyncio.to_thread nor asyncio.wait_for can reclaim a
+        # thread stuck in a blocking socket read), permanently leaking a
+        # slot from the shared thread-pool executor every time it happens.
+        # Enough leaks exhaust that pool and freeze the whole app for every
+        # user, not just the one call that hung. 120s (vs. 60s on the
+        # embedding-only clients) — a real multi-step tool-calling turn can
+        # legitimately take tens of seconds per call.
+        client_kwargs={"timeout": 120.0},
     )
 
 
@@ -168,6 +183,7 @@ def _get_mechanics_model() -> ChatOllama:
         base_url=settings.ollama_base_url,
         temperature=0.1,
         reasoning=False,
+        client_kwargs={"timeout": 120.0},  # see _get_model()'s comment above
     )
 
 
@@ -185,6 +201,7 @@ def _get_narrator_model() -> ChatOllama:
         base_url=settings.ollama_base_url,
         temperature=0.8,
         reasoning=False,
+        client_kwargs={"timeout": 120.0},  # see _get_model()'s comment above
     )
 
 
@@ -365,6 +382,17 @@ class DMState(TypedDict):
                                 # combat/loot correction spending the turn's one correction_count
                                 # retry shouldn't leave zero budget for a lore check later the
                                 # same turn.
+    stalled_turn_guardrail_count: int  # caps retries for _detect_stalled_non_player_turn_followup —
+                                        # a separate budget from correction_count, split out after
+                                        # observed live (2026-07-09) that it starved exactly the way
+                                        # lore_guardrail_count's own doc comment predicts: one player
+                                        # message can auto-continue through several combatants'
+                                        # turns in a row (see the Combat prompt section), so an
+                                        # earlier, unrelated correction_count-spending correction
+                                        # (e.g. a missing combat-roll-backing catch a few combatants
+                                        # earlier in the same response) left zero budget by the time
+                                        # this genuinely distinct failure — a DM companion's turn
+                                        # later in the same sequence — needed its own retry.
 
 
 # ── agent factory ──────────────────────────────────────────────────────────────
@@ -567,7 +595,13 @@ def _detect_missing_combat_roll_followup(notes: str, called: set[str]) -> str | 
     )
 
 
-_LOOT_TOOLS = {"update_character_currency", "add_item_to_character", "create_magic_item", "reveal_loot"}
+_LOOT_TOOLS = {
+    "update_character_currency", "add_item_to_character", "create_magic_item", "reveal_loot",
+    # end_encounter now rolls and reveals post-combat loot automatically (see
+    # backend/tools/loot_generator.py) — its own tool result is a valid backing
+    # call for a narrated gain, same as calling reveal_loot by hand.
+    "end_encounter",
+}
 
 # Gain-verbs broadened beyond "finds/receives" to cover mundane handoffs/pickups
 # ("snatches the weapon", "recovers his shortsword") that the original verb list
@@ -621,40 +655,6 @@ def _detect_missing_loot_followup(notes: str, called: set[str]) -> str | None:
     )
 
 
-_MONSTER_DEFEATED_RE = re.compile(r"—\s*DEFEATED\b")
-
-
-def _detect_missing_loot_consideration_followup(state: DMState, called: set[str]) -> str | None:
-    """Catches a monster reduced to 0 HP this turn with NO loot tool
-    (reveal_loot/add_item_to_character/update_character_currency/
-    create_magic_item) called at all. Distinct from
-    _detect_missing_loot_followup, which catches a FALSE claim of loot —
-    this catches SILENCE: the model kills something and moves on without
-    ever considering whether it drops anything. Observed live: a group of
-    guards the actual adventure text confirms carry a specific plot-relevant
-    key (Out of the Abyss's Velkynvelve slave-pen key) could easily be
-    killed and looted-for-nothing if the model simply never thinks to check,
-    losing a real story hook with no narrated claim to even catch."""
-    if called & _LOOT_TOOLS:
-        return None
-    defeated = any(
-        isinstance(m, ToolMessage) and _MONSTER_DEFEATED_RE.search(_extract_text(m.content))
-        for m in _messages_since_last_human(state["messages"])
-    )
-    if not defeated:
-        return None
-    return (
-        "You defeated a monster this turn but didn't call reveal_loot / "
-        "add_item_to_character / update_character_currency / create_magic_item, "
-        "and didn't note in your report that a check turned up nothing. Before "
-        "moving on: if this is a named adventure NPC or monster, call "
-        "search_rules or search_adventure_literal to check what the module "
-        "says they carry — never silently skip loot the book actually "
-        "specifies just because it wasn't the first thing that came to mind. "
-        "Either call the appropriate loot tool now, or explicitly state in "
-        "your resolution report that nothing of value was found."
-    )
-
 
 _COMBAT_RESOLUTION_TOOLS = {"resolve_attack", "resolve_saving_throw"}
 
@@ -696,6 +696,105 @@ async def _detect_missing_encounter_followup(
         "If this is truly a single decisive blow that's now fully resolved, proceed. "
         "Otherwise, formalize combat now: call create_monster for every hostile actor "
         "not already registered, then start_encounter, before resolving anything further."
+    )
+
+
+def _live_current_turn(campaign: Campaign) -> tuple[InitiativeEntry, bool] | None:
+    """(current initiative entry, is_player_controlled) for whoever's turn it
+    live-is right now, or None if there's no active encounter / no pending
+    reaction to resolve first. Shared ground-truth lookup for both
+    _detect_stalled_non_player_turn_followup (forces real resolution) and
+    _next_turn_ground_truth_note (tells the narrator the fact directly,
+    regardless of whether that guardrail's bounded retry already fired) —
+    see both docstrings for why neither alone is sufficient."""
+    enc = campaign.active_encounter
+    if not enc or not enc.is_active or enc.pending_action:
+        return None
+    current = next((e for e in enc.initiative_order if e.is_current_turn), None)
+    if not current:
+        return None
+    if current.combatant_type == CombatantType.CHARACTER:
+        char = find_char(campaign, current.name)
+        is_player = bool(char and char.is_player_controlled)
+    else:
+        is_player = False
+    return current, is_player
+
+
+async def _detect_stalled_non_player_turn_followup(
+    campaign_id: str, store: CampaignStore
+) -> str | None:
+    """Catches the mechanics model stopping to prompt the (human) player when
+    the combatant actually due to act next — per live initiative_order — is a
+    monster, a DM-controlled companion, or an NPC. Nobody is there to act
+    until the model resolves it itself; the Combat prompt section already
+    instructs auto-continuing through every non-player turn in one response
+    (see prompts.py's "turn of this conversation vs turn of initiative" rule),
+    this is the deterministic backstop for when that instruction doesn't get
+    followed — same shape as the loot/encounter guardrails above. Observed
+    live: the model stopped and asked the human player to act for a DM
+    companion (a different character than the human's own), leaving the
+    actual player-controlled turn never reached. Exempt whenever there's a
+    pending_action — that's a real reaction prompt legitimately awaiting the
+    player's decision, not a stall."""
+    campaign = await store.load(campaign_id)
+    if not campaign:
+        return None
+    hit = _live_current_turn(campaign)
+    if not hit:
+        return None
+    current, is_player = hit
+    if is_player:
+        return None
+    return (
+        f"It's currently {current.name}'s turn ({current.combatant_type.value}, not "
+        "player-controlled) — nobody is waiting to act until you resolve it yourself. "
+        "Call advance_initiative and resolve their action now with a sensible tactical "
+        "choice, and keep going through any further non-player turns in this same "
+        "response, per the Combat section's auto-continuation rule — don't stop to ask "
+        "the player until it's actually a player-controlled character's turn."
+    )
+
+
+async def _next_turn_ground_truth_note(campaign_id: str, store: CampaignStore) -> str | None:
+    """Deterministic "whose turn is it, really" fact, appended to the
+    resolution report unconditionally (no retry budget — this never loops,
+    just annotates) right before the narrator sees it. Exists because
+    _detect_stalled_non_player_turn_followup's fix wasn't sufficient on its
+    own: observed live (2026-07-09) that even with its own dedicated retry
+    budget, a single long auto-continued response can still stall on a
+    SECOND non-player turn after the guardrail's one retry already got spent
+    correcting a first, unrelated mistake earlier in the same response —
+    three different DM companions (Elara, Kaelen, Thrainna) each independently
+    got asked directly across one fight, and the model's own free-text
+    tracking of "whose turn" drifted every time rather than reading the live
+    fact it already has better access to. This can't loop indefinitely
+    (unlike the guardrail, it has no bounded-retry mechanism to force a real
+    re-resolution), so it's a narration-correctness backstop, not a
+    substitute for the guardrail actually resolving the turn — it guarantees
+    the player is never told a wrong or premature "X, you are up" even in the
+    worst case where a companion's turn is still technically unresolved when
+    this response ends; the player's own next message starts a fresh
+    stalled_turn_guardrail_count budget that can then force the real fix."""
+    campaign = await store.load(campaign_id)
+    if not campaign:
+        return None
+    hit = _live_current_turn(campaign)
+    if not hit:
+        return None
+    current, is_player = hit
+    if is_player:
+        return (
+            f"\n\n[GROUND TRUTH — it is now {current.name}'s turn (player-controlled). "
+            "End your reply prompting exactly this character, by this exact name, for "
+            "their action. Do not address any other character.]"
+        )
+    return (
+        f"\n\n[GROUND TRUTH — it is still {current.name}'s turn "
+        f"({current.combatant_type.value}, NOT player-controlled). No player input is "
+        "being waited on right now — do not end your reply asking the player what they "
+        "do. Narrate the scene continuing/holding instead; the DM will resolve "
+        f"{current.name}'s action on the next pass.]"
     )
 
 
@@ -914,14 +1013,16 @@ def get_agent(
         # the encounter-gated check above can't catch a "combat" that never
         # got a real encounter/monster created in the first place; claiming a
         # loot/currency gain with no backing tool call at all, combat or not
-        # (see _detect_missing_loot_followup); silently skipping loot
-        # entirely after a kill, with no claim to even catch (see
-        # _detect_missing_loot_consideration_followup — a real adventure NPC
-        # can carry book-specified loot that's lost for good if the model
-        # never thinks to check); or resolving an attack/save against a
-        # surviving monster with no active encounter backing it (see
-        # _detect_missing_encounter_followup). Capped at one retry per
-        # PLAYER TURN via correction_count (reset in stream_response), not per
+        # (see _detect_missing_loot_followup — end_encounter itself now counts
+        # as a backing call, since it rolls and reveals post-combat loot
+        # automatically, see backend/tools/loot_generator.py; there's no more
+        # "silently skipped loot after a kill" guardrail needed here — that's
+        # now handled deterministically by end_encounter itself, generic DMG
+        # treasure and any adventure-specific item alike, rather than by
+        # nagging the model to remember to check); or resolving an attack/save
+        # against a surviving monster with no active encounter backing it (see
+        # _detect_missing_encounter_followup). Capped at one retry per PLAYER
+        # TURN via correction_count (reset in stream_response), not per
         # no-tool-calls cycle — a model that stops short after nearly every
         # real tool call could otherwise re-trigger this every loop iteration
         # and never reach the recursion limit's stop condition.
@@ -932,8 +1033,6 @@ def get_agent(
             if not issue:
                 issue = _detect_missing_loot_followup(notes, called_this_turn)
             if not issue:
-                issue = _detect_missing_loot_consideration_followup(state, called_this_turn)
-            if not issue:
                 issue = await _detect_missing_encounter_followup(state, campaign.id, store)
             if issue:
                 log.info("guardrail fired: %s", issue)
@@ -942,6 +1041,26 @@ def get_agent(
                     update={
                         "correction_note": issue,
                         "correction_count": correction_count + 1,
+                        "tool_error_count": 0,
+                    },
+                )
+
+        # Stopping to prompt the human player when live initiative_order says
+        # it's actually a monster's/DM companion's/NPC's turn — nobody is
+        # there to act until the model resolves it itself (see
+        # _detect_stalled_non_player_turn_followup). Own separate budget
+        # (stalled_turn_guardrail_count) — see DMState's doc comment for the
+        # starvation this was split out to avoid.
+        stalled_turn_guardrail_count = state.get("stalled_turn_guardrail_count", 0)
+        if stalled_turn_guardrail_count < 1:
+            stalled_issue = await _detect_stalled_non_player_turn_followup(campaign.id, store)
+            if stalled_issue:
+                log.info("guardrail fired: %s", stalled_issue)
+                return Command(
+                    goto="mechanics",
+                    update={
+                        "correction_note": stalled_issue,
+                        "stalled_turn_guardrail_count": stalled_turn_guardrail_count + 1,
                         "tool_error_count": 0,
                     },
                 )
@@ -1006,6 +1125,15 @@ def get_agent(
         # AIMessage remain as the permanent record of this turn.
         scratch = _messages_since_last_human(state["messages"])
         removals = [RemoveMessage(id=m.id) for m in scratch if m.id]
+
+        # Deterministic "whose turn is it" fact, appended unconditionally —
+        # see _next_turn_ground_truth_note's docstring for why this is a
+        # necessary backstop even with _detect_stalled_non_player_turn_followup
+        # already in the guardrail chain above.
+        ground_truth = await _next_turn_ground_truth_note(campaign.id, store)
+        if ground_truth:
+            notes += ground_truth
+
         return Command(
             goto="narrator",
             update={
@@ -1563,7 +1691,10 @@ async def stream_response(
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
 
     async for event in agent.astream_events(
-        {"messages": [HumanMessage(content=user_message)], "correction_count": 0, "tool_error_count": 0, "lore_guardrail_count": 0},
+        {
+            "messages": [HumanMessage(content=user_message)], "correction_count": 0, "tool_error_count": 0,
+            "lore_guardrail_count": 0, "stalled_turn_guardrail_count": 0,
+        },
         config=config,
         version="v2",
     ):
@@ -1737,10 +1868,25 @@ def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore) -> st
         if loc:
             query = f"{loc.name}. {loc.description}".strip()
 
-    if not query or not rules_store.is_ready():
+    if not query or not rules_store.is_ready() or not campaign.books_in_play:
         return "(none retrieved)"
 
-    chunks = rules_store.search(query, books_in_play=campaign.books_in_play)
+    # search_adventure_only (plain dense search) rather than the hybrid
+    # search() — see design.md's Evolution section, 2026-07-09: search()'s
+    # reranker makes its own separate ChatOllama call, so this one retrieval
+    # step forces an embed -> chat model swap on Ollama every time a session
+    # ends. That's the exact trigger already root-caused for world-prep's
+    # recurring whole-app freeze (fixed there by removing Ollama from the
+    # seed step entirely; here, dropping to dense-only search removes just
+    # the chat-model half of the same problem while keeping the live-state-
+    # dependent semantic search this function actually needs). Also a
+    # better fit than search() was in the first place — matches
+    # search_adventure_only's own original rationale: adventure-scoped
+    # dense search surfaces a location's own named content instead of
+    # generic core-rulebook DM advice drowning it out.
+    chunks = []
+    for book in campaign.books_in_play:
+        chunks += rules_store.search_adventure_only(query, adventure=book, k=4)
     if not chunks:
         return "(none retrieved)"
     return "\n\n---\n\n".join(f"[{c.book} — {c.section}]\n{c.content}" for c in chunks)
@@ -1786,14 +1932,26 @@ async def summarize_session(
     progress_marker = f"---PROGRESS-{token}---"
     relations_marker = f"---RELATIONS-{token}---"
 
-    # asyncio.to_thread — _book_context_for_summary calls RulesStore.search()
-    # (the full hybrid pipeline: dense + BM25 + an LLM rerank call),
-    # synchronous end to end. Called bare here it would freeze this
-    # process's single event loop for every request, not just this session-
-    # end call — same bug class as the 2026-06-30 audit's add_session
-    # finding and world_prep.py's two call sites; see design.md's Evolution
-    # section for the live incident (2026-07-08) that surfaced this one.
-    book_context = await asyncio.to_thread(_book_context_for_summary, campaign, rules_store)
+    # asyncio.to_thread — _book_context_for_summary is synchronous
+    # (RulesStore.search_adventure_only, a blocking Ollama embed call under
+    # the hood); called bare here it would freeze this process's single
+    # event loop for every request, not just this session-end call — same
+    # bug class as the 2026-06-30 audit's add_session finding and
+    # world_prep.py's call sites; see design.md's Evolution section.
+    #
+    # asyncio.wait_for on top of that as a backstop. Note
+    # _book_context_for_summary itself no longer calls the hybrid search()
+    # (2026-07-09 — see its own docstring): it now uses
+    # search_adventure_only, which only needs the embedding model, not a
+    # second embed->chat model swap via search()'s own LLM reranker. That
+    # was the actual root cause of a whole-app freeze here, not just a slow
+    # call — same mechanism as world-prep's, see design.md.
+    try:
+        book_context = await asyncio.wait_for(
+            asyncio.to_thread(_book_context_for_summary, campaign, rules_store), timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        book_context = "(book context unavailable — retrieval timed out)"
 
     prompt = _SUMMARY_PROMPT.format(
         campaign_name=campaign.name,
@@ -1807,7 +1965,32 @@ async def summarize_session(
     )
 
     llm = _get_model()
-    response = await llm.ainvoke(prompt)
+    # Bounded retry on an Ollama timeout — the book-context step above still
+    # makes one embedding call, so a single embed->chat swap remains
+    # possible right here even after the fix above. Same discipline as
+    # world-prep's _ainvoke_with_retry: one retry, not a loop.
+    #
+    # asyncio.wait_for wrapping each attempt, NOT relying on the httpx
+    # client_kwargs timeout alone — confirmed live, 2026-07-09: this exact
+    # call still froze the whole app for 4+ minutes (well past the
+    # configured 120s client timeout) on a retry immediately after this fix
+    # first shipped. Leading theory: Ollama's response is a stream, and a
+    # naive read-timeout resets on any partial byte received, so a
+    # connection that trickles data without ever completing can outlast a
+    # timeout that's only measuring silence, not total request time.
+    # asyncio.wait_for is different in kind, not just a second copy of the
+    # same idea — it's a real wall-clock deadline enforced by asyncio
+    # itself, and because ainvoke() here runs on the native async httpx
+    # client (not a to_thread-wrapped sync one), cancelling it actually
+    # propagates into the request and aborts the connection, rather than
+    # abandoning an unkillable OS thread the way the to_thread cases
+    # earlier tonight could only leak.
+    import httpx
+    try:
+        response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=120.0)
+    except (httpx.TimeoutException, asyncio.TimeoutError):
+        log.warning("session summary LLM call timed out, retrying once (campaign=%s)", campaign.id)
+        response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=120.0)
     text = _extract_text(response.content)
 
     # Parse the structured response

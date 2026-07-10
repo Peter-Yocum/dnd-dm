@@ -1,7 +1,7 @@
 from langchain_core.tools import tool
 
 from backend.models import (
-    Attack, Campaign, CombatantPosition, CombatantType, CoverType, DamageType,
+    Attack, Campaign, CombatantPosition, CombatantType, Container, CoverType, DamageType,
     Encounter, InitiativeEntry, Monster, MonsterSize, MonsterType, ZoneType,
 )
 from backend.stores.campaign_store import CampaignStore
@@ -10,6 +10,7 @@ from backend.tools._helpers import (
     advance_combatant_turn, apply_damage_to_monster, find_char, find_monster,
     monster_summary, roll_notation,
 )
+from backend.tools.loot_generator import enrich_with_adventure_loot, generate_encounter_loot
 
 
 def build_encounter_context(campaign: Campaign) -> str | None:
@@ -124,6 +125,23 @@ def make_tools(
             type_enum = MonsterType(monster_type.lower())
         except ValueError:
             type_enum = MonsterType.HUMANOID
+
+        # Validated up front, not left to crash on a[\"name\"] below — observed
+        # live (2026-07-09): a missing 'name' key raised a bare KeyError, and
+        # the generic tool-error handler's str(e) rendered that as literally
+        # "Error: 'name'" with no indication of what was wrong or how to fix
+        # it. The model retried the identical mistake four times against that
+        # unhelpful message, then gave up and fabricated the rest of an entire
+        # combat encounter in narration with no real monster/encounter ever
+        # created — the actual root cause of that session's "stuck asking for
+        # a DM companion's turn forever" bug traced all the way back to this.
+        for i, a in enumerate(attacks):
+            if not a.get("name"):
+                return (
+                    f"attacks[{i}] is missing 'name' — every attack needs one, e.g. "
+                    '{"name": "Scimitar", "to_hit_bonus": 4, "damage_dice": "1d6+2", '
+                    '"damage_type": "slashing"}. Fix and call create_monster again.'
+                )
 
         built_attacks = []
         for a in attacks:
@@ -272,7 +290,13 @@ def make_tools(
     @tool
     async def end_encounter(xp_awarded: int = 0) -> str:
         """End the current combat encounter. Pass xp_awarded to record what the
-        party earned; leave 0 if XP is not used or will be tracked separately."""
+        party earned; leave 0 if XP is not used or will be tracked separately.
+        Automatically rolls and reveals loot for any defeated monsters (real DMG
+        treasure tables, scaled to their CR, plus any adventure-specific item tied
+        to them or this location) — do not separately invent or grant post-combat
+        loot; narrate exactly what this tool's result says. Skips its own roll if
+        loot was already granted manually mid-fight (reveal_loot/add_item_to_character/
+        etc.), so a narrated treasure pile can't double up with an automatic one."""
         campaign = await store.load(campaign_id)
         if not campaign.active_encounter or not campaign.active_encounter.is_active:
             return "No active encounter to end."
@@ -280,10 +304,55 @@ def make_tools(
         enc.is_active = False
         enc.xp_awarded = xp_awarded
         campaign.active_encounter = None
-        await store.save(campaign)
+
         msg = f"Encounter ended after {enc.round} round(s)."
         if xp_awarded:
             msg += f" {xp_awarded} XP awarded."
+
+        if enc.loot_already_granted:
+            msg += "\nLoot for this encounter was already handled during the fight — nothing further to reveal."
+        else:
+            defeated_names = {
+                e.name for e in enc.initiative_order if e.combatant_type == CombatantType.MONSTER
+            }
+            defeated = [
+                m for m in campaign.monsters
+                if m.name in defeated_names and m.current_hp <= 0
+            ]
+            location = next((l for l in campaign.locations if l.id == enc.location_id), None)
+            location_name = location.name if location else enc.location_description
+
+            loot = generate_encounter_loot(defeated)
+            loot.items += await enrich_with_adventure_loot(
+                lore_store, books_in_play, defeated, location_name,
+                location.aliases if location else None,
+            )
+
+            if loot.is_empty():
+                msg += "\nNo loot found on the fallen."
+            else:
+                container = Container(
+                    name="the fallen enemies",
+                    location_id=enc.location_id,
+                    is_open=True,
+                    contents=loot.items,
+                    currency=loot.currency,
+                )
+                campaign.containers.append(container)
+                lines = ["\n💰 Loot found — the fallen enemies (unassigned):"]
+                lines += [
+                    f"  - {i.name}" + (f" x{i.quantity}" if i.quantity > 1 else "")
+                    for i in container.contents
+                ]
+                coins = ", ".join(
+                    f"{v} {k}" for k, v in loot.currency.model_dump().items() if v
+                )
+                if coins:
+                    lines.append(f"  - {coins}")
+                lines.append("Ask the party how to split it before assigning anything.")
+                msg += "\n".join(lines)
+
+        await store.save(campaign)
         return msg
 
     @tool

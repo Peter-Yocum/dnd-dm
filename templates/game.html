@@ -2,7 +2,42 @@
 {% block title %}{{ campaign.name }} — D&D DM{% endblock %}
 
 {% block content %}
-<div class="game-layout">
+{% set wp_pending = campaign.books_in_play and campaign.world_prep_status in ["not_started", "in_progress"] %}
+<div class="game-layout"
+     {% if wp_pending %}
+     hx-get="/campaigns/{{ campaign.id }}" hx-trigger="every 3s" hx-select=".game-layout" hx-target=".game-layout" hx-swap="outerHTML"
+     {% endif %}>
+{% if wp_pending %}
+
+  <!-- ── world-prep gate: blocks the rest of the UI until the background
+       world-prep pass (region-scale locations/travel/opening-scene NPCs)
+       finishes for this campaign — see design.md's Evolution section for
+       why this exists: prior to this, a still-preparing campaign just
+       looked like a broken/frozen app with no explanation. Self-terminating
+       poll: once world_prep_status leaves not_started/in_progress, the next
+       3s poll's response no longer carries hx-trigger, so polling stops on
+       its own. ──────────────────────────────────────────────────────── -->
+  <div class="world-prep-gate">
+    <div class="world-prep-gate-inner">
+      <div class="spinner" aria-hidden="true"></div>
+      <h3>Preparing the world…</h3>
+      <p>
+        Setting up locations, travel routes, and the opening scene for
+        {{ campaign.books_in_play | map("replace", "-", " ") | map("title") | join(", ") }}.
+        This can take a few minutes for a location-dense adventure — this
+        page updates automatically, no need to refresh.
+      </p>
+    </div>
+  </div>
+
+{% else %}
+
+  {% if campaign.world_prep_status == "failed" %}
+  <div class="world-prep-failed-banner">
+    World preparation didn't finish cleanly{% if campaign.world_prep_error %}: {{ campaign.world_prep_error }}{% endif %}.
+    You can still play — the DM will improvise locations/travel as needed instead of using a pre-seeded map.
+  </div>
+  {% endif %}
 
   <!-- ── sidebar ─────────────────────────────────────────────────── -->
   <aside class="sidebar">
@@ -186,6 +221,7 @@
     </div>
   </aside>
 
+{% endif %}
 </div>
 
 <!-- ── campaign settings modal ─────────────────────────────────── -->
@@ -252,6 +288,14 @@
     <p class="overlay-hint">The chronicle has been saved. A new session begins.</p>
     <button class="btn-primary" onclick="closeOverlay()">Continue to Next Session</button>
     <a id="overlay-history-link" href="#" class="btn-ghost">View Full Chronicle</a>
+  </div>
+</div>
+
+<!-- ── item detail popup ───────────────────────────────────────── -->
+<div id="item-detail-modal" class="session-overlay hidden" onclick="if (event.target === this) closeItemDetail();">
+  <div class="session-overlay-box item-detail-box">
+    <div id="item-detail-body"></div>
+    <button class="btn-ghost" onclick="closeItemDetail()">Close</button>
   </div>
 </div>
 
@@ -340,6 +384,67 @@
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
+  // Rarity -> CSS class, shared by inline item-links and the detail popup.
+  // "" (mundane, or not yet looked up) intentionally maps to no class — a
+  // plain link, not a miscolored one.
+  function rarityClass(rarity) {
+    if (!rarity) return "";
+    return "rarity-" + rarity.toLowerCase().replace(/\s+/g, "-");
+  }
+
+  // Clickable item name -> item-detail popup (see showItemDetail below).
+  // data-item carries the raw name (quote-escaped only) so the lookup fetch
+  // matches the real item name, not its display-escaped form. rarity is
+  // optional — pass it when already known synchronously (character sheet
+  // inventory has the real Item object in hand); leave it blank for a
+  // narration mention and enrichItemLinks() will fill the color in shortly
+  // after, once its background lookup resolves.
+  function itemLink(name, rarity) {
+    const cls = ("item-link " + rarityClass(rarity)).trim();
+    return `<span class="${cls}" data-item="${escapeHtml(name).replace(/"/g, "&quot;")}">${escapeHtml(name)}</span>`;
+  }
+
+  // Turns a narrator-emitted [[Item Name]] marker (see get_narrator_system_prompt's
+  // Loot section) into the same clickable span itemLink() produces, operating on
+  // already-escaped HTML (brackets pass through escapeHtml unchanged, so this must
+  // run after it) — unescapes just the captured name for the data attribute.
+  // Rarity isn't known yet at this point (the narrator doesn't state it) — left
+  // uncolored until enrichItemLinks() looks it up.
+  function linkifyItems(escapedHtml) {
+    return escapedHtml.replace(/\[\[([^\[\]]+)\]\]/g, (_, name) => {
+      const raw = name.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+      return `<span class="item-link" data-item="${raw.replace(/"/g, "&quot;")}">${name}</span>`;
+    });
+  }
+
+  // Background rarity lookup for item-links added without a known rarity yet
+  // (narration mentions — inventory links already carry theirs). One fetch per
+  // distinct item name per page load (ITEM_RARITY_CACHE), not per mention.
+  const ITEM_RARITY_CACHE = new Map();
+
+  async function enrichItemLinks(container) {
+    const spans = container.querySelectorAll(".item-link:not([data-rarity-checked])");
+    for (const span of spans) {
+      span.dataset.rarityChecked = "1";
+      const name = span.dataset.item;
+      if (ITEM_RARITY_CACHE.has(name)) {
+        applyRarityClass(span, ITEM_RARITY_CACHE.get(name));
+        continue;
+      }
+      try {
+        const res = await fetch(`/campaigns/${CAMPAIGN_ID}/item-detail?name=${encodeURIComponent(name)}`);
+        const rarity = res.ok ? (await res.json()).rarity || "" : "";
+        ITEM_RARITY_CACHE.set(name, rarity);
+        applyRarityClass(span, rarity);
+      } catch (err) { /* leave uncolored — a lookup failure isn't worth surfacing here */ }
+    }
+  }
+
+  function applyRarityClass(span, rarity) {
+    const cls = rarityClass(rarity);
+    if (cls) span.classList.add(cls);
+  }
+
   // Renders accumulated raw DM text as separate <p> elements split on blank
   // lines, so distinct beats (description, dialogue, a roll) read as
   // paragraphs instead of one dense block. A paragraph starting with 🎲 (the
@@ -354,9 +459,10 @@
       const isRoll = trimmed.startsWith("🎲");
       const isLoot = trimmed.startsWith("💰");
       const cls = isRoll ? "roll-line" : (isLoot ? "loot-line" : "");
-      const html = escapeHtml(p).replace(/\n/g, "<br>");
+      const html = linkifyItems(escapeHtml(p)).replace(/\n/g, "<br>");
       return `<p class="${cls}">${html}</p>`;
     }).join("");
+    enrichItemLinks(dmDiv);
   }
 
   // Shown while the mechanics model works through its tool-calling loop —
@@ -502,6 +608,72 @@
     document.getElementById("campaign-modal").classList.add("hidden");
   }
 
+  // ── item detail popup ────────────────────────────────────────────────────
+  // Delegated so it works for item-links added at any time — inventory panel
+  // re-renders, streamed narration paragraphs appended live, etc.
+  document.addEventListener("click", (e) => {
+    const link = e.target.closest(".item-link");
+    if (link) showItemDetail(link.dataset.item);
+  });
+
+  async function showItemDetail(name) {
+    const body = document.getElementById("item-detail-body");
+    const box = document.querySelector("#item-detail-modal .item-detail-box");
+    box.className = "session-overlay-box item-detail-box";  // clear any previous rarity-* tint
+    body.innerHTML = "<p class=\"text-dim\">Loading…</p>";
+    document.getElementById("item-detail-modal").classList.remove("hidden");
+    try {
+      const res = await fetch(`/campaigns/${CAMPAIGN_ID}/item-detail?name=${encodeURIComponent(name)}`);
+      if (!res.ok) {
+        body.innerHTML = `<p class="text-dim">No stat block found for "${escapeHtml(name)}".</p>`;
+        return;
+      }
+      const d = await res.json();
+      body.innerHTML = renderItemDetail(d);
+      const cls = rarityClass(d.rarity);
+      if (cls) box.classList.add(cls);
+    } catch (err) {
+      body.innerHTML = "<p class=\"text-dim\">Couldn't load item details.</p>";
+    }
+  }
+
+  function closeItemDetail() {
+    document.getElementById("item-detail-modal").classList.add("hidden");
+  }
+
+  function renderItemDetail(d) {
+    let html = `<h2>${escapeHtml(d.name || "")}</h2>`;
+    if (d.rarity) {
+      html += `<div class="item-rarity ${rarityClass(d.rarity)}">${escapeHtml(d.rarity)}${d.requires_attunement ? " (requires attunement)" : ""}</div>`;
+    }
+    const m = d.mechanical;
+    if (m) {
+      const parts = [];
+      const kind = [m.category, m.weapon_type].filter(Boolean).join(" ");
+      if (kind) parts.push(kind.charAt(0).toUpperCase() + kind.slice(1));
+      if (m.damage_dice) parts.push(`Damage: ${m.damage_dice} ${m.damage_type || ""}`.trim());
+      if (m.properties && m.properties.length) {
+        parts.push(`Properties: ${m.properties.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(", ")}`);
+      }
+      if (m.versatile_damage_dice) parts.push(`Versatile damage: ${m.versatile_damage_dice}`);
+      if (m.range_ft && m.range_ft.includes("/")) parts.push(`Range: ${m.range_ft} ft`);
+      if (m.base_ac !== undefined) {
+        let ac = `AC: ${m.base_ac}`;
+        if (m.dex_cap === null) ac += " + Dex modifier";
+        else if (m.dex_cap > 0) ac += ` + Dex modifier (max ${m.dex_cap})`;
+        parts.push(ac);
+      }
+      if (m.str_requirement) parts.push(`Requires Strength ${m.str_requirement}`);
+      if (m.stealth_disadvantage) parts.push("Disadvantage on Stealth checks");
+      if (m.weight_lbs) parts.push(`Weight: ${m.weight_lbs} lb.`);
+      if (m.value_gp) parts.push(`Cost: ${m.value_gp} gp`);
+      if (parts.length) html += `<div class="item-mechanical">${parts.map(escapeHtml).join("<br>")}</div>`;
+    }
+    if (d.description) html += `<p class="item-description">${escapeHtml(d.description)}</p>`;
+    if (d.holder) html += `<p class="text-dim">Currently held by: ${escapeHtml(d.holder)}</p>`;
+    return html;
+  }
+
   function updateFlagIndicator(count) {
     const btn = document.querySelector(".campaign-menu-btn");
     let badge = btn.querySelector(".flag-indicator");
@@ -604,7 +776,7 @@
     if (d.inventory && d.inventory.length) {
       html += `<div class="preview-section">
         <div class="preview-label">Inventory</div>
-        <div class="preview-value">${d.inventory.map(i => i.name + (i.quantity > 1 ? ` x${i.quantity}` : "")).join(", ")}</div>
+        <div class="preview-value">${d.inventory.map(i => itemLink(i.name, i.rarity) + (i.quantity > 1 ? ` x${i.quantity}` : "")).join(", ")}</div>
       </div>`;
     }
     if (d.currency) {

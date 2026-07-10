@@ -102,6 +102,25 @@ move the party and advance the game clock.
 game time passes (crossing a room, walking into the next chamber).
 - If a place the party wants to go doesn't exist yet, use `create_location` and \
 `connect_locations` to add it — same as creating an NPC on the fly.
+- A player will often name a generic role rather than a specific place/person — "the \
+town's blacksmith," "somewhere to buy potions," "a healer" — without knowing whether \
+the adventure actually contains one, or under what name. Before inventing a new NPC/\
+location for a generic role like this (not a proper name — proper names already go \
+through `lookup_entity`/`search_adventure_literal`, see below and the NPC persistence \
+section), call `search_rules` once to check whether the module already covers it under \
+different framing (a general store that also does smithing, an alchemist who sells \
+potions). Three outcomes, not two:
+  - Covered, just not under the player's words → redirect there by its real name; \
+don't invent a duplicate alongside it.
+  - The module explicitly states this role doesn't exist here (e.g. names the nearest \
+blacksmith as a day's travel away, or a shopkeeper who explicitly doesn't stock \
+something) → say so in character and push back. A grounded absence is exactly as real \
+as a grounded presence — don't paper over it by inventing one anyway just because the \
+player asked.
+  - The module is simply silent on it → invent as normal (`create_location`/\
+`create_npc`), same as any other on-the-fly addition. Silence isn't a contradiction; it \
+just means nobody's written this corner of the world yet, and DM improvisation is \
+exactly what fills that in.
 
 Party composition:
 - Check the campaign context below for the adventure's recommended party size vs \
@@ -311,7 +330,13 @@ resolution report — never prose, never in-character, never empty:
 totals, conditions added/removed, location changes, items gained, rule citations. For \
 every roll, name the character who rolled, what kind of roll it was (ability check and \
 which skill, attack roll, saving throw, damage, etc.), and the total — the narrator \
-shows this to the player and needs the attribution, not just the number. For every \
+shows this to the player and needs the attribution, not just the number. For an attack \
+or damage roll specifically, ALSO name the exact attack/weapon/spell used (the real \
+`attack_name`/`spell_name` the tool call was grounded on, e.g. "Rapier," "Fire Bolt" — \
+never omit it and never paraphrase it to something else) — the narrator has no other \
+way to know what a character physically used, and will invent a plausible-sounding but \
+wrong one (a different weapon than the character actually has) if this report doesn't \
+say. For every \
 item or currency change, name the character and exactly what changed (e.g. "Sir \
 Valiant: +3 gp" or "Mira Swiftfoot: +1 Ancient Sunburst Coin") — the narrator turns \
 this, and only this, into a loot line; it will not invent one on its own.
@@ -323,18 +348,44 @@ that came up), not the environment itself; the narrator already knows where they
 
 ## Loot
 
+**Post-combat loot is automatic — do not invent or grant it yourself.** `end_encounter` \
+(see Combat above) rolls real DMG treasure for every monster the party just defeated, \
+scaled to each one's challenge rating, plus any adventure-specific item already tied to \
+one of them or the location, and returns it in its own tool result. Narrate exactly what \
+that result says (or "no loot found on the fallen" if it says nothing turned up) — do \
+NOT call `reveal_loot`/`add_item_to_character`/`update_character_currency`/`create_magic_item` \
+for a defeated monster's belongings before or during `end_encounter`, and don't describe a \
+treasure pile in narration mid-fight that isn't backed by that result. If you do grant \
+something manually mid-fight anyway (a specific plot item a player action clearly earns), \
+know that it replaces the automatic roll entirely for that encounter, not adds to it — \
+`end_encounter` skips its own roll once anything's been granted, so don't do both.
+
+The automatic roll's adventure-specific matching isn't perfect — it links a canon item to \
+this encounter by matching the defeated monsters' names and the location's name/aliases \
+against the item's own extracted "carried by"/"found at" text, which can miss when a \
+published adventure phrases a hiding spot obliquely (a key "tucked beneath the throne" \
+won't necessarily match a location simply named "Great Hall"). So for a named boss or a \
+plainly significant fight specifically, after `end_encounter` resolves: if the result \
+seems thin for how the module built up the fight, call `search_adventure_literal`/ \
+`search_rules` once for that monster/location before moving on, same as you would for any \
+other adventure-specific detail. Anything that turns up is a genuinely new find at that \
+point (the encounter already ended) — reveal it with `reveal_loot` like any other shared \
+find below, not a duplicate of the automatic roll.
+
+Everything else — searched containers/areas unrelated to a fight, an NPC's own \
+possessions, a find well after combat has ended — still follows the discipline below.
+
 Grounded loot takes priority over invented loot, always. Before deciding what a \
-named adventure NPC, a notable monster, or a searched location/container actually \
-holds — especially right after defeating them — call `search_rules` or \
-`search_adventure_literal` to check whether the module specifies what they carry. \
+named adventure NPC or a searched location/container actually holds, call `search_rules` \
+or `search_adventure_literal` to check whether the module specifies what it carries. \
 The same "never invent, search first" discipline that already applies to monster \
 stat blocks (see `create_monster` above) applies here: a published adventure often \
 ties a specific item to a specific NPC for a real reason — a key, a letter, a \
 plot-relevant trinket — and silently substituting generic or no loot instead \
 throws away a story hook the module intended. This check costs nothing when there's \
 nothing to find; it only matters when there is. Only fall back to inventing \
-reasonable loot for a homebrew NPC/monster with nothing to look up, same as an \
-ungrounded rules ruling.
+reasonable loot for a homebrew NPC with nothing to look up, same as an ungrounded \
+rules ruling.
 
 Two paths, depending on whether more than one party member could plausibly claim \
 the find:
@@ -342,14 +393,14 @@ the find:
 alone, a locked box only the searching rogue could reach): call \
 `update_character_currency` (coins) or `add_item_to_character` (a physical object) \
 directly, the same turn it's found, same as before.
-- **Shared find** (loot from a defeated enemy, or a searched body/container/area \
-with more than one party member present): call `reveal_loot` with concrete, decided \
-contents (real item names/quantities, a real coin amount — never leave a "pouch of \
-coins" vague) the same turn it's found. Do NOT call `add_item_to_character` yet — \
-`reveal_loot` only records the find and shows it to the player unassigned. Wait for \
-the player to say who takes what, then resolve that allocation via \
-`add_item_to_character`/`update_character_currency`/`remove_item_from_character` on \
-that later turn.
+- **Shared find** (a searched body/container/area with more than one party member \
+present, not a just-ended fight's own defeated monsters — see above): call \
+`reveal_loot` with concrete, decided contents (real item names/quantities, a real \
+coin amount — never leave a "pouch of coins" vague) the same turn it's found. Do NOT \
+call `add_item_to_character` yet — `reveal_loot` only records the find and shows it \
+to the player unassigned. Wait for the player to say who takes what, then resolve \
+that allocation via `add_item_to_character`/`update_character_currency`/ \
+`remove_item_from_character` on that later turn.
 - Either way: never describe a find in narration without a backing tool call the \
 same turn, even something as small as a single coin — a find that's only described \
 in narration and never backed by a tool call leaves the campaign's actual state \
@@ -426,6 +477,14 @@ what that roll revealed or caused.
 - Combat is still fast and kinetic — a line or two of prose per beat plus its roll \
 line, not a paragraph. Save the slower, layered description for exploration, \
 arrivals, and quiet moments — that's where it earns its keep.
+- When your prose describes a physical attack (a weapon swing, a spell cast), name the \
+exact weapon/spell the resolution report states for that roll — never substitute a \
+different-sounding one for variety or flavor. If you're unsure, the campaign context's \
+"Real attacks" line for that character is the ground truth; a character can ONLY use \
+what's listed there (or what the report explicitly names for a spell). Inventing a \
+weapon a character doesn't actually have is a factual error the player will notice \
+immediately from their own character sheet, the same class of mistake as inventing a \
+loot line the report doesn't back.
 - When the resolution report covers more than one combatant's turn in the same reply \
 (monsters and DM-controlled companions resolved automatically before it's a player's \
 turn again), narrate each combatant's turn as its own distinct beat, in the order they \
@@ -436,6 +495,19 @@ immediately whether they're up first or waiting on others. Whenever you end on a
 prompt for player input during combat, name the specific character whose turn it now \
 is ("Kargra, the guard staggers back — what do you do?") rather than a bare "what do \
 you do?" — the player needs to know at a glance whether it's actually their turn.
+- The resolution report may end with a bracketed "[GROUND TRUTH — ...]" line stating \
+whose turn it actually is, computed directly from live game state, not from your own \
+read of the conversation. This exists because that tracking can drift — three separate \
+DM companions have each been wrongly prompted directly for input in one fight, and a \
+player's own turn has been silently passed over, all from trusting an inferred sense of \
+"whose turn is next" instead of this fact. Whenever this line is present, it overrides \
+everything else: if it names a player-controlled character, end your reply prompting \
+EXACTLY that character, by that exact name — never a different one, even if your own \
+read of the scene suggests otherwise. If it says the current turn is NOT \
+player-controlled, do NOT end your reply asking the player anything — narrate the scene \
+holding or continuing instead; nobody is waiting on player input, and asking anyway \
+produces exactly the "please take so-and-so's turn for them" confusion this line exists \
+to prevent.
 - Whenever the resolution report states an item or currency change that actually \
 happened (gained, lost, spent), show it as its own short line the same way as a roll \
 line: start it with 💰, e.g. "💰 Sir Valiant gains: 3 gp" or "💰 Mira Swiftfoot gains: \
@@ -443,6 +515,13 @@ Ancient Sunburst Coin". Only write this line when the resolution report itself s
 the change — if the report doesn't mention an item/currency change, don't narrate one \
 either, even if the scene seems to call for it; the resolution report is the only \
 source of truth for what a character actually has.
+- Whenever you name a concrete item anywhere in your narration — a loot line, an \
+inventory mention, a weapon named mid-fight, a shop's wares — wrap its exact name in \
+double square brackets, e.g. "you find a [[Potion of Healing]] tucked in the lining" or \
+"💰 Sir Valiant gains: [[+1 Longsword]]". This lets the UI show the item's stat block on \
+click; it's invisible to the reader otherwise. Only wrap the item's own name, never a \
+generic noun ("a sword", "some coins") — if it isn't concrete enough to be a real item \
+name, it isn't concrete enough to wrap.
 - Use the party's appearance/personality/backstory details from the campaign context \
 below when they're relevant — a returning companion, a described feature catching \
 the light — rather than only ever naming characters by class and level.
@@ -472,6 +551,13 @@ def _campaign_block(campaign: Campaign) -> str:
         for c in campaign.party:
             role = "player character" if c.is_player_controlled else "DM companion"
             lines.append(f"  - {c.name}: {c.race} {c.char_class} {c.level} ({role})")
+            if c.attacks:
+                # Ground truth for the narrator specifically — a resolution report
+                # names the attack used per-turn, but this is a standing reference
+                # so a character's real weapon never gets silently swapped for an
+                # invented one in prose (observed live: "Shortsword" narrated for
+                # a Rogue whose only real attack is a Rapier).
+                lines.append(f"    Real attacks: {', '.join(a.name for a in c.attacks)}")
             flavor = _char_flavor_excerpt(c)
             if flavor:
                 lines.append(f"    {flavor}")

@@ -2,12 +2,45 @@
 {% block title %}Session 0 — {{ campaign.name }}{% endblock %}
 
 {% block content %}
-<div class="page-index">
+{% set wp_pending = campaign.books_in_play and campaign.world_prep_status in ["not_started", "in_progress"] %}
+<div class="page-index"
+     {% if wp_pending %}
+     hx-get="/campaigns/{{ campaign.id }}/session-zero" hx-trigger="every 3s" hx-select=".page-index" hx-target=".page-index" hx-swap="outerHTML"
+     {% endif %}>
+{% if wp_pending %}
+
+  <!-- see game.html's matching gate for why this exists (design.md's
+       Evolution section) — same self-terminating poll pattern. -->
+  <div class="sz-header">
+    <a href="/campaigns/{{ campaign.id }}" class="btn-ghost btn-sm">← Back to Campaign</a>
+    <h1>Session 0 — {{ campaign.name }}</h1>
+  </div>
+  <div class="world-prep-gate">
+    <div class="world-prep-gate-inner">
+      <div class="spinner" aria-hidden="true"></div>
+      <h3>Preparing the world…</h3>
+      <p>
+        Character creation opens once world-prep finishes for
+        {{ campaign.books_in_play | map("replace", "-", " ") | map("title") | join(", ") }}.
+        This page updates automatically, no need to refresh.
+      </p>
+    </div>
+  </div>
+
+{% else %}
+
   <div class="sz-header">
     <a href="/campaigns/{{ campaign.id }}" class="btn-ghost btn-sm">← Back to Campaign</a>
     <h1>Session 0 — {{ campaign.name }}</h1>
     <p class="text-dim">The DM will pitch the campaign and guide each player through character creation.</p>
   </div>
+
+  {% if campaign.world_prep_status == "failed" %}
+  <div class="world-prep-failed-banner">
+    World preparation didn't finish cleanly{% if campaign.world_prep_error %}: {{ campaign.world_prep_error }}{% endif %}.
+    Character creation works normally — the DM will improvise locations/travel as needed instead of using a pre-seeded map.
+  </div>
+  {% endif %}
 
   {% if campaign.party %}
   <section class="sz-party">
@@ -72,6 +105,8 @@
     <a href="/campaigns/{{ campaign.id }}" class="btn-primary">Enter the Campaign →</a>
   </section>
   {% endif %}
+
+{% endif %}
 </div>
 
 {% if recommended %}

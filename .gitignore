@@ -5,8 +5,9 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Data — never commit DB contents or embeddings
-data/
+# Data — never commit DB contents or embeddings (top-level only — backend/data/ is
+# source code, e.g. spells.py/equipment.py, not runtime data, and must stay tracked)
+/data/
 
 # Alembic ignores compiled migrations but keeps version files
 alembic/versions/*.pyc

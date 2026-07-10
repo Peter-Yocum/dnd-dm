@@ -239,11 +239,57 @@ All tools use `async def` with the **closure factory pattern**: `make_tools(camp
 | `create_monster(name, ac, hp, attacks, count=1, …)` | Add a monster stat block, grounded via `search_rules`. `count>1` creates several identical copies (e.g. 3 goblins) in one call, auto-suffixed `"{name} 1".."{name} N"`. |
 | `start_encounter(location, combatants)` | Begin combat: rolls initiative internally (DEX/`initiative_modifier`, or `initiative_override` per-combatant) and builds the order, mark encounter active. Refreshes every combatant's `reaction_available`. |
 | `advance_initiative()` | Move to the next turn; increments round counter on wrap; refreshes the new current combatant's `reaction_available`. |
-| `end_encounter(xp_awarded)` | Close combat, record XP, clear active encounter. |
+| `end_encounter(xp_awarded)` | Close combat, record XP, clear active encounter. Also rolls and reveals post-combat loot automatically — see "Combat loot generation" below. |
 | `update_monster_hp(name, delta)` | Freeform damage/healing to a monster not tied to a specific `Attack` (falling, traps, poison) — prefer `resolve_attack` for an actual attack roll. |
 | `set_combatant_position(name, zone, cover)` | Update spatial zone and cover. |
 
 `get_active_encounter` was removed as a callable tool (2026-07-03) — its content (round, initiative, monster stats, positions, any pending reaction) is now auto-injected into the mechanics model's context on every invocation during an active encounter via `build_encounter_context()` + `dm_agent.py`'s `_make_mechanics_modifier`, rather than a tool the model had to remember to call every turn. See "Deferred from the combat resolution refactor" below and the architecture section for why.
+
+### Combat loot generation (2026-07-09)
+
+Before this, all loot was 100% LLM-invented, then recorded via `party.py`'s bookkeeping tools (`reveal_loot`/`add_item_to_character`/`update_character_currency`/`create_magic_item`) — nothing rolled against a real table. `end_encounter` now rolls real loot automatically for every monster the party just defeated, so this no longer depends on the model remembering (or choosing) to invent something reasonable.
+
+**Data (`backend/data/treasure_tables.py`, generated, not hand-written):** the DMG's Individual Treasure tables, Treasure Hoard tables, gem/art object tables, and Magic Item Tables A-I, parsed directly out of the ingested `docs/source/core/D&D 5E - Dungeon Master's Guide.md`'s embedded HTML tables by `scripts/gen_treasure_tables.py` rather than hand-transcribed — at ~250 rows across 9 magic item tables plus four treasure tiers, retyping by hand was both slow and a real transposition risk. Re-run that script if the source file ever changes. Two source-scan defects were caught and fixed during generation (both noted in the generated file's own docstring): the Challenge 11-16 hoard table was missing row 10 entirely (a dropped leading digit, patched to a contiguous range) and "Ioun stone" was OCR'd as "loun stone" throughout Table I. A full contiguity sweep (every d100 range across every table, including the two nested sub-tables — Table G's Figurine of wondrous power, Table I's magic armor — sums to exactly 1-100 with no gaps/overlaps) confirmed clean after both fixes.
+
+**Roll engine (`backend/tools/loot_generator.py`):** `generate_encounter_loot()` rolls Individual Treasure per defeated monster at its own CR tier (DMG's own per-monster convention), then separately gates a single Treasure Hoard roll behind `hoard_drop_chance()` — a homebrew scaling (15%/40%/70%/95% across the four CR tiers), not a DMG rule, chosen specifically so a beefier monster has a real, visible chance at more valuable/magical loot rather than every fight paying out identically. Verified live with a sweep: CR 1/4 hit a hoard ~17% of the time (avg 1.4 items when it did), CR 20 hit ~97% of the time (avg 8.2 items) — matches the intended shape.
+
+Since the DMG's own roll tables don't carry rarity/attunement data (those live in each item's own writeup, not the table), `RARITY_BY_TABLE` assigns one rarity per table letter (A=common..I=legendary — the DMG's own rough correspondence between table letter and hoard tier) and a name-keyword heuristic (`_looks_attuned`) flags likely-attunement items (rings, rods, staves, named weapons, etc.). Both are documented best-effort approximations, not a per-item transcription of all ~250 items' actual individual rarity/attunement.
+
+**Adventure-specific enrichment:** `enrich_with_adventure_loot()` queries the canon Lore Registry (`LoreStore.all_for_book`) for any item whose extracted `owned_by`/`found_at` profile fields (see `scripts/extract_entities.py`'s `ItemExtractor`) match one of the defeated monsters' names or the encounter's location (name or alias) — a guaranteed addition, not chance-gated, since a published adventure ties a specific item to a specific monster/location for a real story reason (a key, a letter, a plot-relevant trinket). This is a best-effort substring match, not a hard link — a hiding spot phrased obliquely in the source text ("tucked beneath the throne") can still miss a location simply named "Great Hall." `prompts.py`'s Loot section carries the explicit backstop: for a named boss or plainly significant fight, if the automatic result seems thin, the DM agent is instructed to still call `search_adventure_literal`/`search_rules` once after `end_encounter` resolves and `reveal_loot` anything that turns up — a genuinely new find at that point, not a duplicate of the automatic roll.
+
+**Double-dip guard:** a narrated treasure pile mid-fight (the model calling `reveal_loot` before combat ends) and the automatic roll are two independent code paths with no natural correlation — without a guard, both could pay out for the same fight. `Encounter.loot_already_granted` (new field, `backend/models.py`) is set by any of `party.py`'s four loot tools whenever they fire while an encounter is active (only on a *gain* for `update_character_currency`, not a spend, so paying off a hostile creature mid-fight doesn't suppress the automatic roll); `end_encounter` checks it first and skips its own roll entirely if it's already `True`. `prompts.py`'s Loot section carries the matching instruction: post-combat loot is `end_encounter`'s job now, narrate its result, don't invent or grant anything for a defeated monster before it resolves.
+
+**Narration hook (`[[Item Name]]` markers):** with items now regularly appearing via an automatic roll rather than model-authored text, `_NARRATOR_BASE` (`prompts.py`) instructs the narrator to wrap any concrete item name in double square brackets wherever it's mentioned — loot lines, inventory mentions, a weapon named mid-fight — mirroring the existing 🎲/💰 line-marker convention. This backs the item-detail popup (see below): the frontend parses `[[...]]` into a clickable span, invisible to the reader otherwise.
+
+### Stalled non-player-turn guardrail (2026-07-09)
+
+Reported live: mid-combat, the DM asked the player to take "Elara's" turn — a DM-controlled companion, not the player's own character (Tarvokk). The Combat prompt section already correctly instructs auto-continuing through every non-player turn in one response ("if the next combatant(s) in initiative order are monsters or DM-controlled companions... keep going in this same response... until the initiative order comes back around to a turn belonging to a player-controlled character") — this was a compliance miss, not a missing instruction, but nothing deterministically caught it, unlike the loot/encounter guardrails above.
+
+`_detect_stalled_non_player_turn_followup` (`dm_agent.py`) closes that gap: after each mechanics response, if there's an active encounter with no `pending_action` (a real reaction prompt legitimately awaiting the player — exempted), it checks live `initiative_order` for whichever combatant is currently `is_current_turn`. If that combatant is a monster, an NPC, or a `Character` with `is_player_controlled=False` (a DM companion), it fires a correction telling the model to call `advance_initiative` and resolve that turn itself rather than waiting on the player. Verified with four cases before wiring in: DM companion's turn (fires), player's turn (doesn't fire), monster's turn (fires), monster's turn with a pending reaction prompt (doesn't fire — the exemption).
+
+**Recurred within the hour — a budget-starvation bug, not a detection bug.** Reported live again: the DM stopped on Kaelen Swiftstep's turn (also a real DM companion, confirmed `is_player_controlled=false` in the DB) and asked the player to act. The logs showed why: `_detect_missing_combat_roll_followup` had already fired earlier in the *same* response (auto-continuing through several combatants per the Combat section's own rule can cover many turns in one reply) and spent the turn's one `correction_count` retry before the mechanics model ever reached Kaelen — exactly the starvation `lore_guardrail_count`'s own doc comment already predicted for a different pair of guardrails, just not yet triggered for this one. Fix: pulled `_detect_stalled_non_player_turn_followup` out of the shared `correction_count` chain into its own budget, `stalled_turn_guardrail_count` (`DMState`, reset alongside the others in `stream_response`) — same shape as `lore_guardrail_count`'s own split from `correction_count`. Re-verified the detection logic still fires correctly for the exact reported case (Kaelen, DM companion, `is_current_turn`) after the refactor.
+
+**Recurred a third time — the guardrail's one retry got spent on a different problem, again.** Reported live once more, this time on Thrainna Stoneheart's turn (also confirmed `is_player_controlled=false`) — asked directly, mid-round, skipping what should have been Elara's and Tarvokk's next turns. Three separate DM companions (Elara, Kaelen, Thrainna) each independently triggered this same class of mistake over one fight, which reframed the problem: the model's own free-text tracking of "whose turn is next" is fundamentally unreliable across a long, multi-combatant auto-continued response, not just occasionally wrong. A per-guardrail retry budget helps but doesn't fully close it, since a single response can still contain more distinct stalls than it has retries for.
+
+The fix moves from "detect and correct after the fact" to "state the fact so there's nothing to get wrong": `_live_current_turn(campaign)` (new, factored out of the guardrail) is the one shared live-state lookup, and `_next_turn_ground_truth_note()` calls it unconditionally at the very end of `mechanics_node` — no retry budget, because it never loops, it just appends a `[GROUND TRUTH — ...]` line to the resolution report stating exactly whose turn it live-is and whether they're player-controlled. `_NARRATOR_BASE` (`prompts.py`) now instructs the narrator that this line, when present, overrides its own read of the scene entirely: name exactly the stated character if player-controlled, or don't prompt the player at all if not. This runs *in addition to* `_detect_stalled_non_player_turn_followup` (still valuable — it's the one that can actually force a real re-resolution via a mechanics retry), not instead of it: the guardrail tries to fix the underlying resolution when it has budget left, and the ground-truth note guarantees the player is never shown a wrong or premature turn prompt even in the worst case where it doesn't. Verified against the exact reported shape (a DM companion mid-round, and a genuine player turn) after fixing one bug caught in testing — the player-controlled branch's `[GROUND TRUTH — ...]` string was missing its closing bracket.
+
+### The actual root cause behind all of tonight's combat bugs: `create_monster` crashing on a bare `KeyError` (2026-07-09)
+
+Traced all the way back after the turn-order fixes above kept not helping a specific live session: `campaign.active_encounter` didn't exist at all — zero rows in the `monsters`/`encounters` tables for the whole rest of the fight. Every guardrail and ground-truth fix built earlier tonight depends on a real `Encounter` existing to check against; with none there, they were all silent no-ops, not failures — there was nothing for them to catch.
+
+Inspected the actual LangGraph checkpoint directly (`AsyncPostgresSaver` pointed at the live thread, same technique as the Session 0 investigation and the world-prep freeze diagnosis) to see the real tool-call history, not guess from the narrated transcript. Found it precisely: the model correctly called `create_monster` for the goblins — for real, four times in a row — and every single call crashed. `attacks: list[dict]` was processed with `Attack(name=a["name"], ...)`, a bare dict index with no validation; the model's payload never included a `"name"` key on the attack dict, so this raised `KeyError('name')`, which the generic tool-error handler (`_handle_any_tool_error`) stringified via `str(e)` into literally `"Error: 'name'"` — a message carrying zero information about what was wrong or how to fix it. The model retried the identical mistake three more times against that same useless message (it tried `search_rules` for a goblin stat block twice in between, looking for grounding that wouldn't have helped), then gave up and fabricated the entire rest of the encounter in narration — no monster, no encounter, ever actually created — which is exactly why the turn-order ground-truth/guardrail fixes above had nothing to engage with for the rest of that fight.
+
+Fix: `create_monster` (`backend/tools/combat.py`) now validates every `attacks[i]` has a non-empty `name` up front and returns a clear, actionable message (naming the exact index and showing a correct example) instead of letting it crash into an opaque `KeyError`. Verified against the exact failing payload from the real transcript — now returns the clear message instead of crashing — and against a corrected payload, which creates the monsters successfully.
+
+Broader lesson, worth stating plainly: a generic `except Exception: return str(e)` tool-error handler is only as good as the exceptions it's converting — a bare `KeyError`/`AttributeError` from an unguarded dict/attribute access makes a fine crash but a terrible corrective message, and the model has no way to self-correct from one. Every other tool's error paths in this codebase already return hand-written, specific messages (`"No character named '{name}'..."`, `"'{base_item}' isn't a recognized weapon..."`) precisely for this reason; `create_monster`'s `attacks` handling was the one spot that fell through to the generic path instead. Worth a pass over `backend/tools/` for other raw dict/list indexing inside a `@tool` function that could hit the same failure mode, not yet done tonight.
+
+### Narrator inventing a character's weapon (2026-07-09)
+
+Reported live: the narrator described Elara "her Shortsword drawn," but her actual (and only) attack is a Rapier — confirmed on her own character sheet. The roll numbers shown (+5 to hit, 1d8 piercing) exactly matched Rapier, so the mechanics layer resolved this correctly (`resolve_attack` was almost certainly called with the real, grounded `attack_name`); the hallucination was purely in the narrator's prose.
+
+Root cause: the mechanics resolution-report instruction (`_MECHANICS_BASE`'s "Resolution report" section) required naming the roll *type* ("attack roll," "damage roll") but never required naming the specific weapon/spell used — so that fact could be, and was, silently dropped between the tool call (which knew "Rapier") and the report the narrator actually reads. Compounding it: `_campaign_block()` (shared context for both mechanics and narrator prompts) listed each character's race/class/level/flavor but never their actual equipped attacks — so the narrator had no independent ground truth to fall back on either, the same gap that let it invent a plausible-sounding but wrong weapon.
+
+Two-layer fix, matching this session's other guardrail-plus-grounding fixes: (1) the mechanics report instruction now explicitly requires naming the exact `attack_name`/`spell_name` alongside every attack/damage roll, never paraphrased; (2) `_campaign_block()` now lists each character's `Real attacks:` (their actual `Character.attacks` names) as a standing reference, so the narrator has a ground-truth list to check against even if a future resolution report is incomplete for some other reason; (3) `_NARRATOR_BASE` gained an explicit instruction to name only the report-stated (or "Real attacks"-listed) weapon/spell, calling out that inventing one is the same class of error as inventing an unbacked loot line. Verified `_campaign_block()` renders the new line correctly (`Real attacks: Rapier` for a test character with one Attack).
 
 ### `resolution.py` (6 tools, new 2026-07-03) — atomic dice-resolution, not combat.py-scoped
 | Tool | Description |
@@ -637,6 +683,122 @@ def format_transcript(messages) -> list[dict]:
 ```
 
 Used by `GET /campaigns/{id}/sessions/{sid}` to render the session transcript page.
+
+### Decision record (2026-07-09): this is a workflow orchestrating agents, not a multi-agent system — and that's deliberate
+
+Worth stating precisely, since "agentic" gets used loosely: this app is not
+one agent, but it's also not the LLM-orchestrated multi-agent system the
+term sometimes implies. Precisely what exists:
+
+**Five distinct agent constructors in `dm_agent.py`**, two architectural
+shapes:
+
+| Agent | Shape | Tools (scoped) |
+|---|---|---|
+| `get_agent()` — main gameplay | Custom 2-node `StateGraph` (mechanics → narrator) | Full 45+ tool set |
+| `get_session_zero_agent()` — chargen | Same 2-node shape, different prompts | dice + rules + chargen + companion — no combat/quest/travel |
+| `get_world_prep_agent()` — region seeding | Single-loop `create_react_agent` | `create_location`/`connect_locations` + rules search only |
+| `get_npc_prep_agent()` — opening-scene NPCs/site detail | Single-loop `create_react_agent` | `create_npc` + `set_opening_location_detail` + rules search — no party/combat/quest/movement/travel |
+| `get_party_fill_agent()` — DM companion generation | Single-loop `create_react_agent` | Character-generation tools only |
+
+Each has its own prompt, its own scoped tool set (`search_rules` is shared
+across most; `create_location`, `create_npc`, `resolve_attack` etc. are each
+scoped to exactly one role), and its own execution context — genuinely
+distinct agents, not one flat toolset.
+
+**But nothing routes between them with a model.** Checked directly in
+`main.py`: which agent gets built is decided by plain deterministic Python,
+keyed on which HTTP route fired — `POST /campaigns` always calls
+`get_world_prep_agent()` then `get_npc_prep_agent()` twice, in a hardcoded
+sequence inside `run_world_prep()`. The session-zero stream route always
+calls `get_session_zero_agent()`. The main game stream always calls
+`get_agent()`. No model ever reasons about which agent should handle a
+request — the game's own state machine (Session 0 vs. world-prep vs. live
+play) already fully determines it, so there's nothing ambiguous left for an
+LLM to resolve. And the mechanics→narrator split within `get_agent()` isn't
+multi-agent orchestration either — it's one `StateGraph` with two
+LLM-calling nodes connected by explicit `Command(goto=...)` control flow,
+closer to Anthropic's **prompt-chaining/sequential-handoff** pattern than to
+agent-to-agent delegation.
+
+This maps onto Anthropic's own published distinction: **workflows**
+(predefined code paths orchestrating LLM calls: routing, chaining,
+orchestrator-workers) versus **agents** (a model dynamically directs its own
+process, including the control flow itself). What's built here is a
+workflow that orchestrates multiple genuinely-agentic sub-processes — each
+node the workflow dispatches to is a real agent (an LLM in a loop, deciding
+which tools to call and when, over multiple steps), but the *dispatch
+itself* is deterministic. That's not a lesser version of "true multi-agent"
+— per Anthropic's own guidance, it's the better choice whenever the routing
+decision is already knowable ahead of time, which it is here: the game's
+phase isn't ambiguous, so paying for a model to figure out what a
+`if`-statement already knows would be pure latency and cost with no
+corresponding benefit.
+
+**Considered, deliberately rejected: true multi-agent orchestration for
+turn-based gameplay.** Reasons, not just intuition:
+- **State-consistency risk.** The whole architecture exists to guarantee
+  HP/inventory/initiative mutate through exactly one validated path — the
+  2026-06-30 bug audit's finding #3 ("parallel tool calls silently drop
+  mutations") needed a per-campaign lock to fix even *within a single
+  agent's own response*. Multiple independent agents, each with their own
+  read of world state and their own authority to call
+  `update_character_hp`, reintroduces that race at a worse scale — not just
+  "did two tool calls in one response collide" but "did two *agents* act on
+  mutually stale state."
+- **No real decomposition hides in a turn.** "Attack the goblin" is
+  roll → apply → narrate, tightly sequential — the mechanics/narrator split
+  already captures the one genuine distinct-skill boundary (rules-
+  correctness vs. prose quality). A third agent wouldn't decompose anything
+  real, just add latency.
+- **Combat only looks multi-agent-shaped.** Many combatants, each
+  superficially "deciding" their own action, could look like a fit — but
+  initiative order is strictly sequential and centrally arbitrated by rules,
+  which is exactly why the mechanics node already resolves every
+  non-player combatant's turn in one response rather than spinning up a
+  per-monster agent. Monster AI needs speed and rule-consistency, not
+  distinct personalities — one model resolving all of them sequentially
+  gets both, faster than N agent calls would.
+- **Latency is directly felt here**, unlike background work — a player is
+  watching a spinner for a reply. Every extra orchestration round-trip taxes
+  the exact thing that matters most for a live game.
+
+**Considered, deliberately deferred (not rejected): true multi-agent
+orchestration for world-prep.** This one's genuinely closer to justified,
+worth recording the real argument on both sides rather than a flat no:
+- **For:** world-prep already runs as a fire-and-forget background task
+  (`asyncio.create_task`, never blocking a response — see the "world-prep
+  freeze" incident above for how much care went into making that safe), so
+  extra orchestration latency is nearly free — nobody's watching a spinner
+  synchronously. And the fixed pipeline has *already* hit a real
+  decomposition limit once: `run_world_prep()`'s own comment records that
+  asking one agent to create a whole NPC roster *and* the opening location
+  in one pass let the location call starve after the roster ran long,
+  fixed by manually splitting into two separate calls. That's evidence a
+  single fixed shape doesn't scale cleanly across adventures of very
+  different size (Lost Mine of Phandelver's dozen-ish locations vs. Curse
+  of Strahd's sprawling geography) — a model reading the adventure and
+  deciding "this splits into 3 distinct regions, dispatch one sub-agent per
+  region" is a genuine content-understanding judgment call a size-based
+  heuristic couldn't make as well.
+- **Against:** running region sub-agents in parallel creates real
+  duplicate/conflict risk — `entity_resolution.py`'s fuzzy-match guard
+  exists precisely to catch near-duplicate entities for a *single* agent's
+  sequential creates; independent parallel sub-agents creating locations
+  without seeing each other's in-flight work makes that collision more
+  likely, not less. And world-prep is explicitly best-effort already (a
+  failure just means the DM improvises — see the world-prep freeze
+  writeup's UI-gate fix) — there's no demonstrated pain forcing this, only
+  a plausible hypothesis.
+- **The actual trigger for revisiting this, stated in advance so it isn't
+  built speculatively:** play a genuinely sprawling adventure (Curse of
+  Strahd, Storm King's Thunder) through world-prep and check whether the
+  seeded content comes out measurably thinner or less coherent than it does
+  for a small adventure like Lost Mine of Phandelver. If it does, that's a
+  real, measured decomposition problem — same discipline as the rest of
+  this project (measure, don't assume) — and that's when a chief-
+  worldbuilder-plus-regional-subagents pattern would earn its added
+  complexity. Not before.
 
 ---
 
@@ -1095,6 +1257,180 @@ against DMG's unusually large candidate list with zero progress visibility
 design itself — both were ingestion-pipeline robustness gaps that only
 showed up at a scale the pipeline hadn't been proven against before.
 
+### The world-prep freeze (2026-07-08): three plausible fixes, then the real one
+
+Separate incident, same night, different subsystem — the live app itself,
+not retrieval. Clicking "create campaign" (with an adventure selected) or
+navigating into Session 0 started **freezing the entire app for every
+user**, repeatedly, confirmed each time by a plain `GET /` timing out
+completely. Three attempted fixes in sequence, each real and necessary but
+each insufficient on its own — worth recording all three, not just the one
+that worked, since "the fix didn't fully work" was itself the signal that
+led to the next, better fix:
+
+1. **Found three unwrapped synchronous calls** in `world_prep.py` and
+   `dm_agent.py`'s `summarize_session()` — plain `def` methods on
+   `RulesStore` (blocking Ollama embed/rerank calls) invoked directly from
+   `async def` functions with no `await`/`asyncio.to_thread`, on a
+   single-worker `uvicorn --reload` process with exactly one event loop.
+   Same bug *class* as a 2026-06-30 audit finding (`add_session` blocking
+   the loop the same way) that was fixed in one place but never swept
+   elsewhere. Wrapped all three in `asyncio.to_thread`. **Necessary, not
+   sufficient** — froze again on the next campaign.
+2. **Bounded those with `asyncio.wait_for(..., timeout=30.0)`.** Confirmed
+   live that the identical query, run directly/natively/single-threaded,
+   returned in under a second — yet the app-embedded call still froze
+   everything, which was itself a clue that per-call cancellation wasn't
+   reaching whatever was actually stuck. Root cause at the time: cancelling
+   an `asyncio.to_thread` wait does **not** stop the underlying OS thread —
+   Python cannot forcibly terminate a running thread — so a genuinely stuck
+   call leaks one permanent slot from the shared default `ThreadPoolExecutor`
+   every time it happens. **Necessary, not sufficient** — froze again.
+3. **Added real `httpx` client timeouts** (`client_kwargs={"timeout": ...}`,
+   60s embeddings / 120s chat) to every live-app Ollama client construction
+   site (`rules_store.py`, `history_store.py`, `dm_agent.py` ×3,
+   `reranker.py`, `grading.py`) — verified directly that the timeout config
+   really does reach the underlying httpx client
+   (`c._client.timeout == Timeout(timeout=60.0)`, confirmed by inspection).
+   **Still froze again**, well past both thresholds — the most surprising
+   result of the night, since this should have been airtight.
+
+At that point the pattern across every freeze became the real clue: `ollama
+ps` always showed `nomic-embed-text` loaded normally (healthy, not stuck) —
+the seed queries always succeeded — and the freeze always landed immediately
+*after*, exactly where the code needed to switch to `gemma4:26b-mlx` for the
+actual agent. That's a **model swap** (Ollama evicting one model to load
+another), and this codebase already had a documented prior incident with
+that *exact* signature: `_get_mechanics_model()`'s own docstring in
+`dm_agent.py` notes a previously-chased hang where "a request landing
+mid-idle-eviction seemed to leave the MLX runner stuck reporting
+'Stopping...' indefinitely." Not a new bug — a known MLX-engine rough edge,
+now recurring reliably because world-prep's own workflow (embed → chat,
+every single run) manufactured that exact transition on every campaign
+creation.
+
+**The actual fix: stop causing the swap, rather than better-surviving it.**
+World-prep's seed-query step (`_SEED_QUERIES`, three embedding searches for
+generic context like "regional overview" / "travel distances") got replaced
+with `_gather_seed_context()` — a fully deterministic, zero-Ollama-call
+function: a plain read of the adventure's own introduction section (the
+text before its curated `opening_section_marker` — confirmed against Lost
+Mine of Phandelver that this is exactly where "Background"/"Overview"/
+"Adventure Hook" content already lives) plus `LocationExtractor`'s own
+pre-computed `_connections` data (already-grounded travel routes,
+extracted once at ingest time — *better* grounded than a fresh live search
+would be, since real source citations went into producing it, and it's the
+literal "travel distances between locations" content the old query was
+trying to find). After this change, every remaining Ollama call in
+world-prep's whole pipeline is `gemma4:26b-mlx` — no embedding model is ever
+touched, so there's no swap to trigger the bug at all.
+
+Two follow-on fixes, found while validating: (a) `world_prep_error` was
+silently ending up empty on a real failure — `httpx.TimeoutException`
+subclasses carry no message text, so bare `str(e)` produced `""`; fixed to
+`f"{type(e).__name__}: {e}"`, so a failure at least shows `"ReadTimeout: "`
+instead of nothing. (b) a **single bounded retry** on any agent step that
+still times out (`_ainvoke_with_retry`, one retry, not a loop — same
+discipline as Stage 2's CRAG grading) — the underlying MLX flakiness didn't
+disappear (it's Ollama/MLX-engine-level, outside app code's control), it's
+just fully absorbed now: bounded, retried once, cleanly reported on failure.
+
+Verified live, three consecutive campaign-creation runs, each watched with
+a 5–10-second polling loop against both `GET /` and the campaign's
+`world_prep_status`:
+
+| Run | App froze? | Outcome |
+|---|---|---|
+| 1 (seed-context fix only) | No | Failed — `world_prep_error` empty (the message bug) |
+| 2 (+ error-message fix) | No | Failed — error now readable (`ReadTimeout: `) |
+| 3 (+ bounded retry) | No | **Completed** — 2 separate timeouts hit and recovered from automatically (confirmed in logs: `npc-prep` and `opening-location` steps each retried once, both succeeded) |
+
+Zero freezes across all three — the core problem — and the retry took a
+run that would have failed 100% of the time down to a clean success.
+
+**A fourth, complementary change, not a fix but a UX one**: `game.html` and
+`session_zero_index.html` now gate their normal content behind
+`campaign.world_prep_status`, showing a spinner + self-terminating 3-second
+poll while `in_progress`/`not_started`, and a non-blocking amber banner
+(never a hard block) if `failed`. Before this, a still-preparing or
+failed-but-recoverable campaign looked indistinguishable from a genuinely
+broken app — the whole debugging session tonight started from exactly that
+confusion. Worth noting for its own sake: world-prep's *total* runtime is
+allowed to be genuinely long (a location-dense adventure's agent run can
+legitimately take several minutes across many tool calls) — the fix here
+bounds each *individual* Ollama request, never the workflow as a whole, so
+this gate needed to reflect "still working" accurately rather than assume
+anything past N seconds means something's wrong.
+
+One diagnostic dead end worth recording so it isn't retried blindly next
+time: attempted a live `py-spy dump` on the frozen container to get a
+definitive stack trace before restarting. Installed cleanly
+(`pip install py-spy` inside the container), but this container's process
+topology defeated it — `docker top`'s host-side PIDs don't match what's
+visible inside the container's own PID namespace via `docker exec`, and
+even after finding the container-relative PIDs, the actual worker thread
+wasn't independently attachable (`py-spy dump --pid 1 --subprocesses` found
+the reloader and a `multiprocessing.resource_tracker` helper, but a third
+PID reported "Failed to get process executable name" — likely a thread
+sharing PID 1's process image, not a genuinely separate process). Not a
+dead end in "py-spy is bad" — a dead end in "this specific uvicorn
+`--reload` + Docker PID-namespace combination needs more setup (e.g.
+`--cap-add=SYS_PTRACE`, or running natively) before it's useful here."
+
+### The freeze recurs mid-session (2026-07-09): the same trigger, in the one place the 2026-07-08 fix didn't reach
+
+Reported live, twice in about fifteen minutes, mid-game: the app went fully
+unresponsive (`curl` timing out completely, ~0% CPU, no new log lines) —
+the exact signature as the world-prep freeze above, but this time nothing
+to do with world-prep at all. The user's own instinct nailed it before the
+logs did: "I really think it's something about starting combat."
+
+They were right, and the mechanism is the same embed↔chat model swap
+already root-caused on 2026-07-08 — just triggered from a different call
+site the previous fix never touched. `search_rules` and `search_lore`
+(`backend/tools/rules.py`, `backend/tools/lore.py`) both call
+`RulesStore.search()`, whose hybrid pipeline was still doing dense (Chroma,
+`nomic-embed-text`) retrieval **and then** a separate `LLMJudgeReranker`
+call on `gemma4:26b-mlx` — two genuinely different model architectures
+(a small embedding model vs. the full 26B chat model), not "the same model
+taking longer with more context." Every `search_rules` call forced Ollama to
+evict one and load the other. The 2026-07-08 fix only ever touched two
+call sites — world-prep's seed step and end-of-session summarization —
+`search_rules`/`search_lore` (the live-gameplay tools) kept the swap intact
+the whole time. Combat-start is exactly where this gets hit hardest:
+`create_monster`'s own docstring recommends a `search_rules` call per
+monster for stat-block grounding, so starting a multi-monster encounter can
+trigger the swap several times in one turn — far more concentrated than a
+typical exploration turn.
+
+**The fix, same discipline as 2026-07-08 (stop the swap, don't
+better-survive it):** `RulesStore.search()` gained a `use_reranker: bool =
+False` parameter — the reranker call is now opt-in, not automatic.
+Dense+BM25 fused via Reciprocal Rank Fusion is a legitimate hybrid retrieval
+result on its own even without an LLM-judged reorder on top; this trades a
+little ranking precision for not freezing the app on the single
+most-called live lookup in the game. `scripts/eval_retrieval.py` (which
+specifically measures reranked quality, offline, where a slow-but-recoverable
+call is fine) opts back in explicitly with `use_reranker=True`.
+
+Noted but deliberately not fixed tonight (out of scope for what was asked,
+flagged for later): `search_lore`'s CRAG-style grading loop
+(`grade_sufficiency`/`reformulate_query`, `backend/rag/grading.py`) makes
+its own separate chat calls interleaved with `search()`'s now-reranker-free
+dense/BM25 retrieval — still an embed→chat→(maybe embed→chat again)
+sequence, just a different shape than the one fixed here. Lower combat-time
+risk than `search_rules` (lore lookups aren't the tool `create_monster`
+leans on), but the same underlying swap risk exists there too if it's ever
+hit as hard.
+
+Also fixed in passing while investigating: a `docker compose exec` test
+script copied into `/app` to inspect the running container was itself
+picked up by `uvicorn --reload`'s file watcher, triggering a reload —
+explains a batch of unexplained "N changes detected" log lines from
+earlier the same night that briefly looked like a mystery background
+process. Not a bug in the app; a lesson for debugging it (copy scratch
+scripts outside the watched directory, or invoke inline).
+
 ---
 
 ## Prep Scripts
@@ -1422,6 +1758,11 @@ Right now `_MAX_MESSAGES` (mechanics) and `_NARRATOR_MAX_TURNS` (narrator) are h
 Surfaced while adding the mechanics prompt's turn-auto-continuation rule (see Agent Architecture — the mechanics model now resolves every non-player combatant's turn in a row within one response, stopping only once initiative comes back to a player-controlled character). A large hostile group (many individual monsters) queued between two of the player's own turns can burn a lot of the per-message `recursion_limit=60` LangGraph step budget (`backend/main.py`, ~2 graph steps per combatant round-trip) in a single reply. Checked the currently indexed core rulebooks (2024 PHB, DMG) for an official mass-combat/mob rule to ground this against — not present in `docs/source/core/`. The well-known version is the unofficial community "mob rule" (one attack roll for a mob of N identical creatures, with a to-hit/damage bonus scaling by group size) — not an indexed sourcebook rule, so it'd need to be flagged as a DM improvisation the same way homebrew monster stats already are, unless a book containing it gets indexed later.
 *Prototype sketch: likely a `mob` flag (or new `CombatantType`) on `Monster`/`InitiativeEntry` representing a group as a single initiative slot with a `count`, resolved with one roll per mob turn (scaled damage/to-hit) instead of N individual `resolve_attack` calls — sidesteps the step-budget risk entirely rather than just raising `recursion_limit`.*
 *Feasibility: Medium — no urgent trigger yet (most encounters are small enough that the step budget isn't a real risk); revisit if the recursion limit is actually hit in play, or if encounters routinely run 10+ hostile combatants.*
+
+**14. Freeform narrative time advancement** (idea from user, 2026-07-09)
+Reported live: the DM narrated dusk falling, but the sidebar's World clock (`campaign.time_of_day`, `templates/game.html:73`) still read "morning" — the underlying field was never updated to match. Investigated: `time_of_day`/`days_elapsed` (`backend/models.py:828-829`) only ever advance through three paths — `travel_to` (region travel, `backend/tools/world.py`), and the long/short rest routes (`apply_long_rest`/`apply_short_rest`, `backend/tools/_helpers.py`) — all three work correctly. There is no tool for freeform time passage outside those three (no "advance time by N hours" for a scene where hours pass without travel — a stakeout, an evening spent in town, a long conversation that runs past dusk), no prompt instruction anywhere telling the model to notice narrated time-skips and act on them (`prompts.py`'s only clock-related guidance is travel-specific), and no guardrail backstop (unlike the combat-loot guardrail chain — see "Combat loot generation" above). So this isn't the model being flaky with an existing mechanism; the mechanism doesn't exist for the non-travel case.
+*Prototype sketch: same two-layer pattern as the loot fix — (1) a new general-purpose `advance_time(hours, reason="")` tool (thin wrapper over the existing `advance_clock` helper, already used by `travel_to`/rests) so the model has something to call; (2) explicit prompt guidance for recognizing non-travel time-skip narration (dusk/nightfall, "several hours later," extended downtime, watching/waiting) with rough hour estimates for common cases; (3) a regex guardrail (mirroring `_detect_missing_loot_followup`'s shape) catching obvious time-skip phrasing in the narration with no backing `advance_time`/`travel_to`/rest call that turn, prompting a self-correction.*
+*Feasibility: Medium — the tool and guardrail are small and mechanical (real precedent in the loot guardrail chain), but this is fuzzier than loot in one real way: a monster's defeat is a clean boolean the code can check, while "how many hours did that scene take" is an inherent judgment call with no ground truth to verify against — the guardrail can catch obviously-missed phrasing, but can't guarantee the hour estimate itself is right the way the loot fix could guarantee no double-payout.*
 
 ### Deferred from the combat resolution refactor (2026-07-03)
 

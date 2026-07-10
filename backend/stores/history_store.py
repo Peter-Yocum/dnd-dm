@@ -48,9 +48,14 @@ class HistoryStore:
         if self._store is None:
             self._store = Chroma(
                 collection_name=self.COLLECTION,
+                # client_kwargs timeout — see rules_store.py's load() for why:
+                # an unbounded httpx client leaks a thread-pool worker forever
+                # on a hung Ollama request, and enough leaks freeze the whole
+                # app, not just this call.
                 embedding_function=OllamaEmbeddings(
                     model="nomic-embed-text",
                     base_url=self._ollama_base_url,
+                    client_kwargs={"timeout": 60.0},
                 ),
                 persist_directory=self._persist_dir,
             )
@@ -121,7 +126,9 @@ class HistoryStore:
             return
 
         contextualizer = ChunkContextualizer(ollama_base_url=self._ollama_base_url)
-        embeddings_fn = OllamaEmbeddings(model="nomic-embed-text", base_url=self._ollama_base_url)
+        embeddings_fn = OllamaEmbeddings(
+            model="nomic-embed-text", base_url=self._ollama_base_url, client_kwargs={"timeout": 60.0}
+        )
 
         ids, documents, metadatas, embed_texts = [], [], [], []
         for i, (event_text, event_type) in enumerate(events):

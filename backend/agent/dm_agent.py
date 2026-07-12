@@ -47,7 +47,7 @@ from psycopg_pool import AsyncConnectionPool
 from backend.config import settings
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS
 from backend.llm import ollama_chat
-from backend.locks import campaign_write_lock
+from backend.locks import campaign_read_lock, campaign_write_lock
 from backend.models import Campaign, CombatantType, InitiativeEntry
 from backend.agent.prompts import (
     OOC_MARKER, VERIFIED_CHANGES_MARKER, VERIFIED_ROLLS_MARKER, get_mechanics_system_prompt,
@@ -386,18 +386,47 @@ def _handle_any_tool_error(e: Exception) -> str:
     return f"Error: {e}\nPlease fix your mistakes and try the tool call again."
 
 
+_TOOL_EXECUTION_TIMEOUT_S = 90.0
+
+
 def _make_tool_node(tools: list[BaseTool], campaign_id: str) -> ToolNode:
-    """Wrap tools in a ToolNode that serializes execution per campaign.
+    """Wrap tools in a ToolNode that serializes MUTATING tool calls per
+    campaign, while letting read-only ones (_LOOKUP_ONLY_TOOLS) run
+    concurrently with each other.
 
     LangGraph gathers parallel tool calls with asyncio.gather; the campaign
-    store uses delete-all/reinsert so the last writer wins. The lock ensures
-    only one tool's load→mutate→save cycle runs at a time per campaign.
+    store uses delete-all/reinsert so the last writer wins — a real writer
+    still needs exclusive access (campaign_write_lock). But a single shared
+    mutex for every tool, reads included, was confirmed live (2026-07-12) to
+    turn one hung read-only call (search_rules, stuck in local Chroma/BM25
+    retrieval well after its own Ollama embed call had already returned)
+    into an apparent freeze of the OTHER two, otherwise-instant read-only
+    calls in the same batch (get_campaign_summary, get_current_location) —
+    they were never actually stuck themselves, just queued behind a lock a
+    hung reader was never going to release. campaign_read_lock lets any
+    number of reads proceed together; only an actual write contends with a
+    read (see backend/locks.py for the full incident writeup).
+
+    Also bounds every tool call's execution at _TOOL_EXECUTION_TIMEOUT_S —
+    same discipline this codebase already applies to every direct Ollama
+    client call (backend/llm.py's CHAT_TIMEOUT_S/EMBED_TIMEOUT_S) extended
+    to a tool's own body, since the 2026-07-12 hang landed in local
+    Chroma/BM25 code AFTER its Ollama call had already completed — nothing
+    upstream would have caught it. A timeout here turns an indefinite
+    silent stall into a normal, catchable tool error the existing
+    _handle_any_tool_error/guardrail-retry machinery already knows how to
+    react to. Note: cancelling asyncio.wait_for does NOT kill the
+    underlying OS thread if the sync tool body is running via
+    asyncio.to_thread (LangChain's default) — this bounds the turn, not a
+    guaranteed clean kill of the stuck work, the same tradeoff already
+    accepted for Ollama calls elsewhere in this codebase.
     """
-    lock = campaign_write_lock(campaign_id)
 
     async def _serialize(request, execute):
+        tool_name = request.tool_call["name"]
+        lock = campaign_read_lock(campaign_id) if tool_name in _LOOKUP_ONLY_TOOLS else campaign_write_lock(campaign_id)
         async with lock:
-            return await execute(request)
+            return await asyncio.wait_for(execute(request), timeout=_TOOL_EXECUTION_TIMEOUT_S)
 
     return ToolNode(tools, awrap_tool_call=_serialize, handle_tool_errors=_handle_any_tool_error)
 

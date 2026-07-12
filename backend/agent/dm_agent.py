@@ -35,7 +35,7 @@ from typing import Annotated, AsyncIterator, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import create_react_agent, ToolNode
@@ -46,7 +46,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from backend.config import settings
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS
-from backend.llm import ollama_chat
+from backend.llm import vllm_chat
 from backend.locks import campaign_read_lock, campaign_write_lock
 from backend.models import Campaign, CombatantType, InitiativeEntry
 from backend.agent.prompts import (
@@ -99,7 +99,7 @@ async def agent_lifespan():
 
 # ── models ─────────────────────────────────────────────────────────────────────
 
-def _get_model() -> ChatOllama:
+def _get_model() -> ChatOpenAI:
     """Single-model instance used by world-prep, party-fill, and session
     summarization — structured/tool-driven passes with no dedicated
     narration step. Session 0 chargen used to be in this list too, but moved
@@ -118,35 +118,40 @@ def _get_model() -> ChatOllama:
     ```json``` blocks that looked like tool calls but never made a single real
     one, then confidently declared the character "successfully created" while
     DraftStore stayed completely empty and finalize_character was never truly
-    called. settings.mechanics_model (gemma4:26b-mlx) has been extensively
-    live-tested elsewhere in this app for reliable, genuine tool-calling
-    discipline (including self-correcting after guardrail rejections across
-    multi-turn combat) — standardizing on one validated model closes this
-    failure class rather than working around it per call site. Note this
-    model choice didn't fully close the gap for Session 0 either, hence the
-    2026-07-04 structural split — see above."""
-    return ollama_chat(temperature=0.7)
+    called. settings.mechanics_model has been extensively live-tested
+    elsewhere in this app for reliable, genuine tool-calling discipline
+    (including self-correcting after guardrail rejections across multi-turn
+    combat) — standardizing on one validated model closes this failure
+    class rather than working around it per call site. Note this model
+    choice didn't fully close the gap for Session 0 either, hence the
+    2026-07-04 structural split — see above. (2026-07-13: model/client
+    swapped from Ollama's gemma4:26b-mlx to vLLM-metal's Qwen3-30B-A3B-4bit,
+    see vllm-migration-plan.md — this function's own role/rationale is
+    otherwise unchanged.)"""
+    return vllm_chat(temperature=0.7)
 
 
-def _get_mechanics_model() -> ChatOllama:
+def _get_mechanics_model() -> ChatOpenAI:
     """Low-temperature tool-calling model for the in-game agent.
-    Cross-cutting client policy (reasoning=False, the client-level timeout,
-    keep_alive) is owned and documented by backend/llm.py — the reasoning
-    and keep_alive investigation history that used to live in this
-    docstring moved there and to config.py's ollama_keep_alive comment."""
-    return ollama_chat(temperature=0.1)
+    Cross-cutting client policy is owned and documented by backend/llm.py's
+    vllm_chat() (2026-07-13, vllm-migration-plan.md — swapped from Ollama's
+    ollama_chat() for real forced tool-calling via tool_choice="required")."""
+    return vllm_chat(temperature=0.1)
 
 
-def _get_narrator_model() -> ChatOllama:
+def _get_narrator_model() -> ChatOpenAI:
     """Higher-temperature prose model for the in-game agent. No tool access.
 
     Same underlying model as the mechanics node (settings.mechanics_model),
     just a different temperature/prompt — benchmarked against a smaller
-    dedicated narrator model (gemma4:12b-mlx) and found to be both faster
-    at raw generation and to incur no residency/swap cost either way, so a
-    second model wasn't worth the extra ~7.6GB resident and the added
-    config surface."""
-    return ollama_chat(temperature=0.8)
+    dedicated narrator model (gemma4:12b-mlx, back when the chat backend was
+    Ollama) and found to be both faster at raw generation and to incur no
+    residency/swap cost either way, so a second model wasn't worth the extra
+    resident memory and the added config surface. (2026-07-13: model/client
+    swapped to vLLM-metal's Qwen3-30B-A3B-4bit, see vllm-migration-plan.md —
+    the narrator has no tool_choice concerns either way, since it never had
+    tools bound.)"""
+    return vllm_chat(temperature=0.8)
 
 
 # ── message trimmer ────────────────────────────────────────────────────────────
@@ -2015,9 +2020,13 @@ _REASONING_LEAK_RE = re.compile(
 
 def strip_reasoning_leakage(text: str) -> str:
     """Best-effort removal of stray reasoning/channel-tag artifacts from
-    narrator-facing text. Defense-in-depth alongside reasoning=False on
-    every ChatOllama instance (see _get_mechanics_model's docstring) for
-    the case where a leak reaches `.content` anyway. Not chunk-boundary-safe
+    narrator-facing text. Originally defense-in-depth alongside
+    reasoning=False on every ChatOllama instance, back when chat ran on
+    Ollama/gemma4:26b-mlx — that kwarg has no vLLM/ChatOpenAI equivalent
+    (see backend/llm.py's vllm_chat()), and Step 0 testing (vllm-migration-
+    plan.md) didn't reproduce the reasoning-channel leak this originally
+    guarded against, but this stays as a cheap safety net in case a leak
+    reaches `.content` anyway on the new backend. Not chunk-boundary-safe
     — a tag split across two stream chunks won't be caught here; not worth
     buffering the live game's token-by-token stream to fix that."""
     return _REASONING_LEAK_RE.sub("", text)
@@ -2276,17 +2285,18 @@ async def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore)
 
     # search_adventure_only (plain dense search) rather than the hybrid
     # search() — see design.md's Evolution section, 2026-07-09: search()'s
-    # reranker makes its own separate ChatOllama call, so this one retrieval
-    # step forces an embed -> chat model swap on Ollama every time a session
-    # ends. That's the exact trigger already root-caused for world-prep's
-    # recurring whole-app freeze (fixed there by removing Ollama from the
-    # seed step entirely; here, dropping to dense-only search removes just
-    # the chat-model half of the same problem while keeping the live-state-
-    # dependent semantic search this function actually needs). Also a
-    # better fit than search() was in the first place — matches
-    # search_adventure_only's own original rationale: adventure-scoped
-    # dense search surfaces a location's own named content instead of
-    # generic core-rulebook DM advice drowning it out.
+    # reranker made its own separate ChatOllama call, so this one retrieval
+    # step used to force an embed -> chat model swap on Ollama every time a
+    # session ends (that was the exact trigger already root-caused for
+    # world-prep's recurring whole-app freeze). The embed<->chat swap risk
+    # itself is now moot (2026-07-13, vllm-migration-plan.md) — Ollama only
+    # ever serves the embedder now, chat runs on a separate vLLM-metal
+    # server, so there's no single-process model-swap to trigger regardless
+    # of which retrieval path this uses. Kept dense-only anyway: it's also
+    # just a better fit than search() was in the first place, independent of
+    # the swap concern — matches search_adventure_only's own original
+    # rationale: adventure-scoped dense search surfaces a location's own
+    # named content instead of generic core-rulebook DM advice drowning it out.
     chunks = []
     for book in campaign.books_in_play:
         chunks += await rules_store.search_adventure_only(query, adventure=book, k=4)

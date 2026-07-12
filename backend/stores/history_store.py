@@ -68,7 +68,13 @@ class HistoryStore:
         if not events:
             return
 
-        contextualizer = ChunkContextualizer(ollama_base_url=self._ollama_base_url)
+        # No vllm_base_url override — self._ollama_base_url is scoped to this
+        # store's embeddings (still Ollama, pending the separate embeddings
+        # migration in vllm-migration-plan.md §7.7), not chat. Reusing it
+        # here would point contextualization at the wrong server. Let
+        # ChunkContextualizer fall back to its own settings.vllm_base_url
+        # default instead — same one every other chat call in the app uses.
+        contextualizer = ChunkContextualizer()
 
         rows = []
         for i, (event_text, event_type) in enumerate(events):

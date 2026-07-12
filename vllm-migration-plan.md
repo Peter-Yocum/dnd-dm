@@ -466,12 +466,27 @@ this plan's writing — re-check before editing, they will have shifted.
     --port 8100 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
     --max-model-len <VALUE — Step 0 used 8192 successfully; size against real
                       dm_agent.py usage, see _MAX_MESSAGES=100, for the real deployment> \
     --gpu-memory-utilization <VALUE — Step 0 ran with no explicit override and had
                                comfortable headroom (84% system-wide free per
                                `memory_pressure`); tune for real deployment if desired>
   ```
+  **`--reasoning-parser qwen3` — required, discovered during §7.4 implementation, not
+  Step 0**: Qwen3-30B-A3B-4bit reasons by default, and without this flag its
+  `<think>...</think>` block leaks straight into `.content` (confirmed live: a plain
+  "say OK" prompt came back as the full chain-of-thought plus "OK" appended — same class
+  of problem Gemma4's channel-tag leak caused on Ollama, `strip_reasoning_leakage()` in
+  `dm_agent.py`, just a different tag format). This flag alone routes it to a separate
+  `reasoning` response field instead of `.content` — but see `backend/llm.py`'s
+  `vllm_chat()` for the actual fix used: `enable_thinking=False` via
+  `chat_template_kwargs` (per-request, sent by every `vllm_chat()` call), which skips
+  reasoning entirely rather than just relocating it — no caller reads `reasoning`, so
+  paying the extra latency/tokens for it (300-token responses got cut off mid-reasoning
+  in testing before this was disabled) is pure waste. Keep `--reasoning-parser qwen3` on
+  the server anyway as defense-in-depth (harmless if reasoning is already disabled
+  per-request; a safety net if some caller ever needs it re-enabled).
   **Installation note (confirmed in Step 0, see the results note at the top of this
   doc):** `pip install vllm-metal` installs a stale, non-functional 0.1.0 snapshot —
   install the real nightly build via `gh release download <tag> --repo
@@ -533,15 +548,15 @@ equivalents apply), then repoint the ~4 call sites at it — no need to touch
 `contextualizer.py`/`grading.py`/`reranker.py` individually beyond that.
 
 - **`_get_model()` (line 134), `_get_mechanics_model()` (line 181),
-  `_get_narrator_model()` (line 199)**: swap `ChatOllama(...)` for
-  `ChatOpenAI(base_url=settings.vllm_base_url, api_key="unused", model=settings.mechanics_model, ...)`.
-  Carry over `temperature` per-factory as today. Re-evaluate whether the
-  `reasoning=False` workaround (documented at length in `_get_mechanics_model()`'s
-  docstring — Gemma's `<|channel>thought...<channel|>` leaking into `.content` when
-  reasoning isn't explicitly disabled) is still needed or has an equivalent on
-  `ChatOpenAI`/vLLM's side — the spike's clean `tool_calls`-only responses are a good
-  sign this isn't a problem via vLLM's `gemma4` parser, but explicitly verify rather
-  than assume (§8).
+  `_get_narrator_model()` (line 199)**: swap `ChatOllama(...)` for `vllm_chat(...)`
+  (`backend/llm.py`) — DONE. Carried `temperature` over per-factory unchanged.
+  ~~Re-evaluate whether the `reasoning=False` workaround... is still needed~~ **RESOLVED
+  during implementation, not just Step 0's battery**: it IS still needed, Qwen3 reasons
+  by default and leaks `<think>...</think>` into `.content` exactly like Gemma's
+  channel-tag leak did — confirmed live. Fixed via `enable_thinking=False`
+  (`chat_template_kwargs`, per-request) in `vllm_chat()` itself, plus
+  `--reasoning-parser qwen3` on the server as defense-in-depth (§7.1). See
+  `backend/llm.py`'s `vllm_chat()` docstring for the full finding.
 - **New `conclude_turn` tool** — add alongside the other mechanics tools (wherever
   `get_tools()` assembles its list, `backend/tools/registry.py`), or as a standalone
   tool defined directly in `dm_agent.py` if it doesn't belong conceptually with the
@@ -659,9 +674,12 @@ design — manual, scenario-driven, check real state not narration).
    and clearly non-combat turns (roleplay, questions) — confirm `conclude_turn` is used
    naturally and cleanly in the latter, not fought against or spammed with junk calls
    (§6's "universal forcing surfaces a new failure mode" risk).
-6. **`reasoning=False` equivalent check** (§7.4) — confirm no reasoning/thinking-channel
-   leakage into tool-call arguments or `conclude_turn`'s `resolution_notes`, across
-   several real turns, not just the spike's clean benchmark run.
+6. **`reasoning=False` equivalent check** (§7.4) — `enable_thinking=False` is now baked
+   into `vllm_chat()` itself and confirmed to produce clean `.content`/tool-calls in
+   isolated testing; still confirm no reasoning/thinking-channel leakage into tool-call
+   arguments or `conclude_turn`'s `resolution_notes` across several REAL turns in the
+   live app (not just isolated `vllm_chat()` smoke tests), since real prompts/message
+   histories differ from the minimal test cases checked so far.
 7. **Failure-injection test**: stop the vllm-metal service mid-session, confirm the app
    fails clearly (not silently hangs) and that the manual break-glass procedure (§6)
    actually restores service when followed.

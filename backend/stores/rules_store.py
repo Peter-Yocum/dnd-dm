@@ -174,14 +174,22 @@ class RulesStore:
 
         use_reranker defaults to False — see design.md's Evolution section,
         2026-07-09: the reranker (LLMJudgeReranker) makes its own separate
-        ChatOllama call, distinct from the embedding model this method's dense
-        step already uses, so calling it here forces Ollama to evict one
-        model and load the other on every single call — the exact embed<->chat
-        swap already root-caused as a whole-app MLX-runner freeze trigger.
+        chat call, distinct from the embedding model this method's dense step
+        already uses; at the time, both ran through Ollama, so calling it
+        here forced Ollama to evict one model and load the other on every
+        single call — the exact embed<->chat swap already root-caused as a
+        whole-app MLX-runner freeze trigger. That specific swap risk is now
+        moot (2026-07-13, vllm-migration-plan.md): chat moved to a separate
+        vLLM-metal server, so the reranker's call no longer touches Ollama
+        (which now only serves embeddings) at all. Left as False for now
+        anyway — the extra vLLM round-trip's latency on this hot path is
+        still a real, independent reason, just a smaller one than an
+        outright freeze risk; worth reconsidering as a real default-flip
+        candidate now that the swap-freeze reason is gone, not done here.
         RRF-fused dense+sparse is a legitimate hybrid retrieval result on its
         own even without a reranked reorder on top. Pass True explicitly for
-        a lower-frequency, quality-sensitive caller that can tolerate the
-        swap risk (e.g. scripts/eval_retrieval.py)."""
+        a lower-frequency, quality-sensitive caller (e.g.
+        scripts/eval_retrieval.py)."""
         if not await self.is_ready():
             raise RuntimeError(
                 "RulesStore is not ready. Run build_index.py first, "

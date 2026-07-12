@@ -36,7 +36,13 @@ services:
       DATABASE_URL: postgresql+psycopg://dnd_dm:dnd_dm@db:5432/dnd_dm
       # Reaches Ollama running on the host machine (Docker Desktop Mac/Windows).
       # On Linux: set OLLAMA_BASE_URL=http://172.17.0.1:11434 or use host network mode.
+      # Ollama now serves embeddings only (nomic-embed-text) — chat moved to
+      # vLLM-metal, see VLLM_BASE_URL below and vllm-migration-plan.md.
       OLLAMA_BASE_URL: http://host.docker.internal:11434
+      # vLLM-metal chat server (see vllm-migration-plan.md) — runs natively
+      # on the host Mac (not in Docker), same reachability pattern as Ollama
+      # above. On Linux: same 172.17.0.1/host-network-mode note applies.
+      VLLM_BASE_URL: http://host.docker.internal:8100/v1
     depends_on:
       db:
         condition: service_healthy

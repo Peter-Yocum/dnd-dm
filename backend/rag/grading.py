@@ -21,9 +21,9 @@ def grade_sufficiency(query: str, chunks: list[RuleChunk], model: str = settings
 
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    from backend.llm import ollama_chat
+    from backend.llm import vllm_chat
 
-    llm = ollama_chat(model=model)
+    llm = vllm_chat(model=model)
     excerpt = "\n\n---\n\n".join(c.content[:500] for c in chunks[:5])
     response = llm.invoke([
         SystemMessage(content=(
@@ -48,9 +48,9 @@ def reformulate_query(query: str, model: str = settings.mechanics_model) -> str:
     query unchanged on any parse/generation failure."""
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    from backend.llm import ollama_chat
+    from backend.llm import vllm_chat
 
-    llm = ollama_chat(model=model)
+    llm = vllm_chat(model=model)
     response = llm.invoke([
         SystemMessage(content=(
             "You rewrite a search query as one alternate phrasing that might "

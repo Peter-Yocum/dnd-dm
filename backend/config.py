@@ -5,12 +5,19 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://dnd_dm:dnd_dm@localhost:5432/dnd_dm"
     ollama_base_url: str = "http://localhost:11434"
     chroma_persist_dir: str = "data/chroma_db"
-    # Both the mechanics and narrator nodes use this model — benchmarked
-    # against a smaller dedicated narrator model (gemma4:12b-mlx) and found
-    # to be both faster at raw generation (~37.5 vs ~25.3 tok/s) and to
-    # incur no swap cost either way (both fit resident simultaneously), so
-    # a second model bought nothing. See design.md tech stack notes.
-    mechanics_model: str = "gemma4:26b-mlx"
+    # vLLM-metal chat server (see vllm-migration-plan.md) — reached from
+    # backend/llm.py's vllm_chat() factory. host.docker.internal in the app
+    # container, same reachability pattern as ollama_base_url, since
+    # vllm-metal runs natively on the host Mac (not in Docker), per
+    # docker-compose.yml. Ollama itself no longer serves chat in the normal
+    # runtime path as of this migration — kept installed only for the
+    # manual break-glass fallback documented in the migration plan.
+    vllm_base_url: str = "http://localhost:8100/v1"
+    # Both the mechanics and narrator nodes use this model. Was
+    # "gemma4:26b-mlx" (via Ollama) until the vLLM-metal migration —
+    # switched for real forced tool-calling (tool_choice="required"),
+    # unavailable on Ollama's serving stack. See vllm-migration-plan.md.
+    mechanics_model: str = "mlx-community/Qwen3-30B-A3B-4bit"
     embed_model: str = "nomic-embed-text"
     # Ollama keep_alive for every client built by backend/llm.py — a
     # duration string ("5m", "45m", "-1" for forever); None sends nothing

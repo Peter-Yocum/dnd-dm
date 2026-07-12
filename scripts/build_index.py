@@ -90,6 +90,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 DEFAULT_SOURCE  = "docs/source"
 DEFAULT_OLLAMA  = "http://localhost:11434"
+DEFAULT_VLLM    = "http://localhost:8100/v1"  # vllm-metal chat server, see vllm-migration-plan.md
 DEFAULT_EMBED   = "nomic-embed-text"
 MAX_CHUNK_CHARS = 1500   # parent section cap
 CHILD_CHUNK_CHARS = 350  # child sub-chunk target size (dense/BM25 search target)
@@ -269,7 +270,7 @@ def _delete_where(engine, condition) -> None:
 # ── indexing (resumable) ──────────────────────────────────────────────────────
 
 def _index_documents(
-    all_docs: list[dict], engine, ollama_url: str,
+    all_docs: list[dict], engine, ollama_url: str, vllm_url: str,
     skip_contextualization: bool, force: bool, context_model: str | None = None,
     recontextualize: bool = False,
 ) -> None:
@@ -281,13 +282,17 @@ def _index_documents(
     from backend.rag.contextualizer import ChunkContextualizer
     from backend.stores import tables as t
 
+    # Embeddings stay on Ollama (ollama_url) — the vllm-metal migration's
+    # embeddings step (vllm-migration-plan.md §7.7) is separate/not done
+    # yet. Contextualization is a chat call and moved to vLLM (vllm_url)
+    # with the rest of the app's chat traffic.
     embeddings_fn = ollama_embeddings(model=DEFAULT_EMBED, base_url=ollama_url, timeout=None)
     if skip_contextualization:
         contextualizer = None
     elif context_model:
-        contextualizer = ChunkContextualizer(model=context_model, ollama_base_url=ollama_url)
+        contextualizer = ChunkContextualizer(model=context_model, vllm_base_url=vllm_url)
     else:
-        contextualizer = ChunkContextualizer(ollama_base_url=ollama_url)
+        contextualizer = ChunkContextualizer(vllm_base_url=vllm_url)
 
     total = len(all_docs)
     indexed_count = 0
@@ -394,7 +399,11 @@ def _index_documents(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build the hybrid Postgres/pgvector rules index from docs/source/.")
     ap.add_argument("--source",      default=DEFAULT_SOURCE)
-    ap.add_argument("--ollama-url",  default=None)
+    ap.add_argument("--ollama-url",  default=None, help="Ollama server for embeddings")
+    ap.add_argument("--vllm-url",    default=None,
+                     help="vLLM-metal chat server for contextualization (see "
+                          "vllm-migration-plan.md) — separate from --ollama-url, "
+                          "which is embeddings-only now")
     ap.add_argument("--wipe",        action="store_true",
                      help="clear whole collection first — FIRST RUN ONLY; if interrupted, "
                           "resume with a plain run (no --wipe), not by repeating --wipe")
@@ -421,15 +430,20 @@ def main() -> None:
     ap.add_argument("--skip-contextualization", action="store_true",
                      help="fast dev path: skip the LLM contextualization pass entirely")
     ap.add_argument("--context-model", default=None,
-                     help="Ollama model for the contextualization pass (default: settings.mechanics_model, "
-                          "gemma4:26b-mlx — Apple Silicon MLX format, ~26B, won't fit a 12GB-class GPU or "
-                          "load at all on non-Apple hardware). On a machine that can't run the default, pass "
-                          "a smaller model here explicitly rather than silently falling back to it — this "
-                          "codebase has a documented incident (design.md) where an unvalidated smaller model "
-                          "(qwen2.5:14b) produced fake tool calls/garbled output under sustained use, so "
-                          "prefer a model from an already-trusted family (e.g. gemma4:e4b, the desktop's "
-                          "target model — see docs/engineering-notes/desktop-native-ingestion.md) over an "
-                          "unvalidated one, and smoke-test before trusting it for a long unattended run.")
+                     help="vLLM-served model name for the contextualization pass (default: "
+                          "settings.mechanics_model, mlx-community/Qwen3-30B-A3B-4bit as of the "
+                          "2026-07-13 vllm-metal migration — see vllm-migration-plan.md; served via "
+                          "--vllm-url, NOT an Ollama model tag anymore). On a machine that can't run "
+                          "the default (no vllm-metal set up, or a smaller-GPU machine), pass a "
+                          "different model served by whatever's at --vllm-url explicitly rather than "
+                          "silently falling back to it — this codebase has a documented incident "
+                          "(design.md) where an unvalidated smaller model (qwen2.5:14b) produced fake "
+                          "tool calls/garbled output under sustained use, so prefer an already-validated "
+                          "model family and smoke-test before trusting a substitute for a long "
+                          "unattended run. NOTE: docs/engineering-notes/desktop-native-ingestion.md's "
+                          "native-desktop workflow predates this migration and still assumes Ollama for "
+                          "this pass — needs its own follow-up update to set up vllm-metal there too, "
+                          "not covered by this change.")
     ap.add_argument("--force",       action="store_true",
                      help="re-process chunk_ids that already exist in the collection")
     ap.add_argument("--recontextualize", action="store_true",
@@ -476,6 +490,7 @@ def main() -> None:
         sys.exit(1)
 
     ollama_url = args.ollama_url or os.environ.get("OLLAMA_BASE_URL") or DEFAULT_OLLAMA
+    vllm_url = args.vllm_url or os.environ.get("VLLM_BASE_URL") or DEFAULT_VLLM
     source_dir = Path(args.source)
 
     if not source_dir.exists():
@@ -535,7 +550,7 @@ def main() -> None:
 
     print(f"\nIndexing {len(all_docs)} chunks (parent+child, resumable) …")
     _index_documents(
-        all_docs, engine, ollama_url, args.skip_contextualization, args.force, args.context_model,
+        all_docs, engine, ollama_url, vllm_url, args.skip_contextualization, args.force, args.context_model,
         recontextualize=args.recontextualize,
     )
 

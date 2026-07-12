@@ -1929,12 +1929,24 @@ TURN_BOUNDARY = _TurnBoundary()
 
 async def watch_for_stalls(source: AsyncIterator, stall_after: float = STALL_TIMEOUT) -> AsyncIterator:
     """Wrap an async iterator, yielding STALL if `stall_after` seconds pass
-    with no new item. Draining happens in a background task so a stall
-    report never cancels or otherwise disturbs the underlying call — by the
-    time we know enough to call it "stuck" rather than "slow," canceling it
-    ourselves would just trade one guess for another. Re-raises any
-    exception from the source (e.g. a connection error once the wedged
-    runner is killed) once draining reaches it."""
+    with no new item — and again every `stall_after` seconds after that for
+    as long as the stall continues, not just once. Draining happens in a
+    background task so a stall report never cancels or otherwise disturbs
+    the underlying call — by the time we know enough to call it "stuck"
+    rather than "slow," canceling it ourselves would just trade one guess
+    for another. Re-raises any exception from the source (e.g. a connection
+    error once the wedged runner is killed) once draining reaches it.
+
+    Confirmed live, 2026-07-12: a cold local-model load took ~15 minutes to
+    produce its first token. The stall-suppression here used to only fire
+    STALL once (an `already_stalled` guard skipped every timeout after the
+    first), so the SSE connection went completely silent for the remaining
+    ~13 minutes with no ping/stall/token of any kind — exactly the window
+    a browser/OS/network idle-connection timeout will kill, which is what
+    happened, surfacing to the player as a bare "Connection lost" with no
+    indication anything had even been attempted. Repeating the STALL event
+    on every timeout keeps the connection alive with real traffic for as
+    long as a slow-but-not-actually-wedged call keeps running."""
     queue: asyncio.Queue = asyncio.Queue()
 
     async def _drain():
@@ -1947,21 +1959,17 @@ async def watch_for_stalls(source: AsyncIterator, stall_after: float = STALL_TIM
             await queue.put(_DONE)
 
     task = asyncio.create_task(_drain())
-    already_stalled = False
     try:
         while True:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=stall_after)
             except asyncio.TimeoutError:
-                if not already_stalled:
-                    already_stalled = True
-                    yield STALL
+                yield STALL
                 continue
             if item is _DONE:
                 return
             if isinstance(item, Exception):
                 raise item
-            already_stalled = False
             yield item
     finally:
         if not task.done():

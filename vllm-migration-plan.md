@@ -1,10 +1,57 @@
 # vLLM-Metal Migration Plan: full backend swap, real forced tool-calling everywhere
 
-**Status:** Not started. Model swapped post-write (see note below) — the empirical spike
-this plan cites (§1) has NOT been re-run against the new model yet; do not proceed past
-§7.1 until §8's new Step 0 passes. This is a self-contained implementation plan — hand
-this whole file to a fresh Claude Code session to execute it; it doesn't assume any prior
-conversation context.
+**Status:** §8 Step 0 PASSED (2026-07-12/13) against `mlx-community/Qwen3-30B-A3B-4bit`
+— see the Step 0 results note below. §7's actual implementation (app code changes) has
+NOT started yet. This is a self-contained implementation plan — hand this whole file to
+a fresh Claude Code session to execute it; it doesn't assume any prior conversation
+context.
+
+**Step 0 results (2026-07-12/13, superseding the caveats in the model swap note below):**
+- The PyPI-published `vllm-metal==0.1.0` is a stale snapshot with NO tool-calling support
+  at all (no `tools`/`tool_choice` in its request schema, no relevant CLI flags) — do not
+  install it. The real, current implementation is on GitHub as nightly dev builds
+  (`v0.3.0.dev...`, e.g. `v0.3.0.dev20260711221406`), installed via
+  `gh release download <tag> --repo vllm-project/vllm-metal --pattern "*.whl"` +
+  `uv pip install <wheel>`, NOT `pip install vllm-metal`.
+- `vllm-metal` is a **platform plugin for mainline vLLM** (registers via
+  `vllm.platform_plugins`/`vllm.general_plugins` entry points), not a standalone server —
+  §7.1's `vllm serve ...` command was correct all along. Mainline `vllm` has no prebuilt
+  macOS wheel and must be built from source per the project's own `install.sh`: download
+  `vllm-<version>.tar.gz` from **vllm-project/vllm's GitHub releases** (not PyPI —
+  `pip install vllm==0.24.0` fails with a `+cpu` local-version mismatch pip can't resolve),
+  `uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match`, then
+  `CXXFLAGS="-Wno-parentheses" uv pip install .` (the `CXXFLAGS` override is required —
+  a plain build fails with a cmake/C++ compile error otherwise).
+- **Correct `--tool-call-parser` for Qwen3 is `qwen3_xml`** (or `qwen3_coder` for
+  coder-tuned variants) — confirmed via `vllm serve --help=Frontend`'s actual parser
+  choice list. Not `hermes`, which this plan's model-swap note guessed.
+- `Qwen3MoeForCausalLM` (Qwen3-30B-A3B's architecture) is fully implemented on both sides
+  of the stack: mainline vLLM's model registry and `mlx_lm`'s (vllm-metal's MLX backend)
+  own `qwen3_moe.py`. vllm-metal's `platform.py` has explicit MoE-aware logic (multi-GPU
+  data-parallelism is dense-only, single-GPU MoE is fine) rather than rejecting it.
+- **Real tool-choice forcing confirmed live**: a `tool_choice: "required"` request
+  against a live server (`vllm serve mlx-community/Qwen3-30B-A3B-4bit --port 8100
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml --max-model-len 8192`) returned
+  a correctly-parsed tool call (`finish_reason: "tool_calls"`, empty content, valid JSON
+  args) on the first try.
+- **15-case battery** (real prompts + real tool schemas pulled from `backend/tools`,
+  `tool_choice="required"` bound): **14/15 = 93.3% compliance.** The one non-compliant
+  case hit `finish_reason: "length"` (test harness's `max_tokens=300` was too tight for a
+  verbose two-tool-call response), not a genuine forcing failure — the model was still
+  actively complying, just got cut off. Several cases correctly returned multiple tool
+  calls in one turn, which the app's existing `ToolNode` dispatch already handles.
+- **Throughput**: single-request 32.1 tok/s; 23.3 tok/s aggregate across the mixed
+  15-case battery. Both beat the original Gemma4 spike's 22.9 tok/s, approaching the
+  ~37.5 tok/s Ollama baseline — confirms the MoE-throughput hypothesis in the model swap
+  note below.
+- **Resource check**: 16GB on disk (matches the ~15-17GB estimate). System-wide memory
+  pressure stayed at 84% free (`memory_pressure`'s authoritative metric, not raw
+  `vm_stat` free-page count, which reads misleadingly low on macOS) with the model
+  resident AND the core rules corpus reindex running concurrently in Docker — comfortable
+  headroom on this 32GB Mac.
+- **Not yet done**: the `conclude_turn` edge case (§6) can't be tested until §7.4 actually
+  adds that tool — this battery only tested "does a real tool call come back," not the
+  app's not-yet-built conclude-turn control flow.
 
 **Prerequisite reading (optional but useful):** `docs/VERIFICATION.md` (this repo's
 manual, scenario-driven verification convention — no automated test suite, by design).
@@ -337,12 +384,20 @@ this plan's writing — re-check before editing, they will have shifted.
   vllm serve mlx-community/Qwen3-30B-A3B-4bit \
     --port 8100 \
     --enable-auto-tool-choice \
-    --tool-call-parser <CONFIRM — likely "hermes" or a dedicated "qwen3" parser, NOT
-                         "gemma4" — check `vllm serve --help` / docs for the installed
-                         version's actual supported parser names before running this> \
-    --max-model-len <VALUE — size against real dm_agent.py usage, see _MAX_MESSAGES=100> \
-    --gpu-memory-utilization <VALUE — tune per §4, re-measured for this model>
+    --tool-call-parser qwen3_xml \
+    --max-model-len <VALUE — Step 0 used 8192 successfully; size against real
+                      dm_agent.py usage, see _MAX_MESSAGES=100, for the real deployment> \
+    --gpu-memory-utilization <VALUE — Step 0 ran with no explicit override and had
+                               comfortable headroom (84% system-wide free per
+                               `memory_pressure`); tune for real deployment if desired>
   ```
+  **Installation note (confirmed in Step 0, see the results note at the top of this
+  doc):** `pip install vllm-metal` installs a stale, non-functional 0.1.0 snapshot —
+  install the real nightly build via `gh release download <tag> --repo
+  vllm-project/vllm-metal --pattern "*.whl"` + `uv pip install <wheel>` instead. Mainline
+  `vllm` itself has no macOS wheel and must be built from source via that project's own
+  `install.sh` recipe (GitHub release tarball, not PyPI; `uv pip install -r
+  requirements/cpu.txt`; `CXXFLAGS="-Wno-parentheses" uv pip install .`).
 - Add a startup health-check (`curl -s http://localhost:8100/v1/models` returning 200)
   that the app itself checks at boot, since there's no Ollama fallback to silently work
   around a not-yet-ready vLLM server anymore — fail loudly and early if it's not up,
@@ -443,23 +498,18 @@ line — a new env var (`VLLM_BASE_URL` or whatever §7.3 settles on) pointed at
 Follow `docs/VERIFICATION.md`'s existing convention (no automated test suite by
 design — manual, scenario-driven, check real state not narration).
 
-0. **NEW, BLOCKING — re-run §1's spike against `mlx-community/Qwen3-30B-A3B-4bit` before
-   doing anything else in this plan.** The 100/40 compliance result and throughput number
-   §1 cites are Gemma4-specific and do not transfer to this MoE model (see the model
-   swap note at the top of this document). Concretely:
-   - Confirm vllm-metal actually loads a Qwen3-MoE checkpoint at all (§6's new top risk
-     row) before investing time in anything downstream of this.
-   - Determine the correct `--tool-call-parser` value for this model (§7.1's `<CONFIRM>`
-     placeholder) from the installed vLLM version's own docs/`--help`, not by guessing.
-   - Re-run `scripts/spikes/vllm_tool_choice/bench_tool_choice.py` (or an updated
-     equivalent) against it with `tool_choice="required"` — confirm compliance holds,
-     and get a real throughput number for this model/quantization/hardware combination.
-   - Get a real `--gpu-memory-utilization` ceiling reading (§4), replacing the untested
-     15-17GB estimate.
-   - If any of the above fails or comes back materially worse than Gemma4's spiked
-     numbers, that's a real decision point — fall back to the already-verified Gemma4
-     checkpoint (§1) rather than proceeding on an unverified model. Don't let sunk
-     research-report enthusiasm override what the spike actually shows.
+0. ~~**BLOCKING — re-run §1's spike against `mlx-community/Qwen3-30B-A3B-4bit`.**~~
+   **DONE, PASSED (2026-07-12/13)** — see the Step 0 results note at the top of this
+   document for the full writeup (installation path, correct parser, 14/15 compliance,
+   throughput, resource check). Summary: vllm-metal loads Qwen3-MoE and serves it
+   correctly; `--tool-call-parser qwen3_xml` is the confirmed correct value (not a
+   placeholder anymore); compliance and throughput both hold up and beat the original
+   Gemma4 spike's numbers. Proceed to §7's implementation steps.
+   - **Still not done**: a real `--gpu-memory-utilization` ceiling reading (the Step 0
+     run used `--max-model-len 8192` with no explicit `--gpu-memory-utilization` override
+     and it worked fine, but no one deliberately pushed to find the actual ceiling the
+     way the Gemma4 spike did) — fine to defer to §7.1's real deployment tuning, not
+     blocking further work.
 1. **§4's resource check** — confirm vLLM-metal alone (tuned `--gpu-memory-utilization`/
    `--max-model-len`) fits comfortably, and do a real concurrency smoke test (a
    background world-prep-shaped call + a live mechanics-shaped call close together) —
@@ -500,13 +550,14 @@ design — manual, scenario-driven, check real state not narration).
 
 ## 9. Open questions to resolve during implementation
 
-- **New, from the model swap:** whether vllm-metal supports Qwen3-MoE at all, and the
-  correct `--tool-call-parser` value for it — both resolved by §8 Step 0, not here.
-- **New, from the model swap:** if Step 0 fails or underperforms, whether to fall back to
-  the already-verified Gemma4 checkpoint (§1) or try a dense (non-MoE) Qwen3 size
-  instead — a real decision, not pre-answered by this plan.
-- Exact `--gpu-memory-utilization` / `--max-model-len` values from §4/§7.1 — fill in
-  once measured against real `dm_agent.py` usage patterns (see `_MAX_MESSAGES = 100`).
+- ~~Whether vllm-metal supports Qwen3-MoE, and the correct `--tool-call-parser` value.~~
+  **RESOLVED by Step 0**: yes, and `qwen3_xml`.
+- ~~Whether to fall back to Gemma4 or a dense Qwen3 size if Step 0 underperforms.~~
+  **MOOT — Step 0 passed**, no fallback needed.
+- Exact `--gpu-memory-utilization` / `--max-model-len` values from §4/§7.1 for the real
+  deployment — Step 0 used `--max-model-len 8192` with no `--gpu-memory-utilization`
+  override successfully, but fill in real production values once measured against real
+  `dm_agent.py` usage patterns (see `_MAX_MESSAGES = 100`).
 - Final process-supervision mechanism for §7.1 (`launchd` plist vs. something else) —
   now load-bearing, not optional (§6) — pick and document.
 - Whether to keep the `gemma4:26b-mlx` Ollama tag pulled (for the manual break-glass

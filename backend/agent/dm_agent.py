@@ -2252,7 +2252,7 @@ def _party_ground_truth(campaign: Campaign) -> str:
     return "\n".join(lines)
 
 
-def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore) -> str:
+async def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore) -> str:
     """Retrieve adventure text relevant to where the party currently stands,
     for the summarizer to use in judging which transcript events are actually
     plot-salient — without this, "salience" is purely the summarizer's own
@@ -2271,7 +2271,7 @@ def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore) -> st
         if loc:
             query = f"{loc.name}. {loc.description}".strip()
 
-    if not query or not rules_store.is_ready() or not campaign.books_in_play:
+    if not query or not await rules_store.is_ready() or not campaign.books_in_play:
         return "(none retrieved)"
 
     # search_adventure_only (plain dense search) rather than the hybrid
@@ -2289,7 +2289,7 @@ def _book_context_for_summary(campaign: Campaign, rules_store: RulesStore) -> st
     # generic core-rulebook DM advice drowning it out.
     chunks = []
     for book in campaign.books_in_play:
-        chunks += rules_store.search_adventure_only(query, adventure=book, k=4)
+        chunks += await rules_store.search_adventure_only(query, adventure=book, k=4)
     if not chunks:
         return "(none retrieved)"
     return "\n\n---\n\n".join(f"[{c.book} — {c.section}]\n{c.content}" for c in chunks)
@@ -2351,7 +2351,7 @@ async def summarize_session(
     # call — same mechanism as world-prep's, see design.md.
     try:
         book_context = await asyncio.wait_for(
-            asyncio.to_thread(_book_context_for_summary, campaign, rules_store), timeout=30.0
+            _book_context_for_summary(campaign, rules_store), timeout=30.0
         )
     except asyncio.TimeoutError:
         book_context = "(book context unavailable — retrieval timed out)"

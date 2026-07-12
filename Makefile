@@ -1,4 +1,4 @@
-.PHONY: up down build restart logs psql migrate migration rollback shell fresh index index-if-empty setup extract-lore reindex-full backfill-history-chunks eval-retrieval backfill-lore-links seed-relation-graph setup-venv ingest-book-native merge-chroma load-lore-json test
+.PHONY: up down build restart logs psql migrate migration rollback shell fresh index index-if-empty setup extract-lore reindex-full recontextualize backfill-history-chunks eval-retrieval backfill-lore-links seed-relation-graph setup-venv ingest-book-native merge-chroma load-lore-json test
 
 ## ── Services ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +110,37 @@ ingest-book:
 		$(if $(source_type),--source-type "$(source_type)",) \
 		$(if $(kinds),--kinds "$(kinds)",)
 	@echo "=== Done: $(or $(adventure),$(book)) ==="
+
+## Resumable LLM-contextualization pass over rule_chunks that were indexed
+## without it (contextualized=false — e.g. an initial reindex run with
+## skip_context=1 to unblock live play quickly). Safe to run whenever you
+## want, Ctrl-C/kill at any point, and re-run later — it only ever picks up
+## rows still missing contextualization, never redoes finished ones and
+## never wipes anything. Scope to one book/adventure/source-type at a time
+## the same way `index` does. Run UNSCOPED (no adventure=/book=/source_type=)
+## and it does core rulebooks FIRST, then adventures, as two sequential
+## phases — core is the higher-priority corpus (used by every campaign),
+## so a kill after phase 1 still leaves all of core done before any
+## adventure work starts.
+## Usage: make recontextualize                        # core first, then adventures
+##        make recontextualize adventure="Curse of Strahd"
+##        make recontextualize source_type=core
+ifeq ($(adventure)$(book)$(source_type),)
+recontextualize:
+	@echo "=== [1/2] Recontextualizing core rulebooks ==="
+	docker compose exec app python scripts/build_index.py --recontextualize --source-type core \
+		$(if $(context_model),--context-model "$(context_model)",)
+	@echo "=== [2/2] Recontextualizing adventures ==="
+	docker compose exec app python scripts/build_index.py --recontextualize --source-type adventure \
+		$(if $(context_model),--context-model "$(context_model)",)
+else
+recontextualize:
+	docker compose exec app python scripts/build_index.py --recontextualize \
+		$(if $(adventure),--adventure "$(adventure)",) \
+		$(if $(book),--book "$(book)",) \
+		$(if $(source_type),--source-type "$(source_type)",) \
+		$(if $(context_model),--context-model "$(context_model)",)
+endif
 
 ## Re-embed existing session chronicles (all campaigns) into the new
 ## per-event chunk schema. Idempotent — safe to re-run.
@@ -225,15 +256,20 @@ ingest-book-native:
 		$(if $(write_postgres),--write-postgres,)
 	@echo "=== Done: $(or $(adventure),$(book)) ==="
 
-## Merge a second machine's ChromaDB (e.g. copied from a desktop that did
-## bulk OCR/indexing) into this machine's canonical rules collection, then
-## rebuild the BM25 pickle. Safe to re-run (idempotent upsert, deterministic
-## content-derived chunk_ids — see scripts/merge_chroma.py). Runs natively
-## (not via Docker) — see this section's header comment for why.
-## Usage: make merge-chroma source=/path/to/other/chroma_db
+## 2026-07-12: obsolete post-ChromaDB-removal. The rules corpus now lives in
+## Postgres (rule_chunks, pgvector) — a real networked client-server DB, not
+## a local file store like Chroma's persist directory was. A desktop doing
+## bulk OCR/indexing no longer needs a separate "merge" step: if it can reach
+## the canonical machine's Postgres (same LAN, port 5432 exposed per
+## docker-compose.yml), just point DATABASE_URL at it directly and run
+## `make ingest-book-native` there — build_index.py writes straight into the
+## shared canonical DB, upserted on chunk_id (deterministic, content-derived —
+## same idempotent-merge safety scripts/merge_chroma.py used to provide).
+## A genuinely air-gapped desktop (no network path to the canonical Postgres
+## at all) has no replacement workflow yet — flagged, not built, since it's
+## not this project's common case.
 merge-chroma:
-	@test -n "$(source)" || (echo "Usage: make merge-chroma source=/path/to/other/chroma_db [target=data/chroma_db]" && exit 1)
-	./.venv/bin/python scripts/merge_chroma.py --source "$(source)" $(if $(target),--target "$(target)",)
+	@echo "Obsolete — see this target's comment in the Makefile. Point DATABASE_URL at the canonical Postgres and run ingest-book-native directly instead."
 
 ## Load extract_entities.py JSON registries (produced by a `write_postgres=0`
 ## native run, e.g. on a desktop with no Postgres) into this machine's

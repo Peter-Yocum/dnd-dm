@@ -5,13 +5,13 @@ from backend.stores.rules_store import RulesStore
 
 def make_tools(rules_store: RulesStore, books_in_play: list[str]) -> list:
     @tool
-    def search_rules(query: str) -> str:
+    async def search_rules(query: str) -> str:
         """Look up D&D 5e rules, spells, monsters, or items in the indexed rulebooks.
         Use for ANY rules question — how a spell works, a condition's effects, a
         monster's stat block, action economy, etc. Always cite the book, section,
         AND chunk_id from the results when relaying a fact. If the books don't
         cover it, say so and label any ruling as your own improvisation."""
-        if not rules_store.is_ready():
+        if not await rules_store.is_ready():
             return (
                 "Rulebook index is not ready. "
                 "Run build_index.py first, then restart the app."
@@ -21,7 +21,7 @@ def make_tools(rules_store: RulesStore, books_in_play: list[str]) -> list:
         # alone can trigger several), and the reranker's own separate
         # ChatOllama call is the embed<->chat model swap already root-caused
         # as the MLX-runner freeze trigger (see design.md's Evolution section).
-        chunks = rules_store.search(query, books_in_play=books_in_play)
+        chunks = await rules_store.search(query, books_in_play=books_in_play)
         if not chunks:
             return f"No relevant rules found for '{query}'."
         return "\n\n---\n\n".join(

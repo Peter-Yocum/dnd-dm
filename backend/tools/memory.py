@@ -5,7 +5,7 @@ from backend.stores.history_store import HistoryStore
 
 def make_tools(history_store: HistoryStore, campaign_id: str) -> list:
     @tool
-    def search_campaign_history(query: str) -> str:
+    async def search_campaign_history(query: str) -> str:
         """Search the chronicles of past sessions for relevant events, NPC
         encounters, revelations, or decisions made by the party.
 
@@ -16,7 +16,7 @@ def make_tools(history_store: HistoryStore, campaign_id: str) -> list:
         - You need context about a location the party has visited before
 
         Do NOT use this for rules questions — use search_rules instead."""
-        results = history_store.search(query, campaign_id=campaign_id)
+        results = await history_store.search(query, campaign_id=campaign_id)
         if not results:
             return "No relevant past session records found for this campaign."
         return "\n\n---\n\n".join(f"[{c.section}]\n{c.content}" for c in results)

@@ -109,11 +109,8 @@ def _store() -> CampaignStore:
 # which real testing showed OOM-killing under Docker Desktop's default
 # memory allocation anyway.
 _reranker = LLMJudgeReranker()
-_rules_store = RulesStore(settings.chroma_persist_dir, reranker=_reranker)
-_rules_store.load()  # opens the existing ChromaDB collection — without this, is_ready() is
-                      # permanently False and every search_rules call fails with "not ready",
-                      # silently undermining every "ground it via search_rules" instruction.
-_history_store = HistoryStore(settings.chroma_persist_dir, settings.ollama_base_url, reranker=_reranker)
+_rules_store = RulesStore(_engine, settings.ollama_base_url, reranker=_reranker)
+_history_store = HistoryStore(_engine, settings.ollama_base_url, reranker=_reranker)
 
 def _rules() -> RulesStore:
     return _rules_store
@@ -425,15 +422,14 @@ async def end_session(campaign_id: str, thread_id: str = Form(...)):
                 except Exception:
                     log.exception("Failed to record session-end relation %s -> %s for campaign %s", source_name, target_name, campaign_id)
 
-    # Fix 4: OllamaEmbeddings.embed_documents is a blocking httpx call — run it
-    # off the event loop. Fix 5: if Ollama is down, log and continue; the chronicle
-    # is already in Postgres and the route must not fail silently on retry.
+    # add_session is now natively async (pgvector/Postgres, not a blocking
+    # ChromaDB client) — no asyncio.to_thread wrapper needed. If Ollama is
+    # down, log and continue; the chronicle is already in Postgres and the
+    # route must not fail silently on retry.
     try:
-        await asyncio.to_thread(
-            lambda: _history().add_session(campaign_id, session.id, session_number, summary, key_events)
-        )
+        await _history().add_session(campaign_id, session.id, session_number, summary, key_events)
     except Exception:
-        log.exception("ChromaDB indexing failed for session %s (campaign %s); chronicle is safe in Postgres", session.id, campaign_id)
+        log.exception("Chronicle indexing failed for session %s (campaign %s); chronicle is safe in Postgres", session.id, campaign_id)
 
     return JSONResponse({
         "session_id": session.id,

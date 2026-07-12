@@ -1,10 +1,15 @@
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean, Column, Date, ForeignKey, Integer, MetaData, String, Table, Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, TSVECTOR, UUID
 
 metadata = MetaData()
+
+# nomic-embed-text's real output dimension — confirmed live against the
+# running Ollama instance (2026-07-12), not assumed from documentation.
+EMBEDDING_DIM = 768
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────
@@ -188,4 +193,52 @@ rolls = Table(
     Column("result",     Integer,                nullable=False),
     Column("breakdown",  Text,                   nullable=False),
     Column("rolled_at",  TIMESTAMP(timezone=True), nullable=False),
+)
+
+
+# ── Rules corpus (core rulebooks + adventures) ─────────────────────────────────
+# Replaces ChromaDB's "rules" collection (2026-07-12 migration — see design.md's
+# Tech Stack table and that date's migration plan for why: Chroma's own local
+# vector index needed ~2.6GB resident just to query a 441k-row collection,
+# independent of any keyword-index work; pgvector + native full-text search
+# consolidates both onto the one DB this app already uses for everything else).
+# Book-agnostic/campaign-agnostic — shared across every campaign, populated
+# offline by scripts/build_index.py. `embedding` is NULL for "parent" rows
+# (never embedded/searched directly, only fetched by id to expand a matched
+# child chunk back to its full section — see backend/stores/rules_store.py).
+rule_chunks = Table(
+    "rule_chunks", metadata,
+    Column("chunk_id",        Text, primary_key=True),  # deterministic content hash, build_index.py's _chunk_id
+    Column("book",            Text, nullable=False),
+    Column("section",         Text, nullable=False),
+    Column("source_type",     Text, nullable=False),      # "core" | "adventure"
+    Column("adventure",       Text, nullable=False, server_default=""),
+    Column("granularity",     Text, nullable=False),       # "child" | "parent"
+    Column("parent_chunk_id", Text, nullable=False, server_default=""),
+    Column("sequence_number", Integer, nullable=False, server_default="0"),
+    Column("content",         Text, nullable=False),
+    Column("embedding",       Vector(EMBEDDING_DIM), nullable=True),
+    Column("content_tsv",     TSVECTOR, nullable=True),  # GENERATED ALWAYS AS column, see migration 0004
+    # True once this row's embedding was computed from the contextualized
+    # (blurb-prefixed) text, not just the raw content — lets a later
+    # --recontextualize pass resume mid-corpus instead of redoing everything
+    # --force would. See migration 0005.
+    Column("contextualized",  Boolean, nullable=False, server_default="false"),
+)
+
+# ── Session chronicles (per-campaign play history) ─────────────────────────────
+# Replaces ChromaDB's "session_chronicles" collection. Fully regenerable from
+# Campaign.sessions (JSONB in `campaigns.data`) — see backend/stores/history_store.py.
+session_chronicle_chunks = Table(
+    "session_chronicle_chunks", metadata,
+    Column("chunk_id",       Text, primary_key=True),  # f"{session_id}::{event_type}::{i}"
+    Column("campaign_id",    UUID(as_uuid=False),
+           ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False),
+    Column("session_id",     Text, nullable=False),
+    Column("session_number", Integer, nullable=False),
+    Column("event_index",    Integer, nullable=False),
+    Column("event_type",     Text, nullable=False),      # "summary" | "key_event"
+    Column("content",        Text, nullable=False),
+    Column("embedding",      Vector(EMBEDDING_DIM), nullable=True),
+    Column("content_tsv",    TSVECTOR, nullable=True),
 )

@@ -128,19 +128,19 @@ def make_tools(
         response, so it can be verified. If retrieval is thin even after a
         reformulated re-try, this says so explicitly rather than padding the
         answer — treat that as a signal to abstain, not to guess."""
-        if not rules_store.is_ready():
+        if not await rules_store.is_ready():
             return "Rulebook index is not ready. Run build_index.py first, then restart the app."
 
         from backend.rag.grading import grade_sufficiency, reformulate_query
 
-        chunks = rules_store.search(query, books_in_play=books_in_play)
+        chunks = await rules_store.search(query, books_in_play=books_in_play)
         sufficient = grade_sufficiency(query, chunks)
         if not sufficient:
             # Bounded to exactly one retry — matches this app's universal
             # no-unbounded-retry discipline (see dm_agent.py's correction_count
             # /tool_error_count/lore_guardrail_count budgets).
             query2 = reformulate_query(query)
-            reretrieved = rules_store.search(query2, books_in_play=books_in_play, wide_k=50)
+            reretrieved = await rules_store.search(query2, books_in_play=books_in_play, wide_k=50)
             if reretrieved:
                 chunks = reretrieved
                 sufficient = grade_sufficiency(query2, chunks)

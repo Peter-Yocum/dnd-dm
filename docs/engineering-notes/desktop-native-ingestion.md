@@ -1,5 +1,14 @@
 # Running bulk ingestion natively on a second machine (e.g. a 3080 Ti desktop)
 
+> **2026-07-12: `merge-chroma`/`scripts/merge_chroma.py` referenced below are
+> obsolete** — the rules corpus moved from ChromaDB (a local file store) to
+> Postgres/pgvector (a real networked DB). If this machine can reach the
+> canonical machine's Postgres (same LAN, port 5432), just point `DATABASE_URL`
+> at it and run `ingest-book-native` directly — no merge step needed. See the
+> Makefile's `merge-chroma` target comment. The rest of this doc (OCR,
+> extraction, the no-Docker/no-virtualization rationale) is otherwise still
+> accurate.
+
 Context: the laptop runs live campaigns via Docker (`docker compose up`) and
 stays the one canonical place campaign/session data lives. A second machine
 can be used purely as an offline corpus-building appliance — OCR + reindex +

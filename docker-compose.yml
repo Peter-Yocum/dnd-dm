@@ -1,6 +1,15 @@
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 — same Postgres 16 as before (postgres:16-alpine),
+    # just with the pgvector extension pre-built in. No alpine tag exists for
+    # this image (checked directly), so this is Debian-based; the data volume
+    # format is unaffected either way. Needed for the rules/session-chronicle
+    # retrieval migration off ChromaDB — see design.md's Tech Stack table and
+    # the 2026-07-12 migration plan for why (Chroma's own local vector index
+    # needed ~2.6GB resident just to query a 441k-row collection, independent
+    # of any BM25/keyword-index work; pgvector consolidates vector + keyword
+    # search onto the one DB this app already uses for everything else).
+    image: pgvector/pgvector:pg16
     environment:
       # Local-dev-only credentials — this stack only ever binds to localhost.
       # Use real secrets (env vars / a secrets manager) for any non-local deploy.
@@ -32,20 +41,37 @@ services:
       db:
         condition: service_healthy
     volumes:
-      # Scoped, not a blanket `.:/app` — docs/raw (source PDFs) and
-      # docs/source/core (OCR'd core-book markdown) are never read by
-      # backend/ at runtime (only by the offline ingest scripts, which run
-      # natively via .venv now, not through this container — see
-      # docs/engineering-notes/nightly-ingestion-commands.md). Same for
-      # scripts/. docs/source/adventures IS needed live (main.py/
-      # rules_store.py/world_prep.py read adventure .md + _entities.json
-      # directly, not just through the Chroma index).
+      # Scoped, not a blanket `.:/app` — only docs/raw (source PDFs, needed
+      # solely by the native/pre-Docker OCR step) is excluded. `make index`/
+      # `reindex-full`/`recontextualize`/`backfill-*` all run scripts/
+      # in-container via `docker compose exec app python scripts/...` for the
+      # common case (this machine, moderate reindex), and build_index.py
+      # reads BOTH docs/source/core AND docs/source/adventures to do that —
+      # confirmed live, 2026-07-13: docs/source/core was missing from this
+      # list, so build_index.py silently saw zero core docs in-container
+      # while a --source-type core scoped run still ran its unconditional
+      # "delete existing core rows" step, net-deleting all core rule_chunks
+      # with nothing to replace them. Root cause was this list, not
+      # build_index.py's logic — same class of bug as the scripts/ mount
+      # gap below: an edit/config gap here silently diverges the container's
+      # view of the repo from disk, with no error, just wrong/missing data.
+      # scripts/ itself: confirmed live, 2026-07-12, with scripts/ NOT
+      # mounted, those targets silently ran whatever copy of scripts/ was
+      # baked into the image at the last `docker compose build`, so an
+      # edited script never took effect without a full rebuild (surfaced as
+      # writes silently landing nowhere during the ChromaDB->pgvector
+      # migration — the script ran, reported success, but against stale,
+      # pre-migration code). docs/source/adventures IS needed live too
+      # (main.py/rules_store.py/world_prep.py read adventure .md +
+      # _entities.json directly, not just through the rules index).
       - ./backend:/app/backend
+      - ./scripts:/app/scripts
       - ./static:/app/static
       - ./templates:/app/templates
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
-      - ./data:/app/data                          # chroma_db (+ its sqlite) and bm25 pickles
+      - ./data:/app/data
+      - ./docs/source/core:/app/docs/source/core
       - ./docs/source/adventures:/app/docs/source/adventures
       - ./tests:/app/tests                        # BDD-style tool-layer suite, see `make test`
       - ./pyproject.toml:/app/pyproject.toml       # pytest config (asyncio_mode, testpaths)

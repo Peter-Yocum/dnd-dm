@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-build_index.py — Chunk, contextualize, and embed docs/source/ into ChromaDB
-for hybrid (dense + BM25) RAG, with a parent/child chunk split.
+build_index.py — Chunk, contextualize, and embed docs/source/ into Postgres
+(rule_chunks, pgvector + native full-text search) for hybrid RAG, with a
+parent/child chunk split.
 
 Expected folder structure:
     docs/source/core/                       ← searched for every campaign
@@ -10,13 +11,14 @@ Expected folder structure:
 
 Each .md file is split on ## headers into PARENT sections (as before), and
 each parent is further split into smaller CHILD sub-chunks. Only children are
-embedded for dense search and indexed for BM25 (see backend/rag/hybrid.py);
-parents exist purely as an id-addressable lookup target so a search hit can
-be expanded to its full surrounding section (backend/stores/rules_store.py's
-search()). Every child chunk is contextualized before embedding — a short
-LLM-generated blurb is prepended to the text that gets EMBEDDED, but the
-chunk's stored/citable text (`documents` in Chroma, `.content` on RuleChunk)
-stays the raw, unmodified book text.
+embedded (dense, `embedding` column) and keyword-indexed (`content_tsv`,
+generated automatically — see backend/stores/tables.py); parents exist
+purely as an id-addressable lookup target so a search hit can be expanded to
+its full surrounding section (backend/stores/rules_store.py's search()).
+Every child chunk is contextualized before embedding — a short LLM-generated
+blurb is prepended to the text that gets EMBEDDED, but the chunk's stored/
+citable text (`content` in rule_chunks, `.content` on RuleChunk) stays the
+raw, unmodified book text.
 
 Metadata per chunk:
     book             — filename stem formatted as title
@@ -30,11 +32,11 @@ Metadata per chunk:
 
 Resumability (safe to Ctrl-C/kill and re-run without losing completed work
 or redoing it): before any embedding/contextualization work for a given
-chunk_id, this script checks whether that id already exists in the target
-Chroma collection and skips it if so (unless --force). Chroma's own
-persistent storage IS the completion tracker — no second cache file to keep
-in sync. Chunks are embedded and upserted in small batches (not buffered for
-a whole book), so a kill loses at most one small in-flight batch.
+chunk_id, this script checks whether that id already exists in rule_chunks
+and skips it if so (unless --force). The table itself IS the completion
+tracker — no second cache file to keep in sync. Chunks are embedded and
+upserted in small batches (not buffered for a whole book), so a kill loses
+at most one small in-flight batch.
 
 IMPORTANT — --wipe and resuming after a kill: --wipe clears the whole
 collection ONCE, then indexing proceeds with the resumable behavior above.
@@ -49,6 +51,10 @@ Usage:
     python build_index.py --adventure tyranny-of-dragons  # one adventure only
     python build_index.py --skip-contextualization  # fast dev path, no LLM calls
     python build_index.py --force                 # re-process even already-indexed chunk_ids
+    python build_index.py --recontextualize        # resumable: (re-)contextualize only rows
+                                                    # indexed with contextualized=false so far
+                                                    # (e.g. from a prior --skip-contextualization
+                                                    # run) — safe to Ctrl-C/kill and rerun
 
 Run inside the app container via:  make index  /  make reindex-full
 """
@@ -77,10 +83,8 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 DEFAULT_SOURCE  = "docs/source"
-DEFAULT_CHROMA  = "data/chroma_db"
 DEFAULT_OLLAMA  = "http://localhost:11434"
 DEFAULT_EMBED   = "nomic-embed-text"
-COLLECTION      = "rules"
 MAX_CHUNK_CHARS = 1500   # parent section cap
 CHILD_CHUNK_CHARS = 350  # child sub-chunk target size (dense/BM25 search target)
 CHUNK_OVERLAP_WORDS = 50 # trailing words carried into the next size-split part
@@ -182,11 +186,11 @@ def build_documents(source_dir: Path) -> list[dict]:
                 "source_type": source_type, "adventure": adventure,
                 "doc_id": doc_id, "sequence_number": ordinal,
             }
-            # chunk_id is duplicated into metadata (not just used as the
-            # Chroma document id) because langchain's similarity_search()
-            # returns Document objects with no id field — metadata is the
-            # only thing callers can read back, and Stage 2's citation
-            # checks need a real, round-trippable chunk_id.
+            # chunk_id is duplicated into meta (not just used as the "id"
+            # key/primary key) since _index_documents reads it straight out
+            # of meta when building each row for rule_chunks — keeps the dict
+            # self-contained rather than needing the caller to zip "id" back
+            # in separately.
             docs.append({
                 "id": parent_id, "text": parent_text,
                 "meta": {**base_meta, "granularity": "parent", "chunk_id": parent_id},
@@ -228,94 +232,49 @@ def build_documents(source_dir: Path) -> list[dict]:
     return docs
 
 
-# ── ChromaDB helpers ──────────────────────────────────────────────────────────
+# ── Postgres helpers (2026-07-12: replaced ChromaDB — see design.md) ─────────
+# content_tsv (keyword search) is a GENERATED ALWAYS AS column on rule_chunks
+# (see alembic/versions/0004_rules_and_chronicles_pgvector.py) — always in
+# sync with `content` automatically, so there is no separate rebuild step
+# here the way there used to be for the old BM25/FTS5 sidecar files.
 
-def _get_chroma(chroma_dir: str, ollama_url: str):
-    from langchain_chroma import Chroma
+def _get_engine():
+    from sqlalchemy import create_engine
 
-    from backend.llm import ollama_embeddings
-    return Chroma(
-        collection_name=COLLECTION,
-        embedding_function=ollama_embeddings(model=DEFAULT_EMBED, base_url=ollama_url, timeout=None),
-        persist_directory=chroma_dir,
-    )
-
-
-def _wipe_collection(chroma_dir: str) -> None:
-    import chromadb
-    client = chromadb.PersistentClient(path=chroma_dir)
-    try:
-        client.delete_collection(COLLECTION)
-        print(f"  Wiped '{COLLECTION}' collection.")
-    except Exception:
-        pass
+    from backend.config import settings
+    return create_engine(settings.database_url)
 
 
-def _delete_where(chroma_dir: str, where: dict) -> None:
-    import chromadb
-    client = chromadb.PersistentClient(path=chroma_dir)
-    try:
-        client.get_collection(COLLECTION).delete(where=where)
-    except Exception:
-        pass
+def _wipe_table(engine) -> None:
+    from backend.stores import tables as t
+
+    with engine.begin() as conn:
+        conn.execute(t.rule_chunks.delete())
+    print("  Wiped rule_chunks table.")
 
 
-_BM25_FETCH_PAGE_SIZE = 5_000  # chromadb's underlying SQLite store errors with
-# "too many SQL variables" on an unpaginated get() once a collection grows large
-# enough (confirmed live once the corpus passed ~250k+ child chunks across
-# several reindexed books) — page through with limit/offset instead of one
-# unbounded call.
+def _delete_where(engine, condition) -> None:
+    from backend.stores import tables as t
 
-
-def _rebuild_bm25(chroma_dir: str, ollama_url: str) -> None:
-    """Always rebuilt from the CURRENT full Chroma state, regardless of this
-    run's scope (--wipe/--adventure/--source-type) — cheap, pure CPU, avoids
-    a stale-BM25 bug class where a partial reindex forgets to refresh it.
-    Paginated (see _BM25_FETCH_PAGE_SIZE) since an unbounded get() over the
-    whole collection hits a real SQLite bound-variable limit once the corpus
-    is large."""
-    from backend.rag.hybrid import BM25Index
-
-    store = _get_chroma(chroma_dir, ollama_url)
-    ids: list[str] = []
-    texts: list[str] = []
-    metadatas: list[dict] = []
-    offset = 0
-    while True:
-        page = store._collection.get(
-            where={"granularity": {"$eq": "child"}},
-            limit=_BM25_FETCH_PAGE_SIZE, offset=offset,
-            include=["documents", "metadatas"],
-        )
-        page_ids = page.get("ids", [])
-        if not page_ids:
-            break
-        ids.extend(page_ids)
-        texts.extend(page.get("documents", []))
-        metadatas.extend(page.get("metadatas", []))
-        offset += len(page_ids)
-        if len(page_ids) < _BM25_FETCH_PAGE_SIZE:
-            break
-
-    bm25 = BM25Index.build(ids, texts, metadatas)
-    out_path = str(Path(chroma_dir).parent / "bm25_rules.pkl")
-    bm25.save(out_path)
-    print(f"  Rebuilt BM25 index — {len(ids)} child chunks — {out_path}")
+    with engine.begin() as conn:
+        conn.execute(t.rule_chunks.delete().where(condition))
 
 
 # ── indexing (resumable) ──────────────────────────────────────────────────────
 
 def _index_documents(
-    all_docs: list[dict], chroma_dir: str, ollama_url: str,
+    all_docs: list[dict], engine, ollama_url: str,
     skip_contextualization: bool, force: bool, context_model: str | None = None,
+    recontextualize: bool = False,
 ) -> None:
     from tqdm import tqdm
+    from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     from backend.llm import ollama_embeddings
     from backend.rag.contextualizer import ChunkContextualizer
+    from backend.stores import tables as t
 
-    store = _get_chroma(chroma_dir, ollama_url)
-    collection = store._collection
     embeddings_fn = ollama_embeddings(model=DEFAULT_EMBED, base_url=ollama_url, timeout=None)
     if skip_contextualization:
         contextualizer = None
@@ -333,7 +292,27 @@ def _index_documents(
         batch_ids = [d["id"] for d in batch]
 
         if not force:
-            existing = set(collection.get(ids=batch_ids).get("ids", []))
+            # --recontextualize resumability: a row that already exists but
+            # was indexed with contextualized=false (e.g. a prior
+            # --skip-contextualization run) still needs reprocessing — only
+            # skip rows that are already contextualized. A plain run just
+            # skips anything that exists at all, same as before.
+            with engine.connect() as conn:
+                if recontextualize:
+                    existing = {
+                        row.chunk_id for row in conn.execute(
+                            select(t.rule_chunks.c.chunk_id).where(
+                                t.rule_chunks.c.chunk_id.in_(batch_ids),
+                                t.rule_chunks.c.contextualized.is_(True),
+                            )
+                        )
+                    }
+                else:
+                    existing = {
+                        row.chunk_id for row in conn.execute(
+                            select(t.rule_chunks.c.chunk_id).where(t.rule_chunks.c.chunk_id.in_(batch_ids))
+                        )
+                    }
             batch = [d for d in batch if d["id"] not in existing]
 
         if batch:
@@ -350,13 +329,51 @@ def _index_documents(
                 else:
                     embed_texts.append(d["text"])
 
-            vectors = embeddings_fn.embed_documents(embed_texts)
-            collection.upsert(
-                ids=[d["id"] for d in batch],
-                embeddings=vectors,
-                documents=[d["text"] for d in batch],
-                metadatas=[d["meta"] for d in batch],
+            # Parent rows are never embedded/searched directly — no dense
+            # step needed for them, only children.
+            children_idx = [j for j, d in enumerate(batch) if d["meta"]["granularity"] == "child"]
+            child_vectors = embeddings_fn.embed_documents([embed_texts[j] for j in children_idx]) if children_idx else []
+            vectors_by_idx = dict(zip(children_idx, child_vectors))
+
+            rows = []
+            for j, d in enumerate(batch):
+                meta = d["meta"]
+                is_child = meta["granularity"] == "child"
+                rows.append({
+                    "chunk_id": d["id"],
+                    "book": meta["book"],
+                    "section": meta["section"],
+                    "source_type": meta["source_type"],
+                    "adventure": meta.get("adventure", ""),
+                    "granularity": meta["granularity"],
+                    "parent_chunk_id": meta.get("parent_chunk_id", ""),
+                    "sequence_number": meta.get("sequence_number", 0),
+                    "content": d["text"],
+                    "embedding": vectors_by_idx.get(j),
+                    # Parent rows are never contextualized (never embedded/
+                    # searched directly), so they're trivially "done" and
+                    # shouldn't be picked up by a --recontextualize pass.
+                    "contextualized": (contextualizer is not None) if is_child else True,
+                })
+
+            stmt = pg_insert(t.rule_chunks).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["chunk_id"],
+                set_={
+                    "content": stmt.excluded.content,
+                    "embedding": stmt.excluded.embedding,
+                    "book": stmt.excluded.book,
+                    "section": stmt.excluded.section,
+                    "source_type": stmt.excluded.source_type,
+                    "adventure": stmt.excluded.adventure,
+                    "granularity": stmt.excluded.granularity,
+                    "parent_chunk_id": stmt.excluded.parent_chunk_id,
+                    "sequence_number": stmt.excluded.sequence_number,
+                    "contextualized": stmt.excluded.contextualized,
+                },
             )
+            with engine.begin() as conn:
+                conn.execute(stmt)
 
         batch_size = len(batch_ids)
         indexed_count += len(batch)
@@ -369,9 +386,8 @@ def _index_documents(
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build the hybrid ChromaDB index from docs/source/.")
+    ap = argparse.ArgumentParser(description="Build the hybrid Postgres/pgvector rules index from docs/source/.")
     ap.add_argument("--source",      default=DEFAULT_SOURCE)
-    ap.add_argument("--chroma",      default=DEFAULT_CHROMA)
     ap.add_argument("--ollama-url",  default=None)
     ap.add_argument("--wipe",        action="store_true",
                      help="clear whole collection first — FIRST RUN ONLY; if interrupted, "
@@ -397,7 +413,24 @@ def main() -> None:
                           "unvalidated one, and smoke-test before trusting it for a long unattended run.")
     ap.add_argument("--force",       action="store_true",
                      help="re-process chunk_ids that already exist in the collection")
+    ap.add_argument("--recontextualize", action="store_true",
+                     help="resumable pass that (re-)runs LLM contextualization only on chunks not yet "
+                          "contextualized (contextualized=false — e.g. rows from a prior "
+                          "--skip-contextualization run), instead of skipping anything that merely "
+                          "exists. Safe to Ctrl-C/kill and re-run arbitrarily. Requires contextualization "
+                          "to be enabled (incompatible with --skip-contextualization) and is meaningless "
+                          "combined with --force (which already reprocesses everything unconditionally).")
     args = ap.parse_args()
+
+    if args.recontextualize and args.skip_contextualization:
+        print("--recontextualize requires LLM contextualization to be enabled — "
+              "it can't be combined with --skip-contextualization.")
+        sys.exit(1)
+
+    if args.recontextualize and args.force:
+        print("--recontextualize and --force are redundant with each other — --force already "
+              "reprocesses every chunk unconditionally, which includes recontextualizing. Pick one.")
+        sys.exit(1)
 
     if args.wipe and (args.adventure or args.book or args.source_type):
         print(
@@ -421,16 +454,29 @@ def main() -> None:
     # normalize the same way here so the same --book value works on both scripts.
     book_display_name = args.book.replace("-", " ").replace("_", " ").title() if args.book else None
 
-    if args.wipe:
-        _wipe_collection(args.chroma)
+    engine = _get_engine()
+    from backend.stores import tables as t
+
+    # --recontextualize is purely additive/resumable — it must never delete
+    # existing rows, even when scoped by --book/--adventure/--source-type.
+    # (2026-07-13 incident: this delete-where block ran unconditionally for
+    # a --recontextualize --source-type core invocation, and because
+    # docs/source/core wasn't mounted into the container at the time — see
+    # docker-compose.yml's comment — build_documents() found zero core docs
+    # afterward, net-deleting every core rule_chunks row with nothing to
+    # replace them.)
+    if args.recontextualize:
+        pass
+    elif args.wipe:
+        _wipe_table(engine)
     elif args.book:
-        _delete_where(args.chroma, {"book": {"$eq": book_display_name}})
+        _delete_where(engine, t.rule_chunks.c.book == book_display_name)
         print(f"  Removed existing chunks for book '{book_display_name}'.")
     elif args.adventure:
-        _delete_where(args.chroma, {"adventure": {"$eq": args.adventure}})
+        _delete_where(engine, t.rule_chunks.c.adventure == args.adventure)
         print(f"  Removed existing chunks for '{args.adventure}'.")
     elif args.source_type == "core":
-        _delete_where(args.chroma, {"source_type": {"$eq": "core"}})
+        _delete_where(engine, t.rule_chunks.c.source_type == "core")
         print(f"  Removed existing core chunks.")
 
     print(f"\nScanning {source_dir} …")
@@ -456,11 +502,13 @@ def main() -> None:
             d["_parent_text"] = parent_text_by_id.get(d["meta"].get("parent_chunk_id", ""), d["text"])
 
     print(f"\nIndexing {len(all_docs)} chunks (parent+child, resumable) …")
-    _index_documents(all_docs, args.chroma, ollama_url, args.skip_contextualization, args.force, args.context_model)
+    _index_documents(
+        all_docs, engine, ollama_url, args.skip_contextualization, args.force, args.context_model,
+        recontextualize=args.recontextualize,
+    )
 
-    _rebuild_bm25(args.chroma, ollama_url)
-
-    print(f"\nDone. {len(all_docs)} chunks in {args.chroma}/{COLLECTION}.")
+    print(f"\nDone. {len(all_docs)} chunks in rule_chunks. (content_tsv keyword-search index "
+          "updates automatically — no separate rebuild step.)")
 
 
 if __name__ == "__main__":

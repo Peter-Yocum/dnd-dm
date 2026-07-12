@@ -1,4 +1,4 @@
-.PHONY: up down build restart logs psql migrate migration rollback shell fresh index index-if-empty setup extract-lore reindex-full backfill-history-chunks eval-retrieval backfill-lore-links seed-relation-graph setup-venv ingest-book-native merge-chroma load-lore-json
+.PHONY: up down build restart logs psql migrate migration rollback shell fresh index index-if-empty setup extract-lore reindex-full backfill-history-chunks eval-retrieval backfill-lore-links seed-relation-graph setup-venv ingest-book-native merge-chroma load-lore-json test
 
 ## ── Services ──────────────────────────────────────────────────────────────────
 
@@ -41,6 +41,13 @@ psql:
 
 shell:
 	docker compose exec app bash
+
+## Run the BDD-style tool-layer test suite (tests/) inside the app container.
+## Runs against the same dev Postgres the app uses — no separate test DB —
+## every test cleans up its own scratch campaign row. Usage: make test
+## [k="expression"] to filter (pytest -k).
+test:
+	docker compose exec app python -m pytest -v $(if $(k),-k "$(k)",)
 
 ## Tear down all containers + volumes, start fresh, and run migrations.
 fresh:

@@ -47,6 +47,8 @@ services:
       - ./alembic.ini:/app/alembic.ini
       - ./data:/app/data                          # chroma_db (+ its sqlite) and bm25 pickles
       - ./docs/source/adventures:/app/docs/source/adventures
+      - ./tests:/app/tests                        # BDD-style tool-layer suite, see `make test`
+      - ./pyproject.toml:/app/pyproject.toml       # pytest config (asyncio_mode, testpaths)
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend
 
 volumes:

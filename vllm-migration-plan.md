@@ -1,11 +1,49 @@
 # vLLM-Metal Migration Plan: full backend swap, real forced tool-calling everywhere
 
-**Status:** Not started. This is a self-contained implementation plan — hand this whole
-file to a fresh Claude Code session to execute it; it doesn't assume any prior
+**Status:** Not started. Model swapped post-write (see note below) — the empirical spike
+this plan cites (§1) has NOT been re-run against the new model yet; do not proceed past
+§7.1 until §8's new Step 0 passes. This is a self-contained implementation plan — hand
+this whole file to a fresh Claude Code session to execute it; it doesn't assume any prior
 conversation context.
 
 **Prerequisite reading (optional but useful):** `docs/VERIFICATION.md` (this repo's
 manual, scenario-driven verification convention — no automated test suite, by design).
+
+**Model swap note (2026-07-13):** this plan was originally written and spiked against
+`mlx-community/gemma-4-26b-a4b-it-nvfp4` (§1's spike results). Decision since then:
+switch to **`mlx-community/Qwen3-30B-A3B-4bit`** instead — a mixture-of-experts model
+(30B total params, ~3B active per token), on the strength of outside research suggesting
+better tool-calling quality than Gemma4. This is a materially different architecture from
+the dense 26B model the spike actually measured, and changes two things the rest of this
+plan still assumes are settled:
+- **vllm-metal's Gemma4 "experimental tier" caveat (§1, §6) does not carry over.**
+  vllm-metal (the Apple-silicon vLLM plugin — narrower support matrix than mainline
+  vLLM) has its own, separately-tracked model support list, and MoE architectures
+  typically lag dense-model support in newer inference backends. Whether Qwen3's MoE
+  architecture (`Qwen3MoeForCausalLM` upstream) is supported at all yet is unverified —
+  check vllm-metal's current docs/changelog first, before installing anything.
+- **The `--tool-call-parser gemma4` value throughout §7.1/§9 is wrong for this model.**
+  Qwen3 uses a Hermes-style tool-call format, not Gemma's — the correct parser name
+  (likely `hermes`, possibly a dedicated `qwen3` parser depending on the installed vLLM
+  version) needs confirming against the real installed version's `--tool-call-parser`
+  choices (`vllm serve --help` or the vLLM docs for that version), not assumed from this
+  note.
+- **§1's 100/40 compliance result and the "~39% slower than Ollama" throughput number are
+  Gemma4-specific and do not transfer.** MoE's much smaller active-parameter count (~3B
+  vs. 26B dense) plausibly beats that throughput number, but that's a hypothesis, not a
+  measurement — §8's new Step 0 re-runs the same spike methodology
+  (`bench_tool_choice.py`) against the new model before anything here is trusted.
+- §4's resource math (weights only, no KV cache yet) is roughly a wash: Qwen3-30B-A3B at
+  4-bit is ~30.5B params × ~0.5 bytes/param ≈ 15-17GB, similar ballpark to Gemma4-26b's
+  17GB — but this hasn't been measured live either (no `--gpu-memory-utilization`
+  ceiling reported for this model the way the Gemma4 spike reported one). Re-measure,
+  don't assume parity.
+
+Every other file/line reference and design decision below (§2 through §7, minus the
+model-specific strings called out inline) is unaffected by the model choice — the
+`conclude_turn`/forcing design, the `backend/llm.py`-centralized client construction
+(confirmed current as of 2026-07-13 — see the implementation note in §7.4), and the
+guardrail-chain adaptation are all model-agnostic.
 
 **Revision note:** an earlier draft of this plan proposed a hybrid design (Ollama stays
 primary, vLLM-metal only backs the guardrail-retry path as a second always-resident
@@ -115,10 +153,10 @@ different client library and base URL.
 
 ### 3.1 One persistent vLLM-metal server, replacing Ollama for chat entirely
 
-Single long-lived vLLM-metal process serving `mlx-community/gemma-4-26b-a4b-it-nvfp4`
-(or whichever final checkpoint — see §7's open question on quantization choice),
-OpenAI-compatible, reached from every call site in §2's table. Ollama keeps running,
-but only for `nomic-embed-text`.
+Single long-lived vLLM-metal process serving `mlx-community/Qwen3-30B-A3B-4bit`
+(pending §8 Step 0's re-verification — see the model swap note at the top of this
+document), OpenAI-compatible, reached from every call site in §2's table. Ollama keeps
+running, but only for `nomic-embed-text`.
 
 ### 3.2 Force tool-calling on *every* mechanics call, not just retries — via a `conclude_turn` tool
 
@@ -220,13 +258,16 @@ scoped to `get_agent()`'s `mechanics_node`.
 Full swap changes this math for the better vs. the abandoned hybrid design — only one
 large model is ever resident, not two:
 
-- vLLM-metal: one instance, `mlx-community/gemma-4-26b-a4b-it-nvfp4`, self-claimed
-  ~25GB Metal ceiling in the spike (tunable down via `--gpu-memory-utilization`, per
-  the KV-cache error message vLLM printed when this was first tested — see the spike's
-  `results-gemma4-26b-nvfp4.txt` for the exact numbers that error surfaced).
+- vLLM-metal: one instance, `mlx-community/Qwen3-30B-A3B-4bit`. **Not yet measured live**
+  — the ~25GB Metal ceiling figure below this line was Gemma4-specific (self-claimed in
+  that spike, tunable via `--gpu-memory-utilization`). Rough estimate for Qwen3-30B-A3B
+  at 4-bit: ~30.5B params × ~0.5 bytes/param ≈ 15-17GB of weights alone, similar ballpark
+  to Gemma4-26b's 17GB — but this ignores KV cache overhead and hasn't been confirmed
+  against a real `--gpu-memory-utilization` ceiling the way the Gemma4 number was. Get a
+  real number during §8 Step 0, don't ship on this estimate.
 - Ollama: `nomic-embed-text` only, 274MB. Trivial, always-resident is fine.
 - Total on this 32GB Mac: comfortably fits without evicting anything, unlike the
-  abandoned hybrid design's 17GB+25GB math.
+  abandoned hybrid design's 17GB+25GB math — assuming the estimate above holds; confirm.
 
 **Still verify before shipping, because the *usage pattern* changed, not just the model
 count:** every one of §2's call sites now hits the same vLLM server — world-prep/
@@ -266,8 +307,9 @@ at all.
 | Risk | Mitigation |
 |---|---|
 | **No resident fallback if vLLM-metal goes down** — this is new and more serious than the abandoned hybrid design, which always had Ollama quietly still running. A vLLM crash/hang now takes down mechanics, narrator, world-prep, RAG grading/reranking — the whole app's LLM surface. | Real process supervision with auto-restart (`launchd` `KeepAlive` or equivalent — see §7's open question) is not optional here, unlike in the hybrid plan where it was just a latency nicety. Additionally: keep a **documented, manual, not-resident "break glass" procedure** — Ollama itself stays installed and `gemma4:26b-mlx` stays pulled (just not running); if vLLM-metal is down for an extended outage, a human can flip `settings`'s base URL back to Ollama and `ollama run gemma4:26b-mlx` to restore service within a couple minutes, at zero ongoing RAM cost while unused. This is different from the abandoned "always-warm fallback" — it costs nothing until the day it's actually needed. |
-| Gemma 4 is "experimental" tier in vllm-metal | Worked cleanly in the spike; re-verify after any vllm-metal version bump. Keep `bench_tool_choice.py` (already in `scripts/spikes/vllm_tool_choice/`) as a regression check to re-run post-upgrade. **More consequential now** than under the hybrid plan — this is the only backend, not a rarely-used escalation path. |
-| `nvfp4` isn't a documented-supported quantization | Worked once in the spike; if it breaks on a vllm-metal upgrade, fall back to a documented format from the same `mlx-community/gemma-4` collection (`-bf16`, `-8bit`, `-4bit` variants all exist) |
+| **Qwen3-30B-A3B's MoE architecture (`Qwen3MoeForCausalLM`) support in vllm-metal is completely unverified** — the Gemma4 spike only proved a dense model works; vllm-metal (narrower support matrix than mainline vLLM) may not support this architecture at all yet, or only partially. **Blocking, not just a caveat** — check before installing anything (§8 Step 0). | Check vllm-metal's current docs/changelog/issue tracker for Qwen3-MoE support first. If unsupported: either wait, or fall back to a dense Qwen3 variant (e.g. `Qwen3-14B`/`Qwen3-32B`, not `-A3B`) if tool-calling quality is the actual goal, or fall back to the already-benchmarked Gemma4 checkpoint from §1's original spike. |
+| Correct `--tool-call-parser` value for Qwen3 is unconfirmed — Qwen3 uses a Hermes-style tool-call format, not Gemma's `gemma4` parser this plan originally specified | Check the installed vLLM version's `vllm serve --help` / docs for its actual supported parser names (likely `hermes`, possibly a dedicated `qwen3` parser in newer versions) before serving — confirm during §8 Step 0, don't guess from this note. |
+| Qwen3-30B-A3B-4bit's MLX quantization format support in vllm-metal is unverified (mirrors the old `nvfp4`-isn't-documented risk, different model) | Confirm during §8 Step 0; if it breaks, fall back to another quantization/size in the same `mlx-community/Qwen3` collection, or reconsider the dense (non-MoE) variants noted above. |
 | `conclude_turn` design has an unknown gap (e.g. the model calls it alongside other real tool calls in the same response, against the "should be the only call" assumption in §3.2) | Handle defensively: if `conclude_turn` appears alongside other tool calls in one response, treat it as a real-tool-calls response (route to `"tools"` as normal) and log a warning — don't silently drop the other calls or silently trust `conclude_turn`'s notes while other calls are still pending execution. Verify this case explicitly during testing (§8), don't just assume it won't happen. |
 | Universal forcing surfaces a NEW failure mode: the model spamming trivial/wrong tool calls just to satisfy `tool_choice="required"` when it genuinely has nothing to do (e.g. pure roleplay, an out-of-combat question) | Watch for this specifically in early live testing — this exact scenario (a turn with no game-mechanics need) is common outside combat, and `conclude_turn` should be the model's obvious/only reasonable choice there, but confirm it behaves that way rather than, say, calling `roll_dice` pointlessly. If this happens, the fix is prompting (tell the model explicitly when `conclude_turn` alone is the right call), not backing off the forcing. |
 | vLLM handling all app traffic surfaces concurrency contention not present before | §4's "still verify" paragraph — real check during rollout, not assumed away |
@@ -292,12 +334,14 @@ this plan's writing — re-check before editing, they will have shifted.
   once decided:
   ```
   source ~/.venv-vllm-metal/bin/activate
-  vllm serve mlx-community/gemma-4-26b-a4b-it-nvfp4 \
+  vllm serve mlx-community/Qwen3-30B-A3B-4bit \
     --port 8100 \
     --enable-auto-tool-choice \
-    --tool-call-parser gemma4 \
+    --tool-call-parser <CONFIRM — likely "hermes" or a dedicated "qwen3" parser, NOT
+                         "gemma4" — check `vllm serve --help` / docs for the installed
+                         version's actual supported parser names before running this> \
     --max-model-len <VALUE — size against real dm_agent.py usage, see _MAX_MESSAGES=100> \
-    --gpu-memory-utilization <VALUE — tune per §4>
+    --gpu-memory-utilization <VALUE — tune per §4, re-measured for this model>
   ```
 - Add a startup health-check (`curl -s http://localhost:8100/v1/models` returning 200)
   that the app itself checks at boot, since there's no Ollama fallback to silently work
@@ -316,7 +360,7 @@ forwards `tool_choice` into the request body, the way `langchain_ollama` famousl
 **not**:
 ```python
 from langchain_openai import ChatOpenAI
-model = ChatOpenAI(base_url="http://localhost:8100/v1", api_key="unused", model="mlx-community/gemma-4-26b-a4b-it-nvfp4")
+model = ChatOpenAI(base_url="http://localhost:8100/v1", api_key="unused", model="mlx-community/Qwen3-30B-A3B-4bit")
 bound = model.bind_tools([...], tool_choice="required")
 print(bound.kwargs)  # confirm 'tool_choice' key is actually present, not silently dropped
 ```
@@ -328,13 +372,29 @@ Replace/extend the Ollama-specific settings with a vLLM equivalent, keeping
 ```python
 vllm_base_url: str = "http://localhost:8100/v1"  # host.docker.internal in the app
                                                     # container, per docker-compose.yml
-mechanics_model: str = "mlx-community/gemma-4-26b-a4b-it-nvfp4"  # now the vLLM-served
-                                                                    # model name, not an
-                                                                    # Ollama tag
+mechanics_model: str = "mlx-community/Qwen3-30B-A3B-4bit"  # now the vLLM-served model
+                                                              # name, not an Ollama tag —
+                                                              # must exactly match the
+                                                              # name `vllm serve` was
+                                                              # given in §7.1
 ```
 Naming is a placeholder — match this file's existing style when implementing.
 
 ### 7.4 `backend/agent/dm_agent.py` changes
+
+**Implementation note (2026-07-13, post-write):** this section still describes the
+construction sites as scattered `ChatOllama(...)` calls, as they were when this plan was
+first written. Since then, `backend/llm.py` was added as the single construction point
+for every Ollama client in the app (`ollama_chat()`/`ollama_embeddings()`) — confirmed
+live: `_get_model()`, `_get_mechanics_model()`, `_get_narrator_model()`
+(`backend/agent/dm_agent.py`), and all of `backend/rag/contextualizer.py`,
+`backend/rag/grading.py`, `backend/rag/reranker.py` now call `ollama_chat(...)` from
+that module rather than constructing `ChatOllama` directly. **This makes §2's swap
+simpler than described below**: add one new `vllm_chat()` (or equivalent) factory to
+`backend/llm.py` mirroring `ollama_chat()`'s signature/cross-cutting policy (minus the
+Ollama-specific `reasoning`/`keep_alive` kwargs, plus whatever vLLM/`ChatOpenAI`
+equivalents apply), then repoint the ~4 call sites at it — no need to touch
+`contextualizer.py`/`grading.py`/`reranker.py` individually beyond that.
 
 - **`_get_model()` (line 134), `_get_mechanics_model()` (line 181),
   `_get_narrator_model()` (line 199)**: swap `ChatOllama(...)` for
@@ -383,17 +443,38 @@ line — a new env var (`VLLM_BASE_URL` or whatever §7.3 settles on) pointed at
 Follow `docs/VERIFICATION.md`'s existing convention (no automated test suite by
 design — manual, scenario-driven, check real state not narration).
 
+0. **NEW, BLOCKING — re-run §1's spike against `mlx-community/Qwen3-30B-A3B-4bit` before
+   doing anything else in this plan.** The 100/40 compliance result and throughput number
+   §1 cites are Gemma4-specific and do not transfer to this MoE model (see the model
+   swap note at the top of this document). Concretely:
+   - Confirm vllm-metal actually loads a Qwen3-MoE checkpoint at all (§6's new top risk
+     row) before investing time in anything downstream of this.
+   - Determine the correct `--tool-call-parser` value for this model (§7.1's `<CONFIRM>`
+     placeholder) from the installed vLLM version's own docs/`--help`, not by guessing.
+   - Re-run `scripts/spikes/vllm_tool_choice/bench_tool_choice.py` (or an updated
+     equivalent) against it with `tool_choice="required"` — confirm compliance holds,
+     and get a real throughput number for this model/quantization/hardware combination.
+   - Get a real `--gpu-memory-utilization` ceiling reading (§4), replacing the untested
+     15-17GB estimate.
+   - If any of the above fails or comes back materially worse than Gemma4's spiked
+     numbers, that's a real decision point — fall back to the already-verified Gemma4
+     checkpoint (§1) rather than proceeding on an unverified model. Don't let sunk
+     research-report enthusiasm override what the spike actually shows.
 1. **§4's resource check** — confirm vLLM-metal alone (tuned `--gpu-memory-utilization`/
    `--max-model-len`) fits comfortably, and do a real concurrency smoke test (a
    background world-prep-shaped call + a live mechanics-shaped call close together) —
    this app never had to worry about this under the old per-role-backend architecture.
 2. **`conclude_turn` wiring** — before any live-model testing, a deterministic check
-   (extend `scripts/check_retry_tool_narrowing.py`, which already validates the narrowed
-   tool sets) confirming: `conclude_turn` is excluded from every `_RETRY_TOOLS_*` set,
-   and is present in the full/normal tool binding.
+   confirming `conclude_turn` is present in the full/normal tool binding. (The
+   `_RETRY_TOOLS_*`/`scripts/check_retry_tool_narrowing.py` guardrail-retry-narrowing
+   feature this step originally referenced was a separate, since-descoped piece of work
+   — it does not exist in this codebase as of this plan's model-swap revision. If it
+   gets ported later, extend this step to also confirm `conclude_turn` is excluded from
+   every `_RETRY_TOOLS_*` set, per §3.3.)
 3. **Re-run `scripts/spikes/vllm_tool_choice/bench_tool_choice.py`** against the real
-   persistent service from §7.1 (not the spike's ad-hoc server) — confirm 100%
-   compliance holds under the actual deployed config.
+   persistent service from §7.1 (not Step 0's ad-hoc server) — confirm 100% compliance
+   still holds under the actual deployed config (port, flags, process supervision), not
+   just Step 0's one-off check.
 4. **`conclude_turn` edge case** (§6's risk table) — deliberately construct a scenario
    where a real tool call and `conclude_turn` could both seem plausible in one response;
    confirm the app's defensive handling (§6) behaves as designed, not just in the common
@@ -419,6 +500,11 @@ design — manual, scenario-driven, check real state not narration).
 
 ## 9. Open questions to resolve during implementation
 
+- **New, from the model swap:** whether vllm-metal supports Qwen3-MoE at all, and the
+  correct `--tool-call-parser` value for it — both resolved by §8 Step 0, not here.
+- **New, from the model swap:** if Step 0 fails or underperforms, whether to fall back to
+  the already-verified Gemma4 checkpoint (§1) or try a dense (non-MoE) Qwen3 size
+  instead — a real decision, not pre-answered by this plan.
 - Exact `--gpu-memory-utilization` / `--max-model-len` values from §4/§7.1 — fill in
   once measured against real `dm_agent.py` usage patterns (see `_MAX_MESSAGES = 100`).
 - Final process-supervision mechanism for §7.1 (`launchd` plist vs. something else) —

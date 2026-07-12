@@ -38,17 +38,23 @@ tracker — no second cache file to keep in sync. Chunks are embedded and
 upserted in small batches (not buffered for a whole book), so a kill loses
 at most one small in-flight batch.
 
-IMPORTANT — --wipe and resuming after a kill: --wipe clears the whole
-collection ONCE, then indexing proceeds with the resumable behavior above.
-If a --wipe run is interrupted, resume with a PLAIN run (no --wipe) — NOT by
-repeating --wipe, which would destroy the progress already saved. See `make
-index` vs `make reindex-full` in the Makefile.
+IMPORTANT — --wipe/--fresh and resuming after a kill: a scoped run
+(--book/--adventure/--source-type) is INCREMENTAL by default — existing rows
+in that scope are left alone, only missing chunk_ids get added, so re-running
+the same scoped command after a crash is cheap and safe. --wipe (whole
+collection) and --fresh (just the current scope) both delete existing rows
+FIRST, ONCE, before indexing proceeds with the resumable behavior above — use
+either only for a genuine rebuild (e.g. after a chunking-schema change), never
+to resume an interrupted run, since repeating either would destroy progress
+already saved. See `make index` vs `make reindex-full` in the Makefile.
 
 Usage:
     python build_index.py                        # index everything (resumable)
-    python build_index.py --wipe                  # FIRST run only: clear collection, then index
-    python build_index.py --source-type core      # core books only
-    python build_index.py --adventure tyranny-of-dragons  # one adventure only
+    python build_index.py --wipe                  # full rebuild only: clear collection, then index
+    python build_index.py --source-type core      # core books only (incremental)
+    python build_index.py --adventure tyranny-of-dragons  # one adventure only (incremental)
+    python build_index.py --adventure tyranny-of-dragons --fresh  # same, but wipe that
+                                                    # adventure's rows first (schema change, etc.)
     python build_index.py --skip-contextualization  # fast dev path, no LLM calls
     python build_index.py --force                 # re-process even already-indexed chunk_ids
     python build_index.py --recontextualize        # resumable: (re-)contextualize only rows
@@ -399,6 +405,19 @@ def main() -> None:
                           "(same value you'd pass to extract_entities.py --book --source-type core), "
                           "e.g. --book \"D&D 5E - Monster Manual\". Adventures already have "
                           "per-adventure granularity via --adventure; this fills the same gap for core/.")
+    ap.add_argument("--fresh",       action="store_true",
+                     help="delete this run's scoped existing chunks (--book/--adventure/"
+                          "--source-type core) before reindexing — use after a chunking-schema "
+                          "change. Default is incremental: existing chunk_ids are left alone and "
+                          "only missing ones get added, so re-running the same scoped command (e.g. "
+                          "to resume after a crash) is cheap and doesn't refetch/re-embed "
+                          "everything. Requires one of --book/--adventure/--source-type — for a "
+                          "full unscoped rebuild use --wipe instead. (2026-07-13: a scoped run "
+                          "used to delete its scope's existing rows unconditionally, with no way "
+                          "to opt out — this flag makes that an explicit choice instead of the "
+                          "default, after an incident where a scoped run silently found zero docs "
+                          "to reindex, due to an unrelated Docker mount gap, and deleted a whole "
+                          "book's rows with nothing to replace them.)")
     ap.add_argument("--skip-contextualization", action="store_true",
                      help="fast dev path: skip the LLM contextualization pass entirely")
     ap.add_argument("--context-model", default=None,
@@ -442,6 +461,20 @@ def main() -> None:
         )
         sys.exit(1)
 
+    if args.fresh and args.wipe:
+        print("--fresh is redundant with --wipe — --wipe already clears everything unconditionally.")
+        sys.exit(1)
+
+    if args.fresh and not (args.book or args.adventure or args.source_type == "core"):
+        print("--fresh has nothing to scope to — combine it with --book/--adventure/"
+              "--source-type core, or use --wipe for a full unscoped rebuild.")
+        sys.exit(1)
+
+    if args.fresh and args.recontextualize:
+        print("--fresh deletes rows outright; --recontextualize is purely additive/resumable. "
+              "These are contradictory — pick one.")
+        sys.exit(1)
+
     ollama_url = args.ollama_url or os.environ.get("OLLAMA_BASE_URL") or DEFAULT_OLLAMA
     source_dir = Path(args.source)
 
@@ -457,25 +490,24 @@ def main() -> None:
     engine = _get_engine()
     from backend.stores import tables as t
 
-    # --recontextualize is purely additive/resumable — it must never delete
-    # existing rows, even when scoped by --book/--adventure/--source-type.
-    # (2026-07-13 incident: this delete-where block ran unconditionally for
-    # a --recontextualize --source-type core invocation, and because
-    # docs/source/core wasn't mounted into the container at the time — see
-    # docker-compose.yml's comment — build_documents() found zero core docs
-    # afterward, net-deleting every core rule_chunks row with nothing to
-    # replace them.)
-    if args.recontextualize:
-        pass
-    elif args.wipe:
+    # A scoped run (--book/--adventure/--source-type) is incremental by default
+    # — it never deletes existing rows, only --wipe (full, unscoped) or --fresh
+    # (scoped, explicit opt-in) do. (2026-07-13 incident: a scoped run used to
+    # delete its scope's existing rows unconditionally, no opt-out — that run
+    # happened to combine with docs/source/core not being mounted into the
+    # container yet, see docker-compose.yml's comment, so build_documents()
+    # found zero core docs afterward and net-deleted every core rule_chunks
+    # row with nothing to replace them. --fresh makes deletion an explicit
+    # choice instead of scoping's default behavior.)
+    if args.wipe:
         _wipe_table(engine)
-    elif args.book:
+    elif args.fresh and args.book:
         _delete_where(engine, t.rule_chunks.c.book == book_display_name)
         print(f"  Removed existing chunks for book '{book_display_name}'.")
-    elif args.adventure:
+    elif args.fresh and args.adventure:
         _delete_where(engine, t.rule_chunks.c.adventure == args.adventure)
         print(f"  Removed existing chunks for '{args.adventure}'.")
-    elif args.source_type == "core":
+    elif args.fresh and args.source_type == "core":
         _delete_where(engine, t.rule_chunks.c.source_type == "core")
         print(f"  Removed existing core chunks.")
 

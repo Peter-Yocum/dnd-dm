@@ -59,25 +59,28 @@ fresh:
 	done
 	@echo " done."
 
-## Build/refresh the ChromaDB vector index (chunk + contextualize + hybrid
-## BM25 index) from docs/source/*.md inside the container. Resumable: safe
-## to Ctrl-C/kill and re-run — already-indexed chunk_ids are detected via
-## Chroma itself and skipped, so a re-run only does remaining work. This is
-## also the correct way to RESUME an interrupted `make reindex-full` — do
-## NOT repeat reindex-full itself, which would re-wipe and lose progress.
-## Scope to one book at a time with adventure= (adventure folder slug) or
-## book= (core rulebook, exact filename stem) + source_type=core — the
-## recommended nightly workflow: one book, delete-then-rebuild just that
-## book's chunks, never blacks out search for anything else. skip_context=1
-## skips the LLM contextualization pass (fast dev path).
+## Build/refresh the Postgres/pgvector rules index from docs/source/*.md
+## inside the container. Resumable: safe to Ctrl-C/kill and re-run —
+## already-indexed chunk_ids are skipped, so a re-run only does remaining
+## work. This is also the correct way to RESUME an interrupted `make
+## reindex-full` — do NOT repeat reindex-full itself, which would re-wipe and
+## lose progress. Scope to one book at a time with adventure= (adventure
+## folder slug) or book= (core rulebook, exact filename stem) + source_type=core.
+## Incremental by default (existing chunks in scope are left alone); pass
+## fresh=1 to delete that scope's existing chunks first (only needed after a
+## chunking-schema change — see build_index.py --fresh's help for why this
+## isn't the default). skip_context=1 skips the LLM contextualization pass
+## (fast dev path).
 ## Usage: make index adventure="Curse of Strahd"
 ##        make index book="D&D 5E - Monster Manual" source_type=core
+##        make index book="D&D 5E - Monster Manual" source_type=core fresh=1
 index:
 	docker compose exec app python scripts/build_index.py \
 		$(if $(adventure),--adventure "$(adventure)",) \
 		$(if $(book),--book "$(book)",) \
 		$(if $(source_type),--source-type "$(source_type)",) \
-		$(if $(skip_context),--skip-contextualization,)
+		$(if $(skip_context),--skip-contextualization,) \
+		$(if $(fresh),--fresh,)
 
 ## One-time full corpus rebuild under the parent/child + contextual-
 ## augmentation chunk schema. Expect a long multi-hour/multi-day first run
@@ -97,13 +100,14 @@ reindex-full:
 ## Usage: make ingest-book adventure="Curse of Strahd"
 ##        make ingest-book book="D&D 5E - Monster Manual" source_type=core kinds=monster
 ingest-book:
-	@test -n "$(adventure)$(book)" || (echo "Usage: make ingest-book adventure=\"Name\" OR book=\"Core Book\" source_type=core [kinds=...] [skip_context=1]" && exit 1)
+	@test -n "$(adventure)$(book)" || (echo "Usage: make ingest-book adventure=\"Name\" OR book=\"Core Book\" source_type=core [kinds=...] [skip_context=1] [fresh=1]" && exit 1)
 	@echo "=== [1/2] Reindexing: $(or $(adventure),$(book)) ==="
 	docker compose exec app python scripts/build_index.py \
 		$(if $(adventure),--adventure "$(adventure)",) \
 		$(if $(book),--book "$(book)",) \
 		$(if $(source_type),--source-type "$(source_type)",) \
-		$(if $(skip_context),--skip-contextualization,)
+		$(if $(skip_context),--skip-contextualization,) \
+		$(if $(fresh),--fresh,)
 	@echo "=== [2/2] Extracting lore/monsters: $(or $(adventure),$(book)) ==="
 	docker compose exec app python scripts/extract_entities.py --write-postgres \
 		--book "$(or $(adventure),$(book))" \
@@ -239,14 +243,15 @@ endif
 ## help for why NOT to silently fall back to the Docker default here).
 ## Usage: make ingest-book-native book="D&D 5.5E - Player's Handbook" source_type=core context_model=gemma4:e4b model=gemma4:e4b
 ingest-book-native:
-	@test -n "$(adventure)$(book)" || (echo "Usage: make ingest-book-native adventure=\"Name\" OR book=\"Core Book\" source_type=core [kinds=...] [context_model=...] [model=...] [write_postgres=1]" && exit 1)
+	@test -n "$(adventure)$(book)" || (echo "Usage: make ingest-book-native adventure=\"Name\" OR book=\"Core Book\" source_type=core [kinds=...] [context_model=...] [model=...] [write_postgres=1] [fresh=1]" && exit 1)
 	@echo "=== [1/2] Reindexing (native): $(or $(adventure),$(book)) ==="
 	./.venv/bin/python scripts/build_index.py \
 		$(if $(adventure),--adventure "$(adventure)",) \
 		$(if $(book),--book "$(book)",) \
 		$(if $(source_type),--source-type "$(source_type)",) \
 		$(if $(context_model),--context-model "$(context_model)",) \
-		$(if $(skip_context),--skip-contextualization,)
+		$(if $(skip_context),--skip-contextualization,) \
+		$(if $(fresh),--fresh,)
 	@echo "=== [2/2] Extracting lore/monsters (native): $(or $(adventure),$(book)) ==="
 	./.venv/bin/python scripts/extract_entities.py \
 		--book "$(or $(adventure),$(book))" \

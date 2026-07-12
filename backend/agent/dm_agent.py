@@ -50,7 +50,8 @@ from backend.llm import ollama_chat
 from backend.locks import campaign_write_lock
 from backend.models import Campaign, CombatantType, InitiativeEntry
 from backend.agent.prompts import (
-    OOC_MARKER, VERIFIED_ROLLS_MARKER, get_mechanics_system_prompt, get_narrator_system_prompt,
+    OOC_MARKER, VERIFIED_CHANGES_MARKER, VERIFIED_ROLLS_MARKER, get_mechanics_system_prompt,
+    get_narrator_system_prompt,
 )
 from backend.agent.session_zero_prompt import get_session_zero_mechanics_prompt, get_session_zero_narrator_prompt
 from backend.stores.campaign_store import CampaignStore
@@ -644,6 +645,64 @@ def _verified_rolls_note(scratch: list[BaseMessage], tools: set[str] = _VERIFIED
         + "\n".join(f"- {r}" for r in rolls)
     )
 
+# Read-only/lookup tools — the ONLY tools excluded from the verified-state-
+# changes capture below. Deliberately an exclusion list rather than an
+# allowlist of mutating tools: every mutating tool in backend/tools/*.py
+# already belongs in the capture (its return string is the real, deterministic
+# fact — an HP total, an item grant, an encounter closing), and a new tool
+# added later is far more likely to mutate state than to be a pure lookup, so
+# defaulting new tools INTO the capture is the safe direction for this list to
+# be wrong in. An allowlist defaults new tools OUT, silently recreating the
+# exact "narrated but not verified" hole this mechanism exists to close (see
+# _verified_state_changes_note's docstring for the incident that motivated
+# generalizing this beyond dice rolls).
+_LOOKUP_ONLY_TOOLS = {
+    "get_party_status", "get_character", "get_unassigned_loot", "get_npc",
+    "get_campaign_summary", "get_active_quests", "search_campaign_history",
+    "search_rules", "search_adventure_literal", "lookup_entity", "search_lore",
+    "get_current_location", "get_travel_estimate",
+}
+
+_STATE_CHANGE_EXCLUDE_TOOLS = _VERIFIED_ROLL_TOOLS | _LOOKUP_ONLY_TOOLS
+
+
+def _verified_state_changes_note(scratch: list[BaseMessage]) -> str:
+    """The VERIFIED_CHANGES_MARKER block appended to a mechanics resolution
+    report: verbatim tool output for every NON-roll mutation this turn — HP,
+    conditions, items, currency, encounter open/close, NPC/quest state, and
+    so on. Generalizes _verified_rolls_note's proven pattern (verbatim tool
+    output as the narrator's only ground truth, instead of trusting the
+    mechanics model's own free-text notes) beyond dice specifically.
+
+    Motivating incident, 2026-07-12: the mechanics model narrated Tarvokk
+    executing three bound, captured goblins — flavor 🎲 dice text and all —
+    with no update_monster_hp call behind it. The narrator, which has no
+    tools and cannot check anything, dutifully wrote prose describing three
+    deaths that never happened; the campaign's real state still had all
+    three goblins alive days later. A regex guardrail
+    (_detect_missing_monster_death_followup) now also nudges the mechanics
+    model to make the call in the first place, but that's a retry budget of
+    one per player turn — this note is the backstop for when that retry
+    doesn't land: the narrator is instructed (see prompts.py) to only
+    confirm a mechanical outcome that actually appears here, so even an
+    unfixed fabrication in the mechanics model's own notes can't reach the
+    player as if it were real."""
+    changes = [
+        _extract_text(m.content) for m in scratch
+        if isinstance(m, ToolMessage) and m.content and m.name not in _STATE_CHANGE_EXCLUDE_TOOLS
+    ]
+    if not changes:
+        return ""
+    return (
+        f"\n\n{VERIFIED_CHANGES_MARKER} (exact tool output — ground truth for "
+        "every non-roll mechanical change this turn: HP, conditions, items, "
+        "currency, encounter status, and similar. Never narrate a mechanical "
+        "outcome — a death, an item gained, combat ending — that isn't listed "
+        "here, and never alter these facts when writing prose):\n"
+        + "\n".join(f"- {c}" for c in changes)
+    )
+
+
 _COMBAT_ROLL_MENTION_RE = re.compile(
     r"\battack roll\b|\bdamage roll\b|\bsaving throw\b|\brolls?\s+(?:to hit|damage)\b|"
     r"\b\d+\s*(?:slashing|piercing|bludgeoning|fire|cold|lightning|acid|poison|psychic|"
@@ -727,23 +786,38 @@ _LOOT_TOOLS = {
 # add_item_to_character call because no word here matched.
 _LOOT_GAIN_VERBS = (
     r"gains?|receives?|finds?|found|discovers?|discovered|recovers?|retrieves?|"
-    r"grabs?|snatch(?:es)?|takes?|strips?|pockets?|picks?\s+up|hands?\s+over"
+    r"grabs?|snatch(?:es)?|takes?|strips?|pockets?|picks?\s+up|hands?\s+over|"
+    r"claims?|stows?|packs?\s+away|tucks?\s+away"
 )
 # Mundane gear nouns so a plain pickup/handoff of ordinary equipment (not just
 # currency/treasure/a magic item) still trips the guardrail.
-_MUNDANE_GEAR_NOUNS = r"sword|shortsword|longsword|greatsword|dagger|blade|weapon|pouch|ring|coins?|purse"
+_MUNDANE_GEAR_NOUNS = (
+    r"sword|shortsword|longsword|greatsword|dagger|blade|weapon|pouch|ring|coins?|purse|"
+    r"bow|shortbow|longbow|crossbow|quiver|arrows?|bolts?|key|whetstone|rations?|meat|"
+    r"scroll|potion|gem|amulet|cloak|wand|staff|rod|shield|armor|helm|helmet|boots|gloves|"
+    r"cape|belt|bracers?|torch|lantern|rope|tool|kit|instrument|trinket|coin|treasure|"
+    r"satchel|bag|sack|case|chest|box|crate|coffer|backpack|pack|contents?"
+)
 
 _LOOT_MENTION_RE = re.compile(
     r"\b\d+\s*(?:gp|sp|cp|pp|ep)\b"
     r"|\b(?:gold|silver|copper|platinum|electrum)\s+pieces?\b"
     rf"|\b(?:{_LOOT_GAIN_VERBS})\b[^.]{{0,40}}\b"
-    rf"(?:gp|gold|coin|coins|treasure|gem|item|{_MUNDANE_GEAR_NOUNS})\b"
+    rf"(?:gp|gold|coin|coins|treasure|gem|item|loot|{_MUNDANE_GEAR_NOUNS})\b"
+    r"|\bloot\s*:"
     # Magic item shape ("+1 Longsword", "+2 studded leather armor") — a bonus
     # followed by either a capitalized name or a common equipment noun, not
     # just any word, so an unrelated "+5 to his attack roll" doesn't match.
     r"|\+\d+\s+(?:(?-i:[A-Z]\w*)|studded|leather|chain|plate|scale|splint|banded|hide|"
     r"padded|longsword|shortsword|greatsword|dagger|mace|axe|hammer|bow|armor|"
-    r"shield|ring|wand|staff|rod|amulet|cloak|boots|gloves|potion|scroll)\b",
+    r"shield|ring|wand|staff|rod|amulet|cloak|boots|gloves|potion|scroll)\b"
+    # Plain item grant with no numeric prefix ("Tarvokk: +Crude Iron Key",
+    # "+Small Whetstone") — the resolution-report convention (prompts.py's
+    # "Sir Valiant: +3 gp" / "Mira Swiftfoot: +1 Ancient Sunburst Coin"
+    # examples) doesn't actually require a leading digit for a non-currency
+    # item, so a "+ItemName" grant with no number slipped past the
+    # digit-anchored magic-item branch above entirely.
+    r"|\+\s*(?-i:[A-Z])\w*(?:\s+(?-i:[A-Z])\w*){0,3}\b",
     re.IGNORECASE,
 )
 
@@ -772,9 +846,57 @@ def _detect_missing_loot_followup(notes: str, called: set[str]) -> str | None:
     )
 
 
+_KILL_VERBS = (
+    r"kills?|killed|slays?|slew|slain|executes?|executed|finishes?\s+off|finished\s+off|"
+    r"slits?\s+(?:his|her|their|its)\s+throat|slit\s+(?:his|her|their|its)\s+throat|"
+    r"dies?|died|dead|dispatche[sd]|puts?\s+(?:him|her|them|it)\s+down|put\s+(?:him|her|them|it)\s+down"
+)
+
+_MONSTER_DEATH_MENTION_RE = re.compile(rf"\b(?:{_KILL_VERBS})\b", re.IGNORECASE)
+
+_MONSTER_DEATH_TOOLS = {"update_monster_hp", "resolve_attack", "end_encounter"}
+
+
+def _detect_missing_monster_death_followup(notes: str, called: set[str]) -> str | None:
+    """Catches the mechanics model's own resolution report narrating a
+    monster's death (a killing blow, or executing/finishing off an
+    already-helpless one) with no update_monster_hp/resolve_attack/
+    end_encounter call backing it this turn. Deliberately NOT gated to an
+    active encounter — the incident this catches (three bound, captured
+    goblins narrated as executed, "🎲 Tarvokk — Dagger: [4] piercing" flavor
+    text and all, HP left untouched in the DB) happened well after the fight
+    that captured them had already (functionally) ended, so gating on
+    active_encounter would leave exactly this case uncaught, same reasoning
+    as _detect_missing_loot_followup's own un-gated design."""
+    if called & _MONSTER_DEATH_TOOLS:
+        return None
+    if not _MONSTER_DEATH_MENTION_RE.search(notes):
+        return None
+    return (
+        "Your resolution report narrates a monster's death (a killing blow, or "
+        "executing/finishing off an already-helpless one), but no update_monster_hp "
+        "call backs it up this turn. Call update_monster_hp now to actually bring it "
+        "to 0 HP before reporting the death — narrating a kill without it leaves the "
+        "monster alive in the campaign's real state."
+    )
+
+
 _COMBAT_ENDED_MENTION_RE = re.compile(
     r"\b(?:combat|the fight|the battle|the encounter)\s+(?:has\s+)?"
-    r"(?:ended|ends|is\s+over|concluded|finished)\b",
+    r"(?:ended|ends|is\s+over|concluded|finished)\b"
+    # Capture/surrender/incapacitation endings — a fight can be functionally
+    # over without anyone ever saying "the fight is over": the party binds,
+    # captures, or otherwise neutralizes every hostile combatant, and the
+    # narration moves straight into post-combat roleplay (interrogation,
+    # looting, travel) without end_encounter ever being called. Observed
+    # live, 2026-07-12: three captured/bound goblins left active_encounter
+    # stuck True through an interrogation, a moral debate, and an execution,
+    # silently mis-gating every ordinary roleplay/travel turn afterward as
+    # "no tool calls during an active encounter" (see
+    # _detect_missing_followup).
+    r"|\b(?:bound|captured|subdued|restrained|surrender(?:s|ed)?|"
+    r"no\s+longer\s+(?:a\s+threat|hostile|fighting)|"
+    r"(?:all|every one of them?)\s+(?:are|is)\s+(?:unconscious|bound|captured))\b",
     re.IGNORECASE,
 )
 
@@ -1192,6 +1314,8 @@ def get_agent(
             if not issue:
                 issue = _detect_missing_loot_followup(notes, called_this_turn)
             if not issue:
+                issue = _detect_missing_monster_death_followup(notes, called_this_turn)
+            if not issue:
                 issue = _detect_missing_encounter_followup(state, live_campaign)
             if not issue:
                 issue = _detect_missing_end_encounter_followup(notes, called_this_turn, live_campaign)
@@ -1290,6 +1414,9 @@ def get_agent(
         # as the session-start directive handling below, applied to this
         # turn's dice — see _verified_rolls_note for the full story.
         notes += _verified_rolls_note(scratch)
+        # Same principle, generalized beyond dice to every other mutating
+        # tool call this turn — see _verified_state_changes_note.
+        notes += _verified_state_changes_note(scratch)
 
         removals = [RemoveMessage(id=m.id) for m in scratch if m.id]
 

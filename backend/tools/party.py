@@ -3,12 +3,15 @@ import re
 from langchain_core.tools import tool
 
 from backend.data.equipment import ARMOR, SHIELD_AC_BONUS, WEAPONS
-from backend.models import Attack, ConditionType, Container, Currency, Item, SpellSlotLevel
+from backend.models import ActiveEffect, Attack, ConditionType, Container, Currency, Item, SpellSlotLevel
 from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.graph_store import RelationGraphStore
 from backend.stores.lore_store import LoreStore
-from backend.tools._helpers import all_campaign_item_names, apply_damage_to_character, char_summary, find_char, with_ability_mod
+from backend.tools._helpers import (
+    all_campaign_item_names, apply_damage_to_character, char_summary, find_char, find_monster,
+    with_ability_mod,
+)
 from backend.tools.loot_generator import ARMOR_BONUS_RARITY, WEAPON_LIKE_BONUS_RARITY
 
 
@@ -152,6 +155,61 @@ def make_tools(
         char.conditions.remove(cond)
         await store.save(campaign)
         return f"{char.name} is no longer {cond.value}."
+
+    @tool
+    async def apply_effect(
+        target_name: str,
+        name: str,
+        duration_rounds: int | None = None,
+        extra_actions: int = 0,
+        extra_bonus_actions: int = 0,
+        extra_reactions: int = 0,
+        ac_bonus: int = 0,
+        attack_bonus: int = 0,
+        save_bonus: int = 0,
+        source: str = "",
+        notes: str = "",
+    ) -> str:
+        """Apply a structured buff/effect (Haste, Bless, Action Surge, and
+        similar) to a character or monster — the counterpart to add_condition
+        for beneficial effects, and the ONLY way anything like "+1 action per
+        turn" actually changes the turn budget resolve_attack/cast_spell
+        enforce (see check_and_spend_action_budget). duration_rounds=None
+        means it lasts until remove_effect is called (e.g. concentration
+        broken, dispelled) rather than expiring on its own. Effects with an
+        extra_actions/extra_bonus_actions bonus apply automatically every
+        turn the buff is still active (reconciled in advance_combatant_turn)
+        and automatically stop the moment duration_rounds reaches 0 or
+        remove_effect is called — no need to re-apply it each round."""
+        campaign = await store.load(campaign_id)
+        target = find_char(campaign, target_name) or find_monster(campaign, target_name)
+        if not target:
+            return f"No character or monster named '{target_name}' found."
+        effect = ActiveEffect(
+            name=name, source=source, duration_rounds=duration_rounds,
+            extra_actions=extra_actions, extra_bonus_actions=extra_bonus_actions,
+            extra_reactions=extra_reactions, ac_bonus=ac_bonus, attack_bonus=attack_bonus,
+            save_bonus=save_bonus, notes=notes,
+        )
+        target.active_effects.append(effect)
+        await store.save(campaign)
+        return f"{target.name} is now affected by {name}" + (f" ({duration_rounds} round(s))" if duration_rounds else " (until removed)") + "."
+
+    @tool
+    async def remove_effect(target_name: str, effect_name: str) -> str:
+        """Remove an active effect from a character or monster early — a
+        dispel, a broken concentration, or any other early end not covered by
+        its own duration_rounds expiring naturally."""
+        campaign = await store.load(campaign_id)
+        target = find_char(campaign, target_name) or find_monster(campaign, target_name)
+        if not target:
+            return f"No character or monster named '{target_name}' found."
+        effect = next((e for e in target.active_effects if e.name.lower() == effect_name.lower()), None)
+        if not effect:
+            return f"{target.name} is not affected by '{effect_name}'."
+        target.active_effects.remove(effect)
+        await store.save(campaign)
+        return f"{effect_name} ends for {target.name}."
 
     @tool
     async def use_spell_slot(character_name: str, level: int) -> str:
@@ -380,7 +438,9 @@ def make_tools(
         return result
 
     @tool
-    async def add_weapon_attack(character_name: str, item_name: str, base_item: str) -> str:
+    async def add_weapon_attack(
+        character_name: str, item_name: str, base_item: str, action_type: str = "action",
+    ) -> str:
         """Grant a character a real, usable Attack from a mundane (non-magical)
         weapon already in their inventory — call this once a character intends to
         actually fight with a looted/purchased mundane weapon, so resolve_attack
@@ -393,7 +453,10 @@ def make_tools(
         character's inventory (add_item_to_character/reveal_loot distribution
         first) or if base_item isn't a recognized weapon, or if this character
         already has an attack with this exact name (no-op, not a duplicate).
-        For a magical weapon, use create_magic_item instead."""
+        For a magical weapon, use create_magic_item instead.
+
+        action_type: pass "bonus_action" for an off-hand/Two-Weapon-Fighting-style
+        attack — defaults to "action" for a character's primary weapon."""
         campaign = await store.load(campaign_id)
         char = find_char(campaign, character_name)
         if not char:
@@ -414,6 +477,7 @@ def make_tools(
             damage_dice=with_ability_mod(weapon["damage_dice"], to_hit_mod),
             damage_type=weapon["damage_type"],
             range_ft=weapon["range_ft"],
+            action_type=action_type,
         ))
         await store.save(campaign)
         return (
@@ -469,12 +533,44 @@ def make_tools(
         lines.append("Ask the party how to split it before assigning anything.")
         return "\n".join(lines)
 
+    @tool
+    async def get_unassigned_loot() -> str:
+        """List every shared find from reveal_loot that still has unclaimed contents
+        or currency, across the whole campaign (not just this encounter). Call this
+        before resolving a player's allocation of a find ("I'll take the pouch",
+        "add it to my inventory") if its exact contents aren't already in your
+        recent context — reveal_loot's own result can scroll out of view by the
+        time the party gets around to splitting it up, and guessing at contents
+        instead of checking here is exactly how a claimed item silently fails to
+        reach anyone's actual inventory. Does not mutate anything."""
+        campaign = await store.load(campaign_id)
+        if not campaign or not campaign.containers:
+            return "No unassigned loot recorded."
+        lines = []
+        for c in campaign.containers:
+            coins = ", ".join(f"{v} {k}" for k, v in c.currency.model_dump().items() if v)
+            if not c.contents and not coins:
+                continue
+            lines.append(f"{c.name}:")
+            lines += [
+                f"  - {i.name}" + (f" x{i.quantity}" if i.quantity > 1 else "")
+                for i in c.contents
+            ]
+            if coins:
+                lines.append(f"  - {coins}")
+        if not lines:
+            return "No unassigned loot recorded."
+        return "\n".join(lines)
+
     return [
         get_party_status,
         get_character,
+        get_unassigned_loot,
         update_character_hp,
         add_condition,
         remove_condition,
+        apply_effect,
+        remove_effect,
         use_spell_slot,
         restore_spell_slots,
         add_item_to_character,

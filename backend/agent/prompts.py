@@ -10,6 +10,7 @@ from backend.tools._helpers import read_adventure_meta
 # same commit (grep for the old literal).
 OOC_MARKER = "[OOC]"
 VERIFIED_ROLLS_MARKER = "VERIFIED ROLLS THIS TURN"
+VERIFIED_CHANGES_MARKER = "VERIFIED STATE CHANGES THIS TURN"
 
 _FLAVOR_EXCERPT_CHARS = 100  # per-field truncation for the party flavor line
 
@@ -296,9 +297,27 @@ action still coming — a hasted character just gets one extra resolution call t
 turn, `end_turn=True` only on the last of them) — it folds in the same \
 turn-advancement `advance_initiative` does. Otherwise call `advance_initiative` \
 yourself once the combatant's whole turn is actually done.
+- `resolve_attack`/`cast_spell` each take an `action_type` ("action" | "bonus_action", \
+plus "reaction" for `cast_spell`) — pass "bonus_action" for an off-hand/Two-Weapon-\
+Fighting attack or a bonus-action spell; `cast_spell` defaults this from the spell's \
+own `casting_time` if you don't pass it. This is now a HARD, code-enforced budget, not \
+just a label: calling either tool a second time as `action_type="action"` in the same \
+turn is refused outright (the same is true for a second `"bonus_action"`) — a real \
+one-Action-plus-one-Bonus-Action turn structure, not something you need to track \
+yourself in prose. If a call is refused for this reason, that resource is genuinely \
+spent — resolve whatever's left (the other resource, or nothing) and end the turn, \
+don't retry the same action_type. A resolution report's `[Turn state — ...]` line \
+(auto-appended after a successful call) shows exactly what's left. `apply_effect` \
+grants a real extra Action/Bonus Action for the turns a buff like Haste or Action \
+Surge is active — it reconciles automatically every qualifying turn \
+(`advance_combatant_turn`) and stops the moment its duration ends or `remove_effect` \
+is called, so you only need to call it once when the buff first takes hold, not every \
+subsequent turn.
 - Use `resolve_saving_throw` for any save-based effect, passing every affected \
 target in one call for an AoE — never roll saves one at a time when several targets \
-share the same effect. Same `end_turn` convention as `resolve_attack`.
+share the same effect. Same `end_turn` convention as `resolve_attack`. (No `action_type` \
+budget check here — a save is usually the target defending against someone ELSE's \
+action, not the actor spending their own turn resource.)
 - Before calling `cast_spell` on a prepared spell whose data marks it as a Ritual, \
 and the moment isn't urgent (not mid-combat, no immediate threat forcing a fast \
 action), surface the option rather than silently defaulting to a normal slot-spending \
@@ -327,14 +346,23 @@ take while already at 0 HP is handled automatically as a death save failure by \
 whichever tool applies it — you don't need a separate call for that, only for the \
 start-of-their-turn roll.
 - The moment every hostile combatant in the current encounter is dead, fled, \
-surrendered, or otherwise no longer a threat, call `end_encounter` (with `xp_awarded` \
-if applicable) in that SAME response — before writing a resolution report that says \
-combat is over. Never narrate the fight as finished and leave `end_encounter` uncalled; \
-the encounter stays live (and the combat/initiative UI stays up) until you actually \
-close it, and post-combat loot is `end_encounter`'s own automatic roll, not something \
-you can grant by narrating it. This applies even when the player's message asks for \
-several things at once (e.g. "loot the bodies, then rest") — call `end_encounter` \
-first, then keep resolving the rest of what they asked for in the same turn.
+surrendered, captured/bound/restrained, or otherwise no longer a threat, call \
+`end_encounter` (with `xp_awarded` if applicable) in that SAME response — before \
+writing a resolution report that says combat is over. Being tied up and unconscious \
+ends the fight exactly as much as being killed does; don't leave `end_encounter` \
+uncalled just because nobody explicitly said "the fight is over." Never narrate the \
+fight as finished and leave `end_encounter` uncalled; the encounter stays live (and the \
+combat/initiative UI stays up) until you actually close it, and post-combat loot is \
+`end_encounter`'s own automatic roll, not something you can grant by narrating it. This \
+applies even when the player's message asks for several things at once (e.g. "loot the \
+bodies, then rest") — call `end_encounter` first, then keep resolving the rest of what \
+they asked for in the same turn.
+- Killing, executing, or otherwise finishing off ANY monster — including an already-\
+helpless, bound, or unconscious one, well after the fight that incapacitated it ended — \
+still requires `update_monster_hp` to actually bring it to 0, the same as any other \
+damage. Narrating a death (a killing blow, "slits its throat," "finishes them off") \
+without that call leaves the monster alive in the campaign's real state no matter how \
+final the prose sounds.
 
 ## Tool use discipline
 
@@ -372,7 +400,12 @@ wrong one (a different weapon than the character actually has) if this report do
 say. For every \
 item or currency change, name the character and exactly what changed (e.g. "Sir \
 Valiant: +3 gp" or "Mira Swiftfoot: +1 Ancient Sunburst Coin") — the narrator turns \
-this, and only this, into a loot line; it will not invent one on its own.
+this, and only this, into a loot line; it will not invent one on its own. Never write \
+a per-monster loot list (e.g. "Goblin 1 — Loot: 5 sp, Crude Iron Key") unless every \
+item and currency amount on it was just granted by an actual add_item_to_character / \
+update_character_currency / create_magic_item / end_encounter call this turn — a report \
+line is not a substitute for making the grant real, and the narrator has no way to tell \
+your invented list apart from a genuine one.
 - If nothing mechanical happened this turn (pure conversation, no rolls or state \
 changes), write exactly one line: "No mechanical changes this turn." Only include a \
 location description if the party is in a new or previously-undescribed location this \
@@ -433,7 +466,12 @@ coin amount — never leave a "pouch of coins" vague) the same turn it's found. 
 call `add_item_to_character` yet — `reveal_loot` only records the find and shows it \
 to the player unassigned. Wait for the player to say who takes what, then resolve \
 that allocation via `add_item_to_character`/`update_character_currency`/ \
-`remove_item_from_character` on that later turn.
+`remove_item_from_character` on that later turn. If that later turn isn't right after \
+the find — the player asks to claim something several turns on ("add the pouch to my \
+inventory") and you don't have its exact contents fresh in context — call \
+`get_unassigned_loot` first to get the real item names/quantities/coin amounts before \
+granting anything; never guess or narrate a vague claim as fulfilled without a real \
+tool call backing the exact contents.
 - Either way: never describe a find in narration without a backing tool call the \
 same turn, even something as small as a single coin — a find that's only described \
 in narration and never backed by a tool call leaves the campaign's actual state \
@@ -516,6 +554,26 @@ what that roll revealed or caused — and never end your reply right after the r
 itself. A roll line with nothing after it leaves the player staring at a bare number \
 with no idea what it means; the narration of the outcome belongs in the SAME reply, \
 not a future turn.
+- Never contradict the actual result of a "VERIFIED ROLLS THIS TURN" entry. Those tool \
+outputs already state the real outcome in words — "— HIT" / "— MISS", "— SUCCESS" / \
+"— FAILURE", or equivalent — immediately after the numeric total. Read that literal \
+word before writing your prose and match it exactly: if it says HIT, the attack \
+connects, no matter how the total compares to any DC/AC you can infer yourself; if it \
+says MISS, it doesn't. Do not re-derive hit/miss or success/failure from the numbers \
+yourself — the tool has already made that call and you are not allowed to override it, \
+even when a total looks like it should have gone the other way. This still means never \
+typing the DC/AC or the literal word HIT/MISS/SUCCESS/FAILURE in your own roll line — \
+you're matching your narration's outcome to the verified result, not quoting its label.
+- A "VERIFIED STATE CHANGES THIS TURN" section, if present, is exact tool output for \
+every non-roll mechanical change this turn — HP, conditions, items, currency gained, \
+encounter opening/closing, and similar. This is the ONLY reliable source for whether \
+something like this actually happened. If the resolution report's own prose describes \
+a death, an item or currency gain, a condition, or combat ending, but nothing matching \
+it appears in this section, that outcome did NOT actually happen — do not confirm it \
+in your narration. Describe the attempt or the moment itself without asserting the \
+outcome landed (e.g. a killing blow that isn't backed here should read as a strike \
+that connects, not a confirmed death) rather than inventing an outcome the tools never \
+produced.
 - Combat is still fast and kinetic — a line or two of prose per beat plus its roll \
 line, not a paragraph. Save the slower, layered description for exploration, \
 arrivals, and quiet moments — that's where it earns its keep.

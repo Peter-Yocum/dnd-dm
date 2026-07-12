@@ -66,10 +66,12 @@ from backend.config import settings
 from backend.data.equipment import ARMOR, WEAPONS
 from backend.data.fivee_options import CLASSES
 from backend.locks import campaign_write_lock
-from backend.models import Campaign, Session
+from backend.models import Campaign, CoverType, Session, ZoneType
 from backend.rag.reranker import LLMJudgeReranker
 from backend.tools._helpers import (
-    apply_long_rest, apply_short_rest, find_char, find_item_anywhere, find_location, find_npc, read_adventure_meta,
+    apply_long_rest, apply_short_rest, assign_container_currency, assign_container_item,
+    find_char, find_container_by_id, find_item_anywhere, find_location, find_npc, read_adventure_meta,
+    spell_action_type,
 )
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import draft_store
@@ -623,6 +625,148 @@ async def short_rest(campaign_id: str):
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     summary = apply_short_rest(campaign)
+    await store.save(campaign)
+    return JSONResponse({"summary": summary})
+
+
+@app.get("/campaigns/{campaign_id}/combat-status")
+async def get_combat_status(campaign_id: str):
+    """Whether an encounter is active, whose turn it is, and the full
+    combatant roster (for the turn-builder's target dropdown) — polled by
+    the combat-mode UI after each DM turn (SSE "done") to decide whether to
+    show the turn-builder, and for which party member."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    enc = campaign.active_encounter
+    if not enc or not enc.is_active:
+        return JSONResponse({"is_active": False})
+
+    current = next((e for e in enc.initiative_order if e.is_current_turn), None)
+    current_char = find_char(campaign, current.name) if current else None
+    current_character_id = (
+        current_char.id if current_char and current_char.is_player_controlled else None
+    )
+    return JSONResponse({
+        "is_active": True,
+        "round": enc.round,
+        "current_combatant_name": current.name if current else None,
+        "current_character_id": current_character_id,
+        "combatants": [
+            {"name": e.name, "type": e.combatant_type.value, "is_current_turn": e.is_current_turn}
+            for e in enc.initiative_order
+        ],
+    })
+
+
+@app.get("/campaigns/{campaign_id}/combat-turn-options")
+async def get_combat_turn_options(campaign_id: str, character_id: str):
+    """Everything the combat-mode turn-builder UI needs for one character:
+    their real attacks/spells (each tagged with the action-economy resource
+    it costs), their current Action/Bonus Action/Reaction budget for this
+    turn, and the zone/cover options for movement. Read-only — the actual
+    turn is still submitted as a synthesized message through the normal
+    /message pipeline (see templates/game.html), so there's exactly one
+    resolution code path; this endpoint only constrains what the UI can
+    offer to pick from."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    char = next((c for c in campaign.party if c.id == character_id), None)
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+
+    enc = campaign.active_encounter
+    entry = None
+    if enc and enc.is_active:
+        entry = next((e for e in enc.initiative_order if e.name.lower() == char.name.lower()), None)
+
+    combat_casting_times = {"1 action", "1 bonus action", "1 reaction"}
+    spells = [
+        {
+            "name": s.name,
+            "level": s.level,
+            "action_type": spell_action_type(s.casting_time),
+            "slots_remaining": (char.spell_slots[s.level].remaining if s.level > 0 and s.level in char.spell_slots else None),
+        }
+        for s in char.spells_known
+        if s.casting_time.strip().lower() in combat_casting_times
+        and (s.level == 0 or (s.level in char.spell_slots and char.spell_slots[s.level].remaining > 0))
+    ]
+
+    return JSONResponse({
+        "character_name": char.name,
+        "in_encounter": entry is not None,
+        "is_current_turn": entry.is_current_turn if entry else False,
+        "actions_remaining": entry.actions_remaining if entry else 1,
+        "bonus_actions_remaining": entry.bonus_actions_remaining if entry else 1,
+        "reaction_available": char.reaction_available,
+        "attacks": [{"name": a.name, "action_type": a.action_type} for a in char.attacks],
+        "spells": spells,
+        "zones": [z.value for z in ZoneType],
+        "covers": [c.value for c in CoverType],
+    })
+
+
+@app.get("/campaigns/{campaign_id}/loot")
+async def list_unassigned_loot(campaign_id: str):
+    """Every shared find (reveal_loot / end_encounter's automatic post-combat
+    roll) still holding unclaimed items or currency, as real JSON for the
+    loot-assignment panel — the direct-UI counterpart to the LLM-only
+    get_unassigned_loot tool. Bypasses narration entirely, since narrated
+    loot has repeatedly failed to actually reach a character's inventory."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    containers = [c for c in campaign.containers if c.contents or c.currency.to_gp()]
+    return JSONResponse([c.model_dump(mode="json") for c in containers])
+
+
+@app.post("/campaigns/{campaign_id}/loot/{container_id}/assign-item")
+async def assign_loot_item(campaign_id: str, container_id: str, item_id: str = Form(...), character_id: str = Form(...)):
+    """Move one specific item from an unassigned loot container straight into
+    a party member's inventory — a direct UI action (loot panel button), no
+    agent/tool-calling/narration involved."""
+    store = _store()
+    campaign = await store.load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    container = find_container_by_id(campaign, container_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    char = next((c for c in campaign.party if c.id == character_id), None)
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+    try:
+        summary = assign_container_item(campaign, container, item_id, char)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await store.save(campaign)
+    return JSONResponse({"summary": summary})
+
+
+@app.post("/campaigns/{campaign_id}/loot/{container_id}/assign-currency")
+async def assign_loot_currency(
+    campaign_id: str, container_id: str,
+    denom: str = Form(...), amount: int = Form(...), character_id: str = Form(...),
+):
+    """Move up to `amount` of one coin denomination from an unassigned loot
+    container into a party member's purse — same direct, non-agent action as
+    assign_loot_item, for currency."""
+    store = _store()
+    campaign = await store.load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    container = find_container_by_id(campaign, container_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    char = next((c for c in campaign.party if c.id == character_id), None)
+    if not char:
+        raise HTTPException(status_code=404, detail="Character not found")
+    try:
+        summary = assign_container_currency(campaign, container, denom, amount, char)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     await store.save(campaign)
     return JSONResponse({"summary": summary})
 

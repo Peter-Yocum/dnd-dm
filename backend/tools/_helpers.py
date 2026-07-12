@@ -94,6 +94,49 @@ def find_container(campaign: Campaign, name: str) -> Container | None:
     return next((c for c in campaign.containers if c.name.lower() == n), None)
 
 
+def find_container_by_id(campaign: Campaign, container_id: str) -> Container | None:
+    return next((c for c in campaign.containers if c.id == container_id), None)
+
+
+def assign_container_item(
+    campaign: Campaign, container: Container, item_id: str, character: Character,
+) -> str:
+    """Move one item straight from an unassigned Container (reveal_loot/
+    end_encounter's shared find) into a character's inventory — a direct UI
+    action, not a tool call, so there's no LLM narration step for it to get
+    lost in (the repeated "narrated loot never actually landed" bug this
+    exists to route around entirely). Drops the empty container once both
+    its contents and currency are exhausted, so the loot panel doesn't keep
+    showing a used-up find."""
+    item = next((i for i in container.contents if i.id == item_id), None)
+    if not item:
+        raise ValueError(f"No item with id '{item_id}' in container '{container.name}'.")
+    container.contents.remove(item)
+    character.inventory.append(item)
+    if not container.contents and not container.currency.to_gp():
+        campaign.containers.remove(container)
+    return f"{item.name} moved to {character.name}'s inventory."
+
+
+def assign_container_currency(
+    campaign: Campaign, container: Container, denom: str, amount: int, character: Character,
+) -> str:
+    """Move up to `amount` of one currency denomination from an unassigned
+    Container into a character's purse — same direct, non-agent action as
+    assign_container_item, for the coin side of a shared find."""
+    if denom not in ("cp", "sp", "ep", "gp", "pp"):
+        raise ValueError(f"Unknown denomination '{denom}'.")
+    available = getattr(container.currency, denom)
+    moved = min(amount, available)
+    if moved <= 0:
+        raise ValueError(f"Container '{container.name}' has no {denom} left to assign.")
+    setattr(container.currency, denom, available - moved)
+    setattr(character.currency, denom, getattr(character.currency, denom) + moved)
+    if not container.contents and not container.currency.to_gp():
+        campaign.containers.remove(container)
+    return f"{moved} {denom} moved to {character.name}."
+
+
 def find_connection(loc: Location, destination_name: str) -> LocationConnection | None:
     n = destination_name.lower()
     return next((c for c in loc.connections if c.to_location_name.lower() == n), None)
@@ -723,8 +766,14 @@ def require_current_turn(campaign: Campaign, actor_name: str) -> str | None:
 def advance_combatant_turn(campaign: Campaign, enc: Encounter) -> str:
     """Advance to the next combatant's turn in `enc`, incrementing the round on
     wraparound, and refresh the new current combatant's reaction_available (a
-    reaction refreshes at the start of YOUR turn, not everyone's). Mutates `enc`
-    and the affected Character/Monster in place; does not save."""
+    reaction refreshes at the start of YOUR turn, not everyone's). Also ticks
+    down and expires the new current combatant's ActiveEffects, then resets
+    their action-economy budget (InitiativeEntry.actions_remaining/
+    bonus_actions_remaining) from 1 + whatever effects are still active —
+    see check_and_spend_action_budget for where that budget gets spent, and
+    ActiveEffect's docstring for why this is a numeric sum rather than a
+    hardcoded "Haste = +1 action" special case. Mutates `enc` and the
+    affected Character/Monster in place; does not save."""
     order = enc.initiative_order
     if not order:
         return "Initiative order is empty."
@@ -739,10 +788,114 @@ def advance_combatant_turn(campaign: Campaign, enc: Encounter) -> str:
 
     current = order[next_idx]
     combatant = find_char(campaign, current.name) or find_monster(campaign, current.name)
+    expired_notes = []
     if combatant is not None:
         combatant.reaction_available = True
 
-    return (
+        still_active = []
+        for effect in combatant.active_effects:
+            if effect.duration_rounds is None:
+                still_active.append(effect)
+                continue
+            remaining = effect.duration_rounds - 1
+            if remaining <= 0:
+                expired_notes.append(f"{effect.name} fades from {combatant.name}.")
+            else:
+                effect.duration_rounds = remaining
+                still_active.append(effect)
+        combatant.active_effects = still_active
+
+        current.actions_remaining = 1 + sum(e.extra_actions for e in still_active)
+        current.bonus_actions_remaining = 1 + sum(e.extra_bonus_actions for e in still_active)
+
+    msg = (
         f"Round {enc.round} — {current.name}'s turn "
         f"(initiative {current.initiative}, {current.combatant_type.value})."
     )
+    if expired_notes:
+        msg += " " + " ".join(expired_notes)
+    return msg
+
+
+def spell_action_type(casting_time: str) -> str:
+    """Derive a spell's action-economy classification from its own
+    `casting_time` field (e.g. "1 action", "1 bonus action", "1 reaction") —
+    no separate structured field needed on Spell. Anything else (rituals,
+    "1 minute", "10 minutes", ...) defaults to "action" since those aren't
+    combat-turn options in the first place."""
+    ct = casting_time.strip().lower()
+    if "bonus action" in ct:
+        return "bonus_action"
+    if "reaction" in ct:
+        return "reaction"
+    return "action"
+
+
+def check_and_spend_action_budget(
+    campaign: Campaign, actor_name: str, action_type: str,
+) -> str | None:
+    """Returns a refusal string if `actor_name` has already spent this turn's
+    Action or Bonus Action (per `action_type`, "action" | "bonus_action"), or
+    None (after decrementing the matching InitiativeEntry counter) if the
+    spend is legal. No-op (returns None, spends nothing) outside an active
+    encounter or for a reaction — reactions are tracked via
+    Character/Monster.reaction_available, not here. Same contract/shape as
+    require_current_turn, called at the same call sites in resolution.py:
+    a hard, code-level backstop for 5e's one-Action-plus-one-Bonus-Action
+    turn structure, which previously existed only as prompt prose the model
+    could (and did) ignore — see the "snuck in two attacks" incident this
+    was built to close."""
+    if action_type not in ("action", "bonus_action"):
+        return None
+    enc = campaign.active_encounter
+    if not enc or not enc.is_active or not enc.initiative_order:
+        return None
+    entry = next((e for e in enc.initiative_order if e.name.lower() == actor_name.lower()), None)
+    if entry is None:
+        return None
+
+    field = "actions_remaining" if action_type == "action" else "bonus_actions_remaining"
+    label = "Action" if action_type == "action" else "Bonus Action"
+    remaining = getattr(entry, field)
+    if remaining <= 0:
+        other_field = "bonus_actions_remaining" if action_type == "action" else "actions_remaining"
+        other_label = "Bonus Action" if action_type == "action" else "Action"
+        other_remaining = getattr(entry, other_field)
+        return (
+            f"{actor_name} has already used their {label} this turn (Round {enc.round}). "
+            + (
+                f"They still have their {other_label} available — resolve that, or end "
+                f"the turn, instead of a second {label}."
+                if other_remaining > 0
+                else f"They have no {label} or {other_label} left — end the turn instead."
+            )
+        )
+    setattr(entry, field, remaining - 1)
+    return None
+
+
+def format_turn_budget_recap(campaign: Campaign, actor_name: str) -> str:
+    """Short structured line rendering the just-updated action-economy state
+    for `actor_name` — folded into the mechanics resolution report right
+    after a successful check_and_spend_action_budget call, so the narrator's
+    "so you still have your bonus action" framing (however it phrases it)
+    is always a rendering of the same InitiativeEntry the enforcement code
+    just mutated, not a separately-authored guess. Returns "" outside an
+    active encounter (nothing to recap)."""
+    enc = campaign.active_encounter
+    if not enc or not enc.is_active:
+        return ""
+    entry = next((e for e in enc.initiative_order if e.name.lower() == actor_name.lower()), None)
+    if entry is None:
+        return ""
+    combatant = find_char(campaign, actor_name) or find_monster(campaign, actor_name)
+    parts = [
+        f"Action {'available' if entry.actions_remaining > 0 else 'used'}",
+        f"Bonus Action {'available' if entry.bonus_actions_remaining > 0 else 'used'}",
+    ]
+    if combatant is not None:
+        parts.append("Reaction available" if combatant.reaction_available else "Reaction used")
+        for effect in combatant.active_effects:
+            duration = f"{effect.duration_rounds} round(s) remaining" if effect.duration_rounds is not None else "ongoing"
+            parts.append(f"{effect.name}: {duration}")
+    return f"\n[Turn state — {actor_name}: " + ", ".join(parts) + ".]"

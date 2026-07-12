@@ -83,6 +83,11 @@
       <p id="rest-result" class="text-dim"></p>
     </div>
 
+    <div class="sidebar-section" id="loot-section" style="display:none">
+      <h4>Unclaimed Loot</h4>
+      <div id="loot-list"></div>
+    </div>
+
     {% if campaign.active_encounter and campaign.active_encounter.is_active %}
     <div class="sidebar-section combat-active">
       <h4>⚔ Combat — Round {{ campaign.active_encounter.round }}</h4>
@@ -186,6 +191,32 @@
         <button type="button" id="begin-session-btn" class="btn-primary btn-sm">Continue the Adventure</button>
         {% endif %}
       </div>
+    </div>
+
+    <div class="combat-turn-panel hidden" id="combat-turn-panel">
+      <div class="combat-turn-header">
+        <h4 id="combat-turn-title">Your Turn</h4>
+        <span class="text-dim" id="combat-turn-budget"></span>
+      </div>
+      <div class="combat-turn-row">
+        <label>Action</label>
+        <select id="combat-action-select"></select>
+      </div>
+      <div class="combat-turn-row" id="combat-target-row">
+        <label>Target</label>
+        <select id="combat-target-select"></select>
+      </div>
+      <div class="combat-turn-row">
+        <label>Bonus Action</label>
+        <select id="combat-bonus-select"></select>
+      </div>
+      <div class="combat-turn-row">
+        <label>Move to</label>
+        <select id="combat-zone-select"></select>
+        <select id="combat-cover-select"></select>
+      </div>
+      <button type="button" class="btn-primary btn-sm" id="combat-turn-submit">Submit Turn</button>
+      <p class="text-dim combat-turn-hint">Prefer to type? Just use the box below instead — it still goes through the same rules.</p>
     </div>
 
     <form class="input-form"
@@ -312,6 +343,9 @@
   const CAMPAIGN_ID   = "{{ campaign.id }}";
   const INITIAL_TID   = "{{ thread_id }}";
   const STORAGE_KEY   = "thread_" + CAMPAIGN_ID;
+  const PARTY = [
+    {% for c in campaign.party %}{ id: "{{ c.id }}", name: "{{ c.name | e }}" }{% if not loop.last %},{% endif %}{% endfor %}
+  ];
 
   // OOC marker the mechanics/narrator prompts recognize (see
   // get_mechanics_system_prompt/get_narrator_system_prompt) — declared here,
@@ -570,6 +604,8 @@
       activeSource = null;
       sendBtn.disabled = false;
       checkContextStatus();
+      refreshLootPanel();
+      refreshCombatPanel();
     });
 
     activeSource.addEventListener("error", e => {
@@ -929,6 +965,201 @@
   }
   document.getElementById("short-rest-btn").addEventListener("click", () => takeRest("short"));
   document.getElementById("long-rest-btn").addEventListener("click", () => takeRest("long"));
+
+  // ── unclaimed loot panel ────────────────────────────────────────────────
+  // Direct, deterministic assignment (see assign_container_item/
+  // assign_container_currency, backend/tools/_helpers.py) — bypasses the
+  // agent/narration entirely, since narrated loot has repeatedly failed to
+  // actually land in a character's inventory. Refreshed after every DM turn
+  // (a turn can reveal new loot via reveal_loot/end_encounter) and after
+  // every assignment.
+
+  function partyOptions() {
+    return PARTY.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
+  }
+
+  function renderLootPanel(containers) {
+    const section = document.getElementById("loot-section");
+    const list = document.getElementById("loot-list");
+    if (!containers.length) {
+      section.style.display = "none";
+      list.innerHTML = "";
+      return;
+    }
+    section.style.display = "";
+    list.innerHTML = containers.map(c => {
+      const itemRows = c.contents.map(i => `
+        <div class="loot-row" data-container="${c.id}" data-item="${i.id}">
+          <span class="loot-name">${i.name}${i.quantity > 1 ? ` x${i.quantity}` : ""}</span>
+          <select class="loot-target">${partyOptions()}</select>
+          <button type="button" class="btn-ghost btn-sm" onclick="assignLootItem('${c.id}', '${i.id}', this)">Give</button>
+        </div>
+      `).join("");
+      const denoms = ["pp", "gp", "ep", "sp", "cp"].filter(d => c.currency[d]);
+      const currencyRows = denoms.map(d => `
+        <div class="loot-row" data-container="${c.id}" data-denom="${d}">
+          <span class="loot-name">${c.currency[d]} ${d}</span>
+          <select class="loot-target">${partyOptions()}</select>
+          <button type="button" class="btn-ghost btn-sm" onclick="assignLootCurrency('${c.id}', '${d}', this)">Give</button>
+        </div>
+      `).join("");
+      return `<div class="loot-container"><p class="loot-source">${c.name}</p>${itemRows}${currencyRows}</div>`;
+    }).join("");
+  }
+
+  async function refreshLootPanel() {
+    if (!PARTY.length) return;
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/loot`);
+      if (!resp.ok) return;
+      renderLootPanel(await resp.json());
+    } catch (err) {
+      // Non-critical — the panel just doesn't update this cycle.
+    }
+  }
+
+  function reloadActiveSheetIfOpen() {
+    const active = document.querySelector(".party-member.active");
+    if (active) loadCharacterSheet(active.dataset.charId);
+  }
+
+  async function assignLootItem(containerId, itemId, btn) {
+    const characterId = btn.parentElement.querySelector(".loot-target").value;
+    btn.disabled = true;
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/loot/${containerId}/assign-item`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `item_id=${encodeURIComponent(itemId)}&character_id=${encodeURIComponent(characterId)}`,
+      });
+      if (!resp.ok) throw new Error((await resp.json()).detail || "Request failed");
+      await refreshLootPanel();
+      reloadActiveSheetIfOpen();
+    } catch (err) {
+      btn.disabled = false;
+      alert("Couldn't assign that item: " + err.message);
+    }
+  }
+
+  async function assignLootCurrency(containerId, denom, btn) {
+    const row = btn.parentElement;
+    const characterId = row.querySelector(".loot-target").value;
+    const amount = parseInt(row.querySelector(".loot-name").textContent, 10);
+    btn.disabled = true;
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/loot/${containerId}/assign-currency`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `denom=${encodeURIComponent(denom)}&amount=${amount}&character_id=${encodeURIComponent(characterId)}`,
+      });
+      if (!resp.ok) throw new Error((await resp.json()).detail || "Request failed");
+      await refreshLootPanel();
+      reloadActiveSheetIfOpen();
+    } catch (err) {
+      btn.disabled = false;
+      alert("Couldn't assign that currency: " + err.message);
+    }
+  }
+
+  refreshLootPanel();
+
+  // ── combat-mode turn panel ──────────────────────────────────────────────
+  // Structured Action/Bonus Action/Movement pickers for whoever's turn it
+  // currently is (if a player-controlled character) — constrains choices to
+  // that character's REAL attacks/spells and current action-economy budget
+  // (see check_and_spend_action_budget/format_turn_budget_recap,
+  // backend/tools/_helpers.py) instead of freeform prose the mechanics model
+  // has to interpret. Submitting composes one precise sentence and posts it
+  // through the exact same /message pipeline as typing would — there is
+  // deliberately only one resolution code path; this UI only narrows what
+  // gets asked for. Free text in the box below remains available always.
+
+  let combatCombatants = [];
+  let combatCharacterName = "";
+
+  function populateSelect(select, options) {
+    select.innerHTML = options.map(o => `<option value="${o.value}">${o.label}</option>`).join("");
+  }
+
+  async function refreshCombatPanel() {
+    const panel = document.getElementById("combat-turn-panel");
+    try {
+      const statusResp = await fetch(`/campaigns/${CAMPAIGN_ID}/combat-status`);
+      if (!statusResp.ok) { panel.classList.add("hidden"); return; }
+      const status = await statusResp.json();
+      if (!status.is_active || !status.current_character_id) {
+        panel.classList.add("hidden");
+        return;
+      }
+      combatCombatants = status.combatants || [];
+
+      const optsResp = await fetch(`/campaigns/${CAMPAIGN_ID}/combat-turn-options?character_id=${encodeURIComponent(status.current_character_id)}`);
+      if (!optsResp.ok) { panel.classList.add("hidden"); return; }
+      const opts = await optsResp.json();
+      combatCharacterName = opts.character_name;
+
+      document.getElementById("combat-turn-title").textContent = `${opts.character_name}'s Turn — Round ${status.round}`;
+      document.getElementById("combat-turn-budget").textContent =
+        `Action: ${opts.actions_remaining > 0 ? "available" : "used"} · `
+        + `Bonus Action: ${opts.bonus_actions_remaining > 0 ? "available" : "used"} · `
+        + `Reaction: ${opts.reaction_available ? "available" : "used"}`;
+
+      const actionOptions = [{ value: "", label: "-- choose --" }]
+        .concat(opts.attacks.filter(a => a.action_type === "action").map(a => ({ value: `attack:${a.name}`, label: `Attack — ${a.name}` })))
+        .concat(opts.spells.filter(s => s.action_type === "action").map(s => ({ value: `spell:${s.name}`, label: `Cast — ${s.name}` })))
+        .concat(["Dash", "Disengage", "Dodge", "Help", "Hide", "Search", "Ready"].map(g => ({ value: `generic:${g}`, label: g })));
+      populateSelect(document.getElementById("combat-action-select"), actionOptions);
+      document.getElementById("combat-action-select").disabled = opts.actions_remaining <= 0;
+
+      const bonusOptions = [{ value: "", label: "None" }]
+        .concat(opts.attacks.filter(a => a.action_type === "bonus_action").map(a => ({ value: `attack:${a.name}`, label: `Attack — ${a.name}` })))
+        .concat(opts.spells.filter(s => s.action_type === "bonus_action").map(s => ({ value: `spell:${s.name}`, label: `Cast — ${s.name}` })));
+      populateSelect(document.getElementById("combat-bonus-select"), bonusOptions);
+      document.getElementById("combat-bonus-select").disabled = opts.bonus_actions_remaining <= 0 || bonusOptions.length <= 1;
+
+      const targetOptions = [{ value: "", label: "-- none --" }]
+        .concat(combatCombatants.filter(c => c.name !== opts.character_name).map(c => ({ value: c.name, label: c.name })));
+      populateSelect(document.getElementById("combat-target-select"), targetOptions);
+
+      populateSelect(document.getElementById("combat-zone-select"), [{ value: "", label: "Stay put" }].concat(opts.zones.map(z => ({ value: z, label: `Move — ${z}` }))));
+      populateSelect(document.getElementById("combat-cover-select"), opts.covers.map(c => ({ value: c, label: `${c} cover` })));
+
+      panel.classList.remove("hidden");
+    } catch (err) {
+      panel.classList.add("hidden");
+    }
+  }
+
+  function composeCombatTurnSentence() {
+    const actionVal = document.getElementById("combat-action-select").value;
+    const bonusVal = document.getElementById("combat-bonus-select").value;
+    const zoneVal = document.getElementById("combat-zone-select").value;
+    const coverVal = document.getElementById("combat-cover-select").value;
+    const targetVal = document.getElementById("combat-target-select").value;
+
+    function describe(val, slot) {
+      if (!val) return slot === "action" ? "" : `${combatCharacterName} doesn't use a ${slot === "bonus" ? "bonus action" : slot}.`;
+      const [kind, name] = val.split(/:(.+)/);
+      if (kind === "attack") return `${combatCharacterName} uses their ${slot === "bonus" ? "bonus action" : "action"} to attack ${targetVal || "the nearest enemy"} with ${name}.`;
+      if (kind === "spell") return `${combatCharacterName} uses their ${slot === "bonus" ? "bonus action" : "action"} to cast ${name}${targetVal ? " on " + targetVal : ""}.`;
+      return `${combatCharacterName} uses their ${slot === "bonus" ? "bonus action" : "action"} to ${name.toLowerCase()}.`;
+    }
+
+    const parts = [describe(actionVal, "action"), describe(bonusVal, "bonus")];
+    if (zoneVal) {
+      parts.push(`${combatCharacterName} moves to a ${zoneVal} position${coverVal && coverVal !== "none" ? ` with ${coverVal} cover` : ""}.`);
+    }
+    return parts.filter(Boolean).join(" ");
+  }
+
+  document.getElementById("combat-turn-submit").addEventListener("click", () => {
+    const sentence = composeCombatTurnSentence();
+    if (!sentence.trim()) return;
+    document.getElementById("message-input").value = sentence;
+    document.getElementById("message-form").requestSubmit();
+  });
+
+  refreshCombatPanel();
 
   // ── session end ───────────────────────────────────────────────────────────
 

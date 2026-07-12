@@ -24,6 +24,31 @@ class ConditionType(str, Enum):
     UNCONSCIOUS = "unconscious"
 
 
+class ActiveEffect(BaseModel):
+    """A structured buff/effect (Haste, Bless, Action Surge, ...) — the
+    counterpart to ConditionType's debuffs. Numeric modifiers rather than a
+    fixed per-effect boolean so a turn's action-economy budget
+    (InitiativeEntry.actions_remaining/bonus_actions_remaining) can just sum
+    these across every active effect instead of hardcoding "Haste = +1
+    action" as a special case. Reconciled once per turn in
+    advance_combatant_turn: duration ticks down and expired effects are
+    dropped at the start of the affected combatant's OWN turn, and the
+    budget fields are recomputed from whatever's still active — so a buff
+    applies automatically every qualifying turn and automatically stops the
+    moment it expires or is removed, with no manual re-application needed."""
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    name: str
+    source: str = ""                     # who/what granted it — narration + targeted removal
+    duration_rounds: int | None = None   # None = no fixed duration (lasts until removed)
+    extra_actions: int = 0
+    extra_bonus_actions: int = 0
+    extra_reactions: int = 0
+    ac_bonus: int = 0
+    attack_bonus: int = 0
+    save_bonus: int = 0
+    notes: str = ""                       # anything else — narrated only, not mechanically modeled
+
+
 class DamageType(str, Enum):
     ACID = "acid"
     BLUDGEONING = "bludgeoning"
@@ -344,6 +369,7 @@ class Attack(BaseModel):
     damage_dice: str = "1d4"              # e.g. "2d6+3"
     damage_type: DamageType = DamageType.BLUDGEONING
     range_ft: str = "5"                   # "5" for melee, "80/320" for ranged
+    action_type: str = "action"           # "action" | "bonus_action" | "reaction"
     notes: str = ""
 
 
@@ -411,6 +437,7 @@ class Character(BaseModel):
 
     # Status
     conditions: list[ConditionType] = Field(default_factory=list)
+    active_effects: list[ActiveEffect] = Field(default_factory=list)
     exhaustion_level: int = 0             # 0–6; each level compounds debuffs
     inspiration: bool = False
     concentration: str | None = None      # name of spell being concentrated on
@@ -498,6 +525,7 @@ class Monster(BaseModel):
     lair_actions: list[str] = Field(default_factory=list)
 
     conditions: list[ConditionType] = Field(default_factory=list)
+    active_effects: list[ActiveEffect] = Field(default_factory=list)
     notes: str = ""
 
 
@@ -719,6 +747,13 @@ class InitiativeEntry(BaseModel):
     initiative: int
     is_current_turn: bool = False
     is_surprised: bool = False
+    # Reset each turn in advance_combatant_turn from 1 + the sum of the
+    # combatant's active ActiveEffect bonuses (Haste, Action Surge, ...) — see
+    # check_and_spend_action_budget/format_turn_budget_recap in
+    # backend/tools/_helpers.py. Reactions deliberately NOT tracked here —
+    # Character/Monster.reaction_available already works and isn't duplicated.
+    actions_remaining: int = 1
+    bonus_actions_remaining: int = 1
 
 
 class CombatantPosition(BaseModel):

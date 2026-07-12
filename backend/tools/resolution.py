@@ -14,8 +14,9 @@ from backend.models import (
 from backend.stores.campaign_store import CampaignStore
 from backend.tools._helpers import (
     advance_combatant_turn, apply_damage_to_character, apply_damage_to_monster,
-    critical_damage_notation, find_char, find_monster, has_plausible_reaction,
-    require_current_turn, roll_notation,
+    check_and_spend_action_budget, critical_damage_notation, find_char, find_monster,
+    format_turn_budget_recap, has_plausible_reaction, require_current_turn, roll_notation,
+    spell_action_type,
 )
 
 _ABILITIES = {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}
@@ -227,6 +228,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         damage_type_override: str = "",
         advantage: str = "none",
         attack_count: int = 1,
+        action_type: str = "action",
         end_turn: bool = False,
     ) -> str:
         """Resolve one or more attacks (roll to-hit, apply crit/fumble rules,
@@ -234,6 +236,13 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         any weapon or improvised-spell attack. Never roll to-hit and damage as
         separate roll_dice calls, and never apply the result with a separate
         update_character_hp/update_monster_hp call for an attack resolved here.
+
+        action_type: "action" | "bonus_action" — which of the attacker's turn
+        resources this attack spends (an off-hand/Two-Weapon-Fighting attack
+        is "bonus_action"; almost everything else, including a Multiattack
+        via attack_count, is "action"). Refused with a hard error if that
+        resource is already spent this turn — this is a real, enforced 5e
+        action-economy budget, not just a naming convention.
 
         Sourcing the attack's to-hit bonus and damage (in order):
         - attack_name: a named entry in the attacker's own attacks list
@@ -276,6 +285,9 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         turn_issue = require_current_turn(campaign, attacker_name)
         if turn_issue:
             return turn_issue
+        budget_issue = check_and_spend_action_budget(campaign, attacker_name, action_type)
+        if budget_issue:
+            return budget_issue
         target = find_char(campaign, target_name) or find_monster(campaign, target_name)
         if not target:
             return f"No character or monster named '{target_name}' found."
@@ -364,6 +376,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                     f"{prior}{label} — HIT{' (CRITICAL)' if is_crit else ''}. PENDING — "
                     f"{target_name} has a reaction available. Stop calling tools this "
                     f"turn; do not apply damage or narrate the outcome yet."
+                    + format_turn_budget_recap(campaign, attacker_name)
                 )
 
             dmg_total, dmg_breakdown = _roll_effect(swing_dice)
@@ -381,6 +394,10 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
             result_lines.append(hp_msg)
         if end_turn and enc and enc.is_active:
             result_lines.append(advance_combatant_turn(campaign, enc))
+        else:
+            recap = format_turn_budget_recap(campaign, attacker_name)
+            if recap:
+                result_lines.append(recap)
 
         await store.save(campaign)
         return "\n".join(result_lines)
@@ -622,6 +639,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         target_names: list[str] | None = None,
         slot_level: int | None = None,
         advantage: str = "none",
+        action_type: str | None = None,
         end_turn: bool = False,
         as_ritual: bool = False,
     ) -> str:
@@ -631,6 +649,12 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         resolve_attack's spell_name fallback whenever the caster's
         spells_known has this spell — only cast_spell grounds the roll with
         zero model-supplied numbers, and it consumes the slot for you.
+
+        action_type: "action" | "bonus_action" | "reaction" — which of the
+        caster's turn resources this costs. Defaults to whatever the spell's
+        own casting_time says (e.g. "1 bonus action" → bonus_action); only
+        pass this explicitly to override that in a genuine edge case. Refused
+        with a hard error if that resource is already spent this turn.
 
         target_names: required for an attack-roll or saving-throw spell
         (attack-roll uses only the first name); optional for an automatic
@@ -678,6 +702,11 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
             )
         if caster.spells_prepared and spell.name not in caster.spells_prepared:
             return f"'{spell_name}' is known but not currently prepared."
+
+        effective_action_type = action_type or spell_action_type(spell.casting_time)
+        budget_issue = check_and_spend_action_budget(campaign, caster_name, effective_action_type)
+        if budget_issue:
+            return budget_issue
 
         material = _material_requirement(spell.components)
         if material:
@@ -761,6 +790,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                         f"{label} — HIT{' (CRITICAL)' if is_crit else ''}. PENDING — "
                         f"{target_name} has a reaction available. Stop calling tools "
                         f"this turn; do not apply damage or narrate the outcome yet."
+                        + format_turn_budget_recap(campaign, caster_name)
                     )
                     return "\n".join(lines)
                 elif spell.effect_dice:
@@ -826,6 +856,10 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
 
         if end_turn and enc and enc.is_active:
             lines.append(advance_combatant_turn(campaign, enc))
+        else:
+            recap = format_turn_budget_recap(campaign, caster_name)
+            if recap:
+                lines.append(recap)
 
         await store.save(campaign)
         return "\n".join(lines)

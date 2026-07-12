@@ -201,6 +201,20 @@ input[type="text"]:focus, textarea:focus { outline: 2px solid var(--accent2); bo
 .rest-buttons button { flex: 1; }
 #rest-result { font-size: 0.78rem; margin-top: 0.3rem; white-space: pre-line; }
 
+/* ── unclaimed loot panel ────────────────────────────────────────────────── */
+.loot-container { margin-bottom: 0.6rem; }
+.loot-container:last-child { margin-bottom: 0; }
+.loot-source {
+  color: var(--accent2); font-size: 0.78rem; font-weight: bold;
+  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem;
+}
+.loot-row {
+  display: flex; align-items: center; gap: 0.35rem;
+  font-size: 0.82rem; margin-bottom: 0.3rem;
+}
+.loot-row .loot-name { flex: 1; }
+.loot-row .loot-target { flex: none; max-width: 6.5rem; font-size: 0.78rem; }
+
 /* ── factions & NPCs ─────────────────────────────────────────────────────── */
 .faction-list, .npc-list { list-style: none; display: flex; flex-direction: column; gap: 0.5rem; }
 .faction-entry, .npc-entry { font-size: 0.85rem; }
@@ -364,6 +378,23 @@ input[type="text"]:focus, textarea:focus { outline: 2px solid var(--accent2); bo
 }
 .player-message.ooc-message { border: 1px dashed var(--accent2); }
 .dm-message.ooc-message { border-left-style: dashed; background: var(--bg); }
+
+/* ── combat-mode turn panel ──────────────────────────────────────────────── */
+.combat-turn-panel {
+  padding: 0.75rem 1.25rem;
+  border-top: 2px solid var(--accent);
+  background: #2a1515;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.combat-turn-header { display: flex; justify-content: space-between; align-items: baseline; }
+.combat-turn-header h4 { color: var(--accent); margin: 0; }
+.combat-turn-row { display: flex; align-items: center; gap: 0.5rem; }
+.combat-turn-row label { flex: none; width: 6rem; font-size: 0.85rem; color: var(--text-dim); }
+.combat-turn-row select { flex: 1; }
+.combat-turn-hint { font-size: 0.78rem; margin: 0; }
+#combat-turn-submit { align-self: flex-start; }
 
 /* ── input form ──────────────────────────────────────────────────────────── */
 .input-form {

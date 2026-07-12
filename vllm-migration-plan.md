@@ -182,17 +182,61 @@ hybrid design would have (see §6) — there's no Ollama fallback quietly still 
 | `backend/rag/grading.py:27,58` | `grade_sufficiency` / `reformulate_query` (CRAG-style retrieval grading) | |
 | `backend/rag/reranker.py:87` | `LLMJudgeReranker` | |
 
-**Embeddings stay on Ollama, unchanged** — `nomic-embed-text` (274MB, per `ollama list`)
-via `OllamaEmbeddings` in `backend/stores/rules_store.py:67` and
-`backend/stores/history_store.py:55,129`. Trivial RAM footprint, and per §1's second
-reason, isolating it as the *only* thing Ollama serves is itself a fix, not just a thing
-left alone.
+**Embeddings ALSO move off Ollama, onto vLLM — revised 2026-07-13, verified live.**
+Originally this plan kept `nomic-embed-text` on Ollama (isolating it as Ollama's only
+remaining job was itself framed as a fix — see §1's second reason). Superseded: a live
+test confirmed `nomic-embed-text`'s architecture (`NomicBertModel`, a BERT-family
+encoder) **cannot be served via vllm-metal at all** — `vllm-metal` delegates model
+loading entirely to `mlx_lm`, which is a causal-LM-only library (confirmed by listing
+every file in `mlx_lm/models/` — zero BERT/encoder architectures exist there, this is
+an architecture-class gap, not a config or quantization issue). But a real alternative
+works: **`mlx-community/Qwen3-Embedding-0.6B-8bit`**, served via `vllm serve ...
+--convert embed` (vLLM's adapter for repurposing a causal generation model as a
+pooling/embedding model) — verified live: real `POST /v1/embeddings` requests returned
+correct 1024-dim vectors, ~74MB resident, 5.6 embeds/sec on a batch of 8. Since this
+model's architecture (`Qwen3` dense, non-MoE) is one `mlx_lm` already supports for chat,
+it loads cleanly with no weight-naming issues (unlike the raw non-mlx-community
+`Qwen/Qwen3-Embedding-0.6B` checkpoint, which failed to load — always use an
+`mlx-community` pre-converted checkpoint, never a raw HF one, on this stack).
+
+**Consequence, accepted**: `Qwen3-Embedding-0.6B` outputs 1024-dim vectors vs.
+`nomic-embed-text`'s 768-dim. `backend/stores/tables.py`'s `EMBEDDING_DIM = 768` and
+every `Vector(EMBEDDING_DIM)` column change to 1024 (§7.7), which means **every existing
+embedding in `rule_chunks`/`session_chronicle_chunks` is invalidated and must be
+regenerated from scratch** — not an incremental migration. Accepted explicitly: this
+migration is already doing a full re-embed of the whole corpus regardless (the
+ChromaDB→pgvector move earlier this week), so folding in one more full re-embed for a
+better embedding model is low marginal cost, not a new one.
+
+Call sites moving to the new embedding client: `backend/stores/rules_store.py:67` and
+`backend/stores/history_store.py:55,129` (both currently `OllamaEmbeddings`), plus
+`scripts/build_index.py`'s `DEFAULT_EMBED`/`ollama_embeddings(...)` call (the offline
+reindex pipeline) and `backend/llm.py`'s `ollama_embeddings()` factory itself, which
+gets a `vllm_embeddings()` sibling (or is repointed, since nothing else uses Ollama
+embeddings once this lands).
+
+**Architecture consequence: two separate vLLM-metal server processes, not one.** vLLM
+serves one model per process/port — the 30B-A3B chat model (§3.1, port 8100) and the
+0.6B embedding model need their own `vllm serve` invocations. Each was verified
+individually (chat: §8 Step 0; embed: this section) with comfortable headroom on its
+own — the embedding server's footprint (~74MB `ps` RSS, likely more once real
+Metal-resident weight accounting is checked properly — see §4) is trivial next to the
+16GB chat model. **Not yet verified: both running at the same time** (they were tested
+sequentially, chat stopped before embed started) — do this before relying on the
+two-server design, per §4's note.
+
+With this change, **Ollama has no role left in the live app's runtime path at all**
+(stronger than §1's original framing, which only isolated Ollama down to the embedder) —
+it remains installed only for §6's manual "break glass" fallback procedure, not any
+normal request path.
 
 **Migration = replace every `ChatOllama(model=settings.mechanics_model, ...)`
 construction above with an equivalent `langchain_openai.ChatOpenAI` pointed at
-vLLM-metal's OpenAI-compatible endpoint.** Same model identity throughout (one served
-checkpoint), same call shapes (temperature/reasoning params carry over conceptually),
-different client library and base URL.
+vLLM-metal's OpenAI-compatible endpoint** (same model identity throughout, one served
+checkpoint, same call shapes — temperature/reasoning params carry over conceptually,
+different client library and base URL), **plus replace every `OllamaEmbeddings`
+construction with `langchain_openai.OpenAIEmbeddings` pointed at the second vLLM-metal
+server** (§7.7).
 
 ---
 
@@ -298,23 +342,60 @@ analogous problem — `_detect_fake_tool_call`, `_detect_invented_spells`, aroun
 main agent, but is **not spec'd out in this plan** — keep this migration's first pass
 scoped to `get_agent()`'s `mechanics_node`.
 
+### 3.6 Embeddings: a second, small vLLM-metal server (`mlx-community/Qwen3-Embedding-0.6B-8bit`)
+
+See the revised note in §2 for the full rationale (`nomic-embed-text` architecturally
+can't run on `mlx_lm`/vllm-metal at all; this is the verified-live replacement, not a
+guess). Design consequences specific to this second server:
+
+- **Separate process, separate port** from the chat model (§3.1) — vLLM serves one
+  model per process. Suggest `--port 8101` (chat stays `8100`), same
+  `host.docker.internal` reachability pattern as the chat server.
+- **`--convert embed`**, not `--enable-auto-tool-choice`/`--tool-call-parser` — this
+  server has no tool-calling concerns at all, it's pure pooling/embedding.
+- Both `RulesStore`/`HistoryStore`'s embedding calls (`backend/stores/rules_store.py:67`,
+  `backend/stores/history_store.py:55,129`) and `scripts/build_index.py`'s offline
+  reindex embedding calls point at this server — same client, same model, dev and
+  production paths unified (no separate "embed locally, differently" step).
+- **`EMBEDDING_DIM` changes from 768 to 1024** (`backend/stores/tables.py`) — this is a
+  breaking schema change, not additive. See §7.7.
+- Process supervision (§6/§7.1's `launchd` requirement) applies to this server too, not
+  just the chat one — a dead embedding server silently breaks `search_rules`/
+  `search_lore`/`search_campaign_history` (dense half of the hybrid search) even if the
+  chat model is perfectly healthy. Both need independent health checks.
+- **Not yet verified**: both servers resident and serving traffic *at the same time*.
+  Step 0 (§8) verified the chat server alone, then stopped it before separately
+  verifying the embedding server — confirm actual concurrent residency (§4) before
+  relying on this design for real.
+
 ---
 
 ## 4. Resource budget
 
 Full swap changes this math for the better vs. the abandoned hybrid design — only one
-large model is ever resident, not two:
+large model is ever resident, not two (the embedding server, per §3.6, is small enough
+not to change this calculus):
 
-- vLLM-metal: one instance, `mlx-community/Qwen3-30B-A3B-4bit`. **Not yet measured live**
-  — the ~25GB Metal ceiling figure below this line was Gemma4-specific (self-claimed in
-  that spike, tunable via `--gpu-memory-utilization`). Rough estimate for Qwen3-30B-A3B
-  at 4-bit: ~30.5B params × ~0.5 bytes/param ≈ 15-17GB of weights alone, similar ballpark
-  to Gemma4-26b's 17GB — but this ignores KV cache overhead and hasn't been confirmed
-  against a real `--gpu-memory-utilization` ceiling the way the Gemma4 number was. Get a
-  real number during §8 Step 0, don't ship on this estimate.
-- Ollama: `nomic-embed-text` only, 274MB. Trivial, always-resident is fine.
-- Total on this 32GB Mac: comfortably fits without evicting anything, unlike the
-  abandoned hybrid design's 17GB+25GB math — assuming the estimate above holds; confirm.
+- vLLM-metal (chat): one instance, `mlx-community/Qwen3-30B-A3B-4bit`. **Verified live
+  in §8 Step 0**: 16GB on disk (matches the ~15-17GB estimate), comfortable headroom —
+  system-wide memory free stayed at 84% (`memory_pressure`'s authoritative metric, not
+  raw `vm_stat` free-page count) with this model resident and the core rules corpus
+  reindex running concurrently in Docker. No `--gpu-memory-utilization` override was
+  needed for this to work — Step 0 ran with the default. A real ceiling reading is still
+  nice-to-have for production tuning (§9) but isn't blocking.
+- vLLM-metal (embed): one instance, `mlx-community/Qwen3-Embedding-0.6B-8bit`. **Verified
+  live, but separately from the chat server (chat was stopped first) — NOT yet confirmed
+  concurrently resident with it**: ~74MB `ps` RSS (likely an undercount the same way the
+  chat model's was — Metal/MLX GPU allocations don't fully show up in standard RSS
+  accounting — but trivial either way next to the 16GB chat model), 5.6 embeds/sec on a
+  batch-of-8 request.
+- Ollama: no longer serving anything in the normal runtime path (§2) — kept installed
+  only for §6's manual break-glass fallback.
+- Total on this 32GB Mac: chat-alone and embed-alone both individually confirmed
+  comfortable. Both servers loaded AT THE SAME TIME (the real production shape) has not
+  been tested yet — do this before treating §3.6's two-server design as settled (should
+  be trivial: ~74MB + 16GB is nowhere near 32GB, but confirm rather than assume, per
+  this whole plan's own verify-don't-assume discipline).
 
 **Still verify before shipping, because the *usage pattern* changed, not just the model
 count:** every one of §2's call sites now hits the same vLLM server — world-prep/
@@ -491,6 +572,50 @@ Add the vLLM equivalent of the existing `OLLAMA_BASE_URL: http://host.docker.int
 line — a new env var (`VLLM_BASE_URL` or whatever §7.3 settles on) pointed at
 `host.docker.internal:<vllm-port>`.
 
+### 7.7 Embeddings migration (§2/§3.6): `nomic-embed-text` → `Qwen3-Embedding-0.6B-8bit`
+
+New work beyond the original plan — do this as a genuinely separate step/commit from
+§7.1-7.6's chat-model swap, since it has its own moving parts and its own full-reindex
+consequence:
+
+- **Stand up the second vLLM-metal server** (§3.6): `vllm serve
+  mlx-community/Qwen3-Embedding-0.6B-8bit --port 8101 --convert embed`. Same process-
+  supervision requirement as the chat server (§7.1) — a separate `launchd` entry, not an
+  afterthought.
+- **`backend/config.py`**: add `vllm_embed_base_url`/`embed_model` settings (naming:
+  match this file's existing style), pointing at the new server's URL and model name.
+- **`backend/llm.py`**: add a `vllm_embeddings()` factory (mirrors `ollama_embeddings()`'s
+  shape/cross-cutting policy — timeout, base_url override for scripts — using
+  `langchain_openai.OpenAIEmbeddings` instead of `OllamaEmbeddings`). Once this lands,
+  `ollama_embeddings()` has no remaining callers anywhere in the app — remove it (and the
+  `ollama_base_url` config it depended on, if truly nothing else uses it) rather than
+  leaving dead code.
+- **`backend/stores/rules_store.py:67`, `backend/stores/history_store.py:55,129`**:
+  swap `ollama_embeddings(...)` for `vllm_embeddings(...)`.
+- **`scripts/build_index.py`**: swap `DEFAULT_EMBED`/its `ollama_embeddings(...)` call
+  for the new factory — same file, same resumability logic, just a different embedding
+  client underneath.
+- **`backend/stores/tables.py`**: `EMBEDDING_DIM = 768` → `1024`. This changes the
+  `Vector(EMBEDDING_DIM)` column type on both `rule_chunks.embedding` and
+  `session_chronicle_chunks.embedding` — needs a new Alembic migration
+  (`ALTER COLUMN embedding TYPE vector(1024)`, or drop+recreate if a plain `ALTER
+  COLUMN TYPE` on a `vector` column with existing incompatible-dimension data doesn't
+  work cleanly — check live, don't assume `ALTER COLUMN TYPE` just silently truncates/
+  errors gracefully). The HNSW index on that column also needs rebuilding after the
+  dimension change (index built against the old 768-dim data is meaningless once the
+  column changes).
+- **Full re-embed required, no partial/incremental path**: every existing row's
+  `embedding` value was computed at 768 dimensions and is incompatible with the new
+  column type — this is not a case where `build_index.py`'s normal "skip existing
+  chunk_ids" resumability helps; every row needs its embedding recomputed. Practically:
+  either wipe+rebuild `rule_chunks` (`--wipe` or `--fresh` per-scope, see
+  `scripts/build_index.py`'s own flags) timed to happen together with whatever reindex
+  is already in progress for the ChromaDB→pgvector move (don't do this migration's
+  re-embed as a THIRD separate full reindex pass if it can be folded into the
+  currently-running one), and re-run `scripts/backfill_history_chunks.py` for
+  `session_chronicle_chunks` (already idempotent/safe to re-run, per that script's own
+  design).
+
 ---
 
 ## 8. Verification plan
@@ -545,6 +670,17 @@ design — manual, scenario-driven, check real state not narration).
    `_detect_missing_followup`'s "no tool calls at all" branch or
    `_detect_missing_combat_roll_followup` have fired even once post-migration. If they
    have, that's a `conclude_turn`/forcing bug to chase down, not expected noise (§3.2).
+9. **NEW (§3.6/§7.7) — concurrent residency of both vLLM-metal servers**: start chat and
+   embed servers together, confirm both stay up and responsive under real mixed traffic
+   (a live mechanics turn plus a `search_rules` call close together) — individually
+   verified, never verified together (see §4's note).
+10. **NEW (§7.7) — post-re-embed retrieval sanity check**: after the full re-embed onto
+    1024-dim `Qwen3-Embedding-0.6B-8bit` vectors, re-run `scripts/eval_retrieval.py`
+    (the hand-labeled recall@k eval) and compare against whatever baseline numbers exist
+    from the 768-dim `nomic-embed-text` corpus — confirm the new embedding model is at
+    least as good for this corpus, not just "different." A model swap that quietly
+    regresses retrieval quality would be a real product regression, not just an infra
+    change.
 
 ---
 
@@ -559,7 +695,15 @@ design — manual, scenario-driven, check real state not narration).
   override successfully, but fill in real production values once measured against real
   `dm_agent.py` usage patterns (see `_MAX_MESSAGES = 100`).
 - Final process-supervision mechanism for §7.1 (`launchd` plist vs. something else) —
-  now load-bearing, not optional (§6) — pick and document.
+  now load-bearing, not optional (§6), for BOTH vLLM-metal servers (chat and embed,
+  §3.6) — pick and document.
+- **New (§7.7)**: whether `--gpu-memory-utilization` needs an explicit split/cap once
+  both servers run concurrently (untested — §4/§8 item 9), to stop one server from
+  greedily claiming Metal memory the other needs.
+- **New (§7.7)**: exact Alembic migration mechanics for changing `rule_chunks`/
+  `session_chronicle_chunks.embedding` from `vector(768)` to `vector(1024)` — confirm
+  live whether a plain `ALTER COLUMN ... TYPE vector(1024)` works against existing
+  768-dim data or needs a drop+recreate, before writing the migration.
 - Whether to keep the `gemma4:26b-mlx` Ollama tag pulled (for the manual break-glass
   fallback in §6) or let it lapse — recommend keeping it, the disk cost is small
   relative to the operational value of a fast manual recovery path.

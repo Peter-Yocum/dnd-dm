@@ -34,6 +34,12 @@ import re
 import sys
 from pathlib import Path
 
+# Make `backend` importable (for backend.llm's Ollama client factory) when run
+# as `python scripts/add_headers.py` from anywhere — Python sets sys.path[0]
+# to this script's own directory, not the repo root. Same shim as the
+# backfill_* scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 DEFAULT_INPUT  = "docs/source"
 DEFAULT_MODEL  = "gemma4:26b-mlx"
 DEFAULT_OLLAMA = "http://localhost:11434"
@@ -137,16 +143,14 @@ def _classify_batch(
     the result (falls back to no header, same as today) rather than voiding
     every other classification in the batch — a single malformed line out of
     25 shouldn't cost 24 good ones."""
-    from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
+
+    from backend.llm import ollama_chat
 
     numbered = "\n".join(f"{i + 1}: {c.strip()}" for i, c in enumerate(candidates))
     prompt = _PROMPT.format(numbered=numbered, n=len(candidates))
 
-    # Heading classification is a bounded task — no reasoning needed, and for
-    # thinking-capable models (e.g. gemma4:26b-mlx) a hidden reasoning trace
-    # can dwarf the actual output (see clean_source.py's _clean_paragraph).
-    llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
+    llm = ollama_chat(model=model, base_url=ollama_url, timeout=None)
     response = llm.invoke([SystemMessage(content=_SYSTEM), HumanMessage(content=prompt)])
     lines = [l for l in response.content.strip().splitlines() if l.strip()]
 

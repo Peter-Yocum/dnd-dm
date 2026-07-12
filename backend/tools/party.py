@@ -8,7 +8,7 @@ from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.graph_store import RelationGraphStore
 from backend.stores.lore_store import LoreStore
-from backend.tools._helpers import all_campaign_item_names, apply_damage_to_character, char_summary, find_char
+from backend.tools._helpers import all_campaign_item_names, apply_damage_to_character, char_summary, find_char, with_ability_mod
 from backend.tools.loot_generator import ARMOR_BONUS_RARITY, WEAPON_LIKE_BONUS_RARITY
 
 
@@ -351,7 +351,7 @@ def make_tools(
             char.attacks.append(Attack(
                 name=item_name,
                 to_hit_bonus=char.proficiency_bonus + to_hit_mod + bonus,
-                damage_dice=f"{weapon['damage_dice']}+{bonus}" if bonus else weapon["damage_dice"],
+                damage_dice=with_ability_mod(weapon["damage_dice"], to_hit_mod + bonus),
                 damage_type=weapon["damage_type"],
                 range_ft=weapon["range_ft"],
                 notes=description,
@@ -411,7 +411,7 @@ def make_tools(
         char.attacks.append(Attack(
             name=item_name,
             to_hit_bonus=to_hit_bonus,
-            damage_dice=weapon["damage_dice"],
+            damage_dice=with_ability_mod(weapon["damage_dice"], to_hit_mod),
             damage_type=weapon["damage_type"],
             range_ft=weapon["range_ft"],
         ))

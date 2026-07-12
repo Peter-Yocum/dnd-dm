@@ -301,9 +301,13 @@
 
 <script>
   // ── thread_id management ──────────────────────────────────────────────────
-  // The server generates a fresh thread_id on every page load. We store it in
-  // sessionStorage so refreshes within the same tab reuse the same LangGraph
-  // thread. Closing the tab / ending the session clears it.
+  // The server is the source of truth: it hands back campaign.active_thread_id
+  // (backend/main.py's game() route) — the same open thread on every load
+  // until session/end closes it out — so a closed tab or a restarted browser
+  // resumes the in-progress session instead of silently starting a new,
+  // empty one. sessionStorage below is just a same-tab convenience on top of
+  // that (avoids a hydrateMessages() round trip on a plain refresh); it is
+  // never the only copy of which thread is active.
 
   const CAMPAIGN_ID   = "{{ campaign.id }}";
   const INITIAL_TID   = "{{ thread_id }}";
@@ -496,21 +500,38 @@
     const sendBtn = document.getElementById("send-btn");
     sendBtn.disabled = true;
 
-    const dmDiv = appendMessage("dm-message streaming", "<p></p>");
-    const p = dmDiv.querySelector("p");
-    let thinkingTimer = startThinking(p);
+    let dmDiv = null;
+    let thinkingTimer = null;
     let rawText = "";
     let stallDivs = [];
 
-    const url = `/campaigns/${campaignId}/stream?thread_id=${encodeURIComponent(currentThreadId)}`;
-    activeSource = new EventSource(url);
-
-    activeSource.addEventListener("token", e => {
+    // The DM-bubble lifecycle lives in these three helpers ONLY — the
+    // token/turn_boundary/done/error handlers reuse them rather than each
+    // re-implementing open/close steps (the copies had already started
+    // drifting in how they guarded the thinking timer).
+    function openBubble() {
+      dmDiv = appendMessage("dm-message streaming", "<p></p>");
+      rawText = "";
+      thinkingTimer = startThinking(dmDiv.querySelector("p"));
+    }
+    function clearThinking() {
       if (thinkingTimer) {
         clearInterval(thinkingTimer);
         thinkingTimer = null;
       }
       clearStallDivs(stallDivs);
+    }
+    function settleBubble() {
+      clearThinking();
+      dmDiv.classList.remove("streaming");
+    }
+    openBubble();
+
+    const url = `/campaigns/${campaignId}/stream?thread_id=${encodeURIComponent(currentThreadId)}`;
+    activeSource = new EventSource(url);
+
+    activeSource.addEventListener("token", e => {
+      clearThinking();
       const msgs = document.getElementById("messages");
       const pinned = isPinnedToBottom(msgs);
       rawText += e.data;
@@ -520,6 +541,17 @@
       // paragraph, since an OOC answer isn't in-fiction prose at all.
       dmDiv.classList.toggle("ooc-message", rawText.trimStart().startsWith("🛈"));
       if (pinned) msgs.scrollTop = msgs.scrollHeight;
+    });
+
+    // A second (or later) combatant's turn is about to start narrating in
+    // this same reply (see get_agent()'s narrator_node / TURN_BOUNDARY in
+    // dm_agent.py) — close out the bubble that just finished and open a
+    // fresh one, re-showing the same "Rolling behind the screen…" indicator
+    // for the gap before this next beat's first token arrives, instead of
+    // silently appending it into the previous beat's text.
+    activeSource.addEventListener("turn_boundary", () => {
+      settleBubble();
+      openBubble();
     });
 
     activeSource.addEventListener("stall", e => {
@@ -533,9 +565,7 @@
     });
 
     activeSource.addEventListener("done", () => {
-      if (thinkingTimer) clearInterval(thinkingTimer);
-      clearStallDivs(stallDivs);
-      dmDiv.classList.remove("streaming");
+      settleBubble();
       activeSource.close();
       activeSource = null;
       sendBtn.disabled = false;
@@ -543,9 +573,7 @@
     });
 
     activeSource.addEventListener("error", e => {
-      if (thinkingTimer) clearInterval(thinkingTimer);
-      clearStallDivs(stallDivs);
-      dmDiv.classList.remove("streaming");
+      settleBubble();
       // e.data is only set for our own server-sent "error" event (see the
       // except block around watch_for_stalls in main.py) — a native
       // connection-drop error has no data, so fall back to a generic note.

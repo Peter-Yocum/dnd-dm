@@ -834,6 +834,16 @@ class Campaign(BaseModel):
 
     session_count: int = 0
     notes: str = ""
+    # Durable pointer to the LangGraph thread for the session currently in
+    # progress (set on first page load after the prior session ended, cleared
+    # once session/end saves it). Browser sessionStorage is only a same-tab
+    # optimization on top of this — it does NOT survive a closed tab or a
+    # browser restart, so without a server-side source of truth, reopening
+    # the campaign mid-session minted a brand-new empty thread instead of
+    # resuming the open one, orphaning everything played since the last
+    # reload. Confirmed live 2026-07-10/11: a single evening's play ended up
+    # split across three separate threads this way.
+    active_thread_id: str = ""
 
     # Active safety flags (X-card) — topics the table has asked the DM agent to
     # steer away from. Cleared by the DM once handled; the permanent audit trail

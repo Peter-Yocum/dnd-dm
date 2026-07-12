@@ -16,9 +16,9 @@ import logging
 from pathlib import Path
 
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
 
 from backend.config import settings
+from backend.llm import ollama_embeddings
 from backend.rag.hybrid import BM25Index, reciprocal_rank_fusion
 from backend.rag.reranker import LLMJudgeReranker, Reranker
 from backend.stores.rules_store import RuleChunk
@@ -48,15 +48,7 @@ class HistoryStore:
         if self._store is None:
             self._store = Chroma(
                 collection_name=self.COLLECTION,
-                # client_kwargs timeout — see rules_store.py's load() for why:
-                # an unbounded httpx client leaks a thread-pool worker forever
-                # on a hung Ollama request, and enough leaks freeze the whole
-                # app, not just this call.
-                embedding_function=OllamaEmbeddings(
-                    model="nomic-embed-text",
-                    base_url=self._ollama_base_url,
-                    client_kwargs={"timeout": 60.0},
-                ),
+                embedding_function=ollama_embeddings(base_url=self._ollama_base_url),
                 persist_directory=self._persist_dir,
             )
         return self._store
@@ -126,9 +118,7 @@ class HistoryStore:
             return
 
         contextualizer = ChunkContextualizer(ollama_base_url=self._ollama_base_url)
-        embeddings_fn = OllamaEmbeddings(
-            model="nomic-embed-text", base_url=self._ollama_base_url, client_kwargs={"timeout": 60.0}
-        )
+        embeddings_fn = ollama_embeddings(base_url=self._ollama_base_url)
 
         ids, documents, metadatas, embed_texts = [], [], [], []
         for i, (event_text, event_type) in enumerate(events):

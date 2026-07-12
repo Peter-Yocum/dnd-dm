@@ -23,6 +23,12 @@ import re
 import sys
 from pathlib import Path
 
+# Make `backend` importable (for backend.llm's Ollama client factory) when run
+# as `python scripts/clean_source.py` from anywhere — Python sets sys.path[0]
+# to this script's own directory, not the repo root. Same shim as the
+# backfill_* scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 DEFAULT_INPUT  = "docs/source"
 DEFAULT_MODEL  = "gemma4:26b-mlx"
 DEFAULT_OLLAMA = "http://localhost:11434"
@@ -94,14 +100,15 @@ _PROMPT_ECHO_MARKERS = [
 
 def _clean_paragraph(text: str, before: str, after: str, model: str, ollama_url: str) -> str:
     """Send one paragraph to Ollama for cleanup and return the corrected version."""
-    from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    # Correction is a bounded fix-only-flagged-words task — no reasoning needed,
-    # and for thinking-capable models (e.g. gemma4:26b-mlx) a hidden reasoning
-    # trace can dwarf the actual output (observed: 8779 eval tokens/255s with
+    from backend.llm import ollama_chat
+
+    # reasoning=False matters especially here (now factory-enforced): for
+    # thinking-capable models (e.g. gemma4:26b-mlx) a hidden reasoning trace
+    # can dwarf the actual output (observed: 8779 eval tokens/255s with
     # thinking vs. 1169 eval tokens/42s without, for the same paragraph).
-    llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
+    llm = ollama_chat(model=model, base_url=ollama_url, timeout=None)
     prompt = _PROMPT.format(
         before=before or "(start of file)",
         target=text,

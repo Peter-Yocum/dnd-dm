@@ -19,15 +19,11 @@ def grade_sufficiency(query: str, chunks: list[RuleChunk], model: str = settings
     if not chunks:
         return False
 
-    from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    # client_kwargs timeout — see rules_store.py's load() for why: an
-    # unbounded client leaks a thread-pool worker forever on a hung request.
-    llm = ChatOllama(
-        model=model, base_url=settings.ollama_base_url, temperature=0, reasoning=False,
-        client_kwargs={"timeout": 120.0},
-    )
+    from backend.llm import ollama_chat
+
+    llm = ollama_chat(model=model)
     excerpt = "\n\n---\n\n".join(c.content[:500] for c in chunks[:5])
     response = llm.invoke([
         SystemMessage(content=(
@@ -50,15 +46,11 @@ def reformulate_query(query: str, model: str = settings.mechanics_model) -> str:
     """One alternate phrasing of the query — widens the net for a re-retrieve
     when the first pass was judged insufficient. Falls back to the original
     query unchanged on any parse/generation failure."""
-    from langchain_ollama import ChatOllama
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    # client_kwargs timeout — see rules_store.py's load() for why: an
-    # unbounded client leaks a thread-pool worker forever on a hung request.
-    llm = ChatOllama(
-        model=model, base_url=settings.ollama_base_url, temperature=0, reasoning=False,
-        client_kwargs={"timeout": 120.0},
-    )
+    from backend.llm import ollama_chat
+
+    llm = ollama_chat(model=model)
     response = llm.invoke([
         SystemMessage(content=(
             "You rewrite a search query as one alternate phrasing that might "

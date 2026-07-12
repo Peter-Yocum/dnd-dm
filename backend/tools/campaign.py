@@ -1,8 +1,6 @@
-from datetime import date
-
 from langchain_core.tools import tool
 
-from backend.models import QuestStatus, Session
+from backend.models import QuestStatus
 from backend.stores.campaign_store import CampaignStore
 from backend.tools._helpers import read_adventure_meta
 
@@ -52,24 +50,20 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
 
     @tool
     async def add_session_note(note: str) -> str:
-        """Append an important event or note to the current session log.
-        Creates a new session record if none is active. Use for significant
-        moments: a major reveal, a PC decision, loot found, an alliance formed."""
-        campaign = await store.load(campaign_id)
-
-        # Find or create the current session
-        if campaign.sessions:
-            session = campaign.sessions[-1]
-        else:
-            campaign.session_count += 1
-            session = Session(
-                session_number=campaign.session_count,
-                real_date=date.today(),
-            )
-            campaign.sessions.append(session)
-
-        session.key_events.append(note)
-        await store.save(campaign)
-        return f"[Session {session.session_number}] Note recorded: {note}"
+        """Flag an important event or note from the current session — a major
+        reveal, a PC decision, loot found, an alliance formed. Purely a
+        marker in the live transcript for your own reference; the session's
+        real chronicle (summary + key events) is generated fresh from the
+        full transcript when the session actually ends (see
+        summarize_session), which already sees this note. Does not touch
+        campaign.sessions itself — that list holds only closed, summarised
+        sessions. It previously appended straight into campaign.sessions,
+        which corrupted history two ways: called before any session had
+        closed, it fabricated a phantom "Session 1" with no thread_id/
+        summary that desynced all later session numbering; called after one
+        had closed, it silently appended live notes into that already-
+        summarised, closed session's key_events instead of the one actually
+        in progress."""
+        return f"Noted: {note}"
 
     return [get_campaign_summary, add_session_note]

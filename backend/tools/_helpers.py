@@ -233,21 +233,50 @@ def apply_short_rest(campaign: Campaign) -> str:
     return "The party takes a short rest.\n" + "\n".join(lines)
 
 
+def with_ability_mod(dice: str, modifier: int) -> str:
+    """Combine a base weapon-table damage dice string with a flat modifier,
+    formatted the way _DICE_RE parses it back ("1d6"+4 -> "1d6+4", "1d6"+-1
+    -> "1d6-1", "1d6"+0 -> "1d6" unchanged). Every PC weapon-damage call site
+    (chargen's starting weapon, unarmed strike, add_weapon_attack,
+    create_magic_item) uses this — 2026-07-11: previously none of them did,
+    which meant Attack.damage_dice only ever carried the bare weapon-table
+    die (equipment.py's WEAPONS, e.g. Shortbow's "1d6") with the character's
+    STR/DEX modifier silently never added at any point in the pipeline
+    (resolve_attack rolls damage_dice as stored — see resolution.py), while
+    to_hit_bonus correctly included it the whole time. Caught live: a
+    level-1 Shortbow user with DEX 18 (+4) rolling "6 piercing" damage that
+    should have been 7-10. Previously described as "a known simplification"
+    (see unarmed_strike_attack's old docstring) but a real accuracy gap, not
+    a deliberate design choice — every character with a positive modifier
+    (nearly all of them) was underdealing damage.
+
+    Caveat for a future ASI/stat-change feature: unlike to_hit_bonus (a
+    patchable int, see levelup.py), "1d6+4" carries no record of which part
+    is weapon vs. modifier — recompute from the weapon table rather than
+    delta-patching the string."""
+    if modifier > 0:
+        return f"{dice}+{modifier}"
+    if modifier < 0:
+        return f"{dice}{modifier}"
+    return dice
+
+
 def unarmed_strike_attack(str_mod: int) -> Attack:
     """Every creature can always make an unarmed strike (PHB) regardless of
     what weapon, if any, it's currently carrying — a baseline every
     character should have, not just one a DM remembers to add by hand when
     a character loses or is stripped of their weapon (e.g. captured at the
     start of an adventure). 1d4 bludgeoning rather than RAW's flat 1 damage:
-    this app's weapon table (equipment.py's WEAPONS) already doesn't bake
-    ability modifiers into damage_dice, a known simplification, and
     roll_notation requires a real die (2-1000 sides) so a flat value isn't
     representable anyway — 1d4 matches the lightest real weapons (Dagger)
-    rather than inventing a new convention."""
+    rather than inventing a new convention. STR mod IS included (see
+    with_ability_mod) — RAW unarmed strike is "1 + STR mod", and now that
+    every other attack in this app correctly includes its modifier, leaving
+    this one out would make it disproportionately weak by comparison."""
     return Attack(
         name="Unarmed Strike",
         to_hit_bonus=2 + str_mod,  # proficiency bonus is always +2 at level 1
-        damage_dice="1d4",
+        damage_dice=with_ability_mod("1d4", str_mod),
         damage_type=DamageType.BLUDGEONING,
         range_ft="5",
     )
@@ -270,7 +299,7 @@ def _starting_equipment(ab: AbilityScores, char_class: str, dex_mod: int, str_mo
     attacks = [Attack(
         name=weapon_name,
         to_hit_bonus=2 + to_hit_mod,  # proficiency bonus is always +2 at level 1
-        damage_dice=weapon["damage_dice"],
+        damage_dice=with_ability_mod(weapon["damage_dice"], to_hit_mod),
         damage_type=weapon["damage_type"],
         range_ft=weapon["range_ft"],
     ), unarmed_strike_attack(str_mod)]

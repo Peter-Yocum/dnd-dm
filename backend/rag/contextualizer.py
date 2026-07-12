@@ -35,10 +35,11 @@ class ChunkContextualizer:
         connection failure — the caller (build_index.py) decides whether to
         skip-and-retry-later, matching extract_entities.py's per-item
         skip-on-doubt philosophy rather than aborting the whole run."""
-        from langchain_ollama import ChatOllama
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = ChatOllama(model=self._model, base_url=self._ollama_base_url, temperature=0, reasoning=False)
+        from backend.llm import ollama_chat
+
+        llm = ollama_chat(model=self._model, base_url=self._ollama_base_url)
         # Cap the parent section handed to the model — it's context for the
         # blurb, not something that needs to be reproduced or fully quoted.
         parent_excerpt = parent_section_text[:4000]

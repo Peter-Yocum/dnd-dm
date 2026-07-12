@@ -232,10 +232,11 @@ def build_documents(source_dir: Path) -> list[dict]:
 
 def _get_chroma(chroma_dir: str, ollama_url: str):
     from langchain_chroma import Chroma
-    from langchain_ollama import OllamaEmbeddings
+
+    from backend.llm import ollama_embeddings
     return Chroma(
         collection_name=COLLECTION,
-        embedding_function=OllamaEmbeddings(model=DEFAULT_EMBED, base_url=ollama_url),
+        embedding_function=ollama_embeddings(model=DEFAULT_EMBED, base_url=ollama_url, timeout=None),
         persist_directory=chroma_dir,
     )
 
@@ -308,13 +309,14 @@ def _index_documents(
     all_docs: list[dict], chroma_dir: str, ollama_url: str,
     skip_contextualization: bool, force: bool, context_model: str | None = None,
 ) -> None:
-    from langchain_ollama import OllamaEmbeddings
     from tqdm import tqdm
+
+    from backend.llm import ollama_embeddings
     from backend.rag.contextualizer import ChunkContextualizer
 
     store = _get_chroma(chroma_dir, ollama_url)
     collection = store._collection
-    embeddings_fn = OllamaEmbeddings(model=DEFAULT_EMBED, base_url=ollama_url)
+    embeddings_fn = ollama_embeddings(model=DEFAULT_EMBED, base_url=ollama_url, timeout=None)
     if skip_contextualization:
         contextualizer = None
     elif context_model:

@@ -32,9 +32,22 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - .:/app                          # mount source for hot reload
-      - ./data/chroma_db:/app/data/chroma_db # bind mount — copy folder to move to new machine
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+      # Scoped, not a blanket `.:/app` — docs/raw (source PDFs) and
+      # docs/source/core (OCR'd core-book markdown) are never read by
+      # backend/ at runtime (only by the offline ingest scripts, which run
+      # natively via .venv now, not through this container — see
+      # docs/engineering-notes/nightly-ingestion-commands.md). Same for
+      # scripts/. docs/source/adventures IS needed live (main.py/
+      # rules_store.py/world_prep.py read adventure .md + _entities.json
+      # directly, not just through the Chroma index).
+      - ./backend:/app/backend
+      - ./static:/app/static
+      - ./templates:/app/templates
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ./data:/app/data                          # chroma_db (+ its sqlite) and bm25 pickles
+      - ./docs/source/adventures:/app/docs/source/adventures
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend
 
 volumes:
   postgres_data:

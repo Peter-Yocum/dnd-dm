@@ -2,10 +2,10 @@ import re
 from pathlib import Path
 
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
 from pydantic import BaseModel
 
 from backend.config import settings
+from backend.llm import ollama_embeddings
 from backend.rag.hybrid import BM25Index, reciprocal_rank_fusion
 from backend.rag.reranker import LLMJudgeReranker, Reranker
 
@@ -64,22 +64,7 @@ class RulesStore:
         """Open the existing ChromaDB collection. No-op if chroma_db doesn't exist yet."""
         if not Path(self._persist_dir).exists():
             return
-        embeddings = OllamaEmbeddings(
-            base_url=self._ollama_base_url,
-            model="nomic-embed-text",
-            # client_kwargs -> httpx timeout. Confirmed live, 2026-07-08: with
-            # no timeout at all, an occasional hung Ollama request blocks its
-            # thread forever (a stuck socket read can't be interrupted by
-            # Python, even from asyncio.to_thread/wait_for — those only
-            # abandon the coroutine, not the thread), permanently leaking one
-            # slot from the shared default thread-pool executor every time.
-            # Enough leaks (a handful of campaign-creation attempts) exhaust
-            # that pool and freeze the *whole app* for every user, not just
-            # the request that triggered it. 60s is generous headroom — this
-            # call normally completes in well under a second — while still
-            # bounding the worst case instead of leaving it unbounded.
-            client_kwargs={"timeout": 60.0},
-        )
+        embeddings = ollama_embeddings(base_url=self._ollama_base_url)
         self._store = Chroma(
             collection_name="rules",
             embedding_function=embeddings,

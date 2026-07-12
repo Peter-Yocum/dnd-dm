@@ -236,12 +236,12 @@ def discover_candidates(windows: list[str], model: str, ollama_url: str) -> dict
     """Returns {"npc": {names...}, "location": {names...}, "item": {names...}}
     — union across all windows, not yet deduped/canonicalized (that's
     canonicalize()'s job)."""
-    from langchain_ollama import ChatOllama
+    from backend.llm import ollama_chat
     from langchain_core.messages import HumanMessage, SystemMessage
 
     from tqdm import tqdm
 
-    llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
+    llm = ollama_chat(model=model, base_url=ollama_url, timeout=None)
     found: dict[str, set[str]] = {"npc": set(), "location": set(), "item": set()}
 
     for window in tqdm(windows, desc="  Discovery windows", unit="window", dynamic_ncols=True):
@@ -304,13 +304,13 @@ def canonicalize(names: set[str], kind: str, model: str, ollama_url: str) -> dic
     if not names:
         return {}
 
-    from langchain_ollama import ChatOllama
+    from backend.llm import ollama_chat
     from langchain_core.messages import HumanMessage, SystemMessage
     from tqdm import tqdm
 
     sorted_names = sorted(names)
     batches = [sorted_names[i:i + CANONICALIZE_BATCH_SIZE] for i in range(0, len(sorted_names), CANONICALIZE_BATCH_SIZE)]
-    llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
+    llm = ollama_chat(model=model, base_url=ollama_url, timeout=None)
 
     result: dict[str, list[str]] = {}
     desc = f"  Canonicalizing {kind}"
@@ -373,10 +373,10 @@ def _generate_json_profile(system: str, prompt: str, model: str, ollama_url: str
     Skip-on-doubt: a malformed response yields an empty profile (the entity
     still gets a registry entry with aliases/type, just no synthesized
     fields) rather than aborting the whole run."""
-    from langchain_ollama import ChatOllama
+    from backend.llm import ollama_chat
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
+    llm = ollama_chat(model=model, base_url=ollama_url, timeout=None)
     response = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
     cleaned = _JSON_FENCE_RE.sub("", response.content).strip()
     try:
@@ -492,10 +492,10 @@ site/terrain breakdown in the text (include area numbers if present, e.g. \
         if not locations:
             return []
 
-        from langchain_ollama import ChatOllama
+        from backend.llm import ollama_chat
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        llm = ChatOllama(model=model, base_url=ollama_url, temperature=0, reasoning=False)
+        llm = ollama_chat(model=model, base_url=ollama_url, timeout=None)
         known = ", ".join(locations)
         connections: list[dict] = []
         seen_pairs: set[tuple[str, str]] = set()

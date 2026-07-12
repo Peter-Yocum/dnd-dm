@@ -90,6 +90,37 @@ def _roll_to_hit(target_ac: int, to_hit_bonus: int, advantage: str) -> tuple[boo
     return hit, is_nat20, total, header
 
 
+def _roll_effect(notation: str) -> tuple[int, str]:
+    """roll_notation for any damage/healing effect roll, floored at 0 (5e: a
+    penalty can reduce damage to 0, never below) — the MANDATORY entry point
+    for every roll in this module whose total feeds an HP change.
+
+    Why the floor is load-bearing: Attack.damage_dice carries the attacker's
+    ability modifier baked in (see with_ability_mod), so a negative modifier
+    can pull a low roll below zero — e.g. a STR 6 unarmed strike's "1d4-2"
+    rolling a 1 totals -1 — and the application sites here pass a SIGNED
+    amount to apply_damage_to_character/apply_damage_to_monster (their
+    convention: negative = damage, positive = healing). An unfloored
+    negative total sign-flips into the opposite branch: a hit that HEALS
+    its target, or a botched healing spell that wounds. The breakdown is
+    annotated on a floor so the narrator's verbatim 🎲 relay (VERIFIED
+    ROLLS, see dm_agent.py) stays consistent with the HP change it
+    accompanies.
+
+    Why here and not deeper: roll_notation is the general-purpose dice
+    engine (initiative, loot counts, the raw roll_dice tool) and must
+    honestly report "1d4-2 = -1"; apply_damage_to_* can't hold the floor
+    because sign IS its intent channel. The roll-for-HP step is the right
+    boundary. If a third clamping style ever appears in this file, the
+    deeper fix is an intent-explicit apply API (apply_damage/apply_healing
+    with unsigned magnitudes, clamped once at that boundary)."""
+    total, breakdown = roll_notation(notation)
+    if total < 0:
+        breakdown += " → 0 (floors at 0)"
+        total = 0
+    return total, breakdown
+
+
 async def resolve_pending_action_impl(
     campaign,
     reaction_declared: str = "",
@@ -122,7 +153,7 @@ async def resolve_pending_action_impl(
         )
     else:
         if pending.pending_damage_notation:
-            dmg_total, dmg_breakdown = roll_notation(pending.pending_damage_notation)
+            dmg_total, dmg_breakdown = _roll_effect(pending.pending_damage_notation)
         else:
             dmg_total, dmg_breakdown = 0, "no damage"
         dmg_total = max(0, dmg_total - damage_reduction)
@@ -153,7 +184,7 @@ async def resolve_pending_action_impl(
                     lines.append(f"{label} — MISS")
                     continue
                 swing_dice = critical_damage_notation(atk.damage_dice) if is_crit else atk.damage_dice
-                dmg_total, dmg_breakdown = roll_notation(swing_dice)
+                dmg_total, dmg_breakdown = _roll_effect(swing_dice)
                 hp_msg = apply_damage_to_character(target, -dmg_total, is_critical=is_crit) if isinstance(target, Character) \
                     else apply_damage_to_monster(target, -dmg_total)
                 lines.append(
@@ -335,7 +366,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                     f"turn; do not apply damage or narrate the outcome yet."
                 )
 
-            dmg_total, dmg_breakdown = roll_notation(swing_dice)
+            dmg_total, dmg_breakdown = _roll_effect(swing_dice)
             total_damage += dmg_total
             hits += 1
             any_crit = any_crit or is_crit
@@ -416,7 +447,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
             line = f"{name} — {ability} save: d20 {roll_desc} + {bonus} = {total} vs DC {dc} — {'SUCCESS' if success else 'FAILURE'}"
 
             if dtype is not None and on_fail_damage_dice and (not success or half_on_success):
-                dmg_total, dmg_breakdown = roll_notation(on_fail_damage_dice)
+                dmg_total, dmg_breakdown = _roll_effect(on_fail_damage_dice)
                 if success:
                     dmg_total //= 2
                 if dmg_total > 0:
@@ -733,7 +764,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                     )
                     return "\n".join(lines)
                 elif spell.effect_dice:
-                    dmg_total, dmg_breakdown = roll_notation(swing_dice)
+                    dmg_total, dmg_breakdown = _roll_effect(swing_dice)
                     hp_msg = apply_damage_to_character(target, -dmg_total, is_critical=is_crit) if isinstance(target, Character) \
                         else apply_damage_to_monster(target, -dmg_total)
                     dtype_str = spell.damage_type.value if spell.damage_type else "force"
@@ -759,7 +790,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                 success = total >= dc
                 line = f"{name} — {spell.save_ability} save: d20 {roll_desc} + {bonus} = {total} vs DC {dc} — {'SUCCESS' if success else 'FAILURE'}"
                 if spell.effect_dice and (not success or spell.half_damage_on_success):
-                    dmg_total, dmg_breakdown = roll_notation(spell.effect_dice)
+                    dmg_total, dmg_breakdown = _roll_effect(spell.effect_dice)
                     if success:
                         dmg_total //= 2
                     if dmg_total > 0:
@@ -784,7 +815,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                     if not target:
                         lines.append(f"{name}: not found — skipped.")
                         continue
-                    dmg_total, dmg_breakdown = roll_notation(spell.effect_dice)
+                    dmg_total, dmg_breakdown = _roll_effect(spell.effect_dice)
                     amount = dmg_total if spell.is_healing else -dmg_total
                     hp_msg = apply_damage_to_character(target, amount) if isinstance(target, Character) \
                         else apply_damage_to_monster(target, amount)

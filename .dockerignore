@@ -1,0 +1,13 @@
+.git/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Runtime data and source docs — bind-mounted at runtime (see
+# docker-compose.yml), never need to be baked into the image itself.
+data/
+docs/
+
+overnight-ingest-*.log

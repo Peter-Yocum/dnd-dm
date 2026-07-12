@@ -77,17 +77,11 @@ class LLMJudgeReranker:
     def rerank(self, query: str, chunks: list["RuleChunk"], top_n: int) -> list["RuleChunk"]:
         if not chunks:
             return []
-        from langchain_ollama import ChatOllama
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        # client_kwargs timeout — see rules_store.py's load() / dm_agent.py's
-        # _get_model() for why: an unbounded client leaks a thread-pool
-        # worker forever on a hung request, and this reranker runs on every
-        # hybrid search() call, live in the request path.
-        llm = ChatOllama(
-            model=self._model, base_url=self._ollama_base_url, temperature=0, reasoning=False,
-            client_kwargs={"timeout": 120.0},
-        )
+        from backend.llm import ollama_chat
+
+        llm = ollama_chat(model=self._model, base_url=self._ollama_base_url)
         listing = "\n".join(f"{i}: {c.content[:300]}" for i, c in enumerate(chunks))
         response = llm.invoke([
             SystemMessage(content=(

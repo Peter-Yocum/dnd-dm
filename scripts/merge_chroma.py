@@ -53,10 +53,11 @@ _PAGE_SIZE = 500
 
 def _get_chroma(chroma_dir: str, ollama_url: str, collection: str):
     from langchain_chroma import Chroma
-    from langchain_ollama import OllamaEmbeddings
+
+    from backend.llm import ollama_embeddings
     return Chroma(
         collection_name=collection,
-        embedding_function=OllamaEmbeddings(model="nomic-embed-text", base_url=ollama_url),
+        embedding_function=ollama_embeddings(base_url=ollama_url, timeout=None),
         persist_directory=chroma_dir,
     )
 

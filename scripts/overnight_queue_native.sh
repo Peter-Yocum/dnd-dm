@@ -79,10 +79,7 @@ ocr_with_retry() {
 # the same way; source_type=adventure needs the 4th field (slug) and its
 # .md lands in docs/source/adventures/{slug}/ instead of docs/source/core/.
 BOOKS=(
-  "D&D 5E - Xanathar's Guide to Everything|core||"
   "D&D 5E - Tasha's Cauldron of Everything|core||"
-  "D&D 5E - Mordenkainen's Tome of Foes|core||"
-  "D&D 5E - Volo's Guide to Monsters|core||monster"
   "D&D 5E - Sword Coast Adventurer's Guide|core||"
 )
 

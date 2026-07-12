@@ -48,6 +48,7 @@ from langchain_core.messages import HumanMessage
 from backend.agent.dm_agent import (
     STALL,
     STALL_MESSAGE,
+    TURN_BOUNDARY,
     agent_lifespan,
     format_transcript,
     get_context_status,
@@ -64,6 +65,7 @@ from backend.agent.world_prep import run_world_prep
 from backend.config import settings
 from backend.data.equipment import ARMOR, WEAPONS
 from backend.data.fivee_options import CLASSES
+from backend.locks import campaign_write_lock
 from backend.models import Campaign, Session
 from backend.rag.reranker import LLMJudgeReranker
 from backend.tools._helpers import (
@@ -181,16 +183,44 @@ async def create_campaign(
     return RedirectResponse(f"/campaigns/{campaign.id}", status_code=303)
 
 
+async def _mint_active_thread(campaign: Campaign, store: CampaignStore) -> str:
+    """Mint a fresh gameplay thread id and persist it as the campaign's
+    durable active pointer in ONE step. The invariant — a minted thread id
+    is always saved to Campaign.active_thread_id before any client sees it
+    (see that field's docstring for the split-session loss it prevents) —
+    lives here rather than being re-enforced by convention at each call
+    site. The save also persists any other pending mutation on `campaign`:
+    end_session appends the closing Session record before calling this, so
+    record and fresh pointer land in one atomic write. Caller owns the
+    campaign write lock (asyncio.Lock is not reentrant — see backend/locks)."""
+    campaign.active_thread_id = f"{campaign.id}:{uuid.uuid4().hex}"
+    await store.save(campaign)
+    return campaign.active_thread_id
+
+
 @app.get("/campaigns/{campaign_id}", response_class=HTMLResponse)
 async def game(request: Request, campaign_id: str):
-    campaign   = await _store().load(campaign_id)
+    store    = _store()
+    campaign = await store.load(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     adventures = _scan_adventures()
     available  = [a for a in adventures if a["slug"] not in campaign.books_in_play]
-    # Generate a thread_id for this page load; the client persists it in
-    # sessionStorage so refreshes within the same browser tab reuse it.
-    thread_id  = f"{campaign_id}:{uuid.uuid4().hex}"
+    # Reuse the in-progress session's thread if one is open (see Campaign.
+    # active_thread_id) — this is the durable source of truth, independent
+    # of the browser's sessionStorage, which is only a same-tab convenience
+    # and does not survive a closed tab or browser restart. An empty pointer
+    # only happens for campaigns predating the field (session/end atomically
+    # replaces it when closing a session) — mint one under the campaign
+    # write lock, re-loading inside it, same load→mutate→save discipline as
+    # end_session below, so this save can't clobber a concurrent tool-call
+    # save or vice versa.
+    if not campaign.active_thread_id:
+        async with campaign_write_lock(campaign_id):
+            campaign = await store.load(campaign_id) or campaign
+            if not campaign.active_thread_id:
+                await _mint_active_thread(campaign, store)
+    thread_id = campaign.active_thread_id
     return templates.TemplateResponse(
         request, "game.html", {
             "campaign": campaign,
@@ -278,6 +308,9 @@ async def stream(request: Request, campaign_id: str, thread_id: str):
                     if token is STALL:
                         yield {"event": "stall", "data": STALL_MESSAGE}
                         continue
+                    if token is TURN_BOUNDARY:
+                        yield {"event": "turn_boundary", "data": ""}
+                        continue
                     yield {"event": "token", "data": token}
             except Exception:
                 log.exception("Streaming turn failed for campaign %s, thread %s", campaign_id, thread_id)
@@ -314,38 +347,61 @@ async def get_messages(campaign_id: str, thread_id: str):
 async def end_session(campaign_id: str, thread_id: str = Form(...)):
     """Summarise the current session, save a Session record, index the chronicle
     in ChromaDB, and return a fresh thread_id for the next session."""
-    store    = _store()
-    campaign = await store.load(campaign_id)
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    store = _store()
 
-    # Fix 5: if this thread was already summarised (e.g. retry after Ollama failure),
-    # return the existing record rather than creating a duplicate.
-    existing = next((s for s in campaign.sessions if s.thread_id == thread_id), None)
-    if existing:
-        new_thread_id = f"{campaign_id}:{uuid.uuid4().hex}"
-        return JSONResponse({
-            "session_id": existing.id,
-            "session_number": existing.session_number,
-            "new_thread_id": new_thread_id,
-            "key_events": existing.key_events,
-            "summary_preview": existing.summary[:400],
-        })
+    # Held for the whole load->mutate->save cycle below, same discipline as
+    # _make_tool_node's awrap_tool_call (dm_agent.py) — without this, a
+    # concurrent tool-call save landing in the gap between this endpoint's
+    # own load and its eventual save (summarize_session alone can take
+    # 30s-2min) gets silently clobbered when store.save(campaign) below
+    # writes back this endpoint's now-stale in-memory snapshot. Confirmed
+    # live, 2026-07-10: a just-looted item vanished this exact way — visible
+    # in the UI right after the loot tool call, gone after session/end ran.
+    async with campaign_write_lock(campaign_id):
+        campaign = await store.load(campaign_id)
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
 
-    summary, key_events, adventure_progress, relations = await summarize_session(thread_id, campaign, _rules())
+        # Fix 5: if this thread was already summarised (e.g. retry after Ollama failure),
+        # return the existing record rather than creating a duplicate. Echo the
+        # CURRENT active_thread_id rather than minting a fresh one: the close
+        # that recorded this session already moved the durable pointer past
+        # this thread, and a stale duplicate close (a second tab still holding
+        # the old thread_id) overwriting it here would orphan whatever session
+        # is now in progress on it — the exact split-thread loss
+        # active_thread_id exists to prevent (see models.py). Only mint when
+        # the pointer is somehow empty (campaign data predating the field),
+        # where there's nothing to orphan.
+        existing = next((s for s in campaign.sessions if s.thread_id == thread_id), None)
+        if existing:
+            new_thread_id = campaign.active_thread_id or await _mint_active_thread(campaign, store)
+            return JSONResponse({
+                "session_id": existing.id,
+                "session_number": existing.session_number,
+                "new_thread_id": new_thread_id,
+                "key_events": existing.key_events,
+                "summary_preview": existing.summary[:400],
+            })
 
-    session_number = len(campaign.sessions) + 1
-    session = Session(
-        session_number=session_number,
-        real_date=date.today(),
-        summary=summary,
-        key_events=key_events,
-        adventure_progress=adventure_progress,
-        thread_id=thread_id,
-    )
-    campaign.sessions.append(session)
-    campaign.session_count = session_number
-    await store.save(campaign)
+        summary, key_events, adventure_progress, relations = await summarize_session(thread_id, campaign, _rules())
+
+        session_number = len(campaign.sessions) + 1
+        session = Session(
+            session_number=session_number,
+            real_date=date.today(),
+            summary=summary,
+            key_events=key_events,
+            adventure_progress=adventure_progress,
+            thread_id=thread_id,
+        )
+        campaign.sessions.append(session)
+        campaign.session_count = session_number
+        # Minted here inside the lock, atomically with closing this session
+        # out (_mint_active_thread's save persists the just-appended Session
+        # record and the fresh pointer in one write) — so there's never a
+        # window where active_thread_id still points at the just-closed
+        # thread.
+        new_thread_id = await _mint_active_thread(campaign, store)
 
     # Stage 1.5: best-effort incremental relation-graph update from this
     # session's newly-stated relationships — resolves each name against
@@ -376,8 +432,6 @@ async def end_session(campaign_id: str, thread_id: str = Form(...)):
         )
     except Exception:
         log.exception("ChromaDB indexing failed for session %s (campaign %s); chronicle is safe in Postgres", session.id, campaign_id)
-
-    new_thread_id = f"{campaign_id}:{uuid.uuid4().hex}"
 
     return JSONResponse({
         "session_id": session.id,

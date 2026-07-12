@@ -1,8 +1,8 @@
 from langchain_core.tools import tool
 
 from backend.models import (
-    Attack, Campaign, CombatantPosition, CombatantType, Container, CoverType, DamageType,
-    Encounter, InitiativeEntry, Monster, MonsterSize, MonsterType, ZoneType,
+    Attack, Campaign, CombatantPosition, CombatantType, ConditionType, Container, CoverType,
+    DamageType, Encounter, InitiativeEntry, Monster, MonsterSize, MonsterType, ZoneType,
 )
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.lore_store import LoreStore
@@ -11,6 +11,15 @@ from backend.tools._helpers import (
     monster_summary, roll_notation,
 )
 from backend.tools.loot_generator import enrich_with_adventure_loot, generate_encounter_loot
+
+
+def _encounter_monster_names(enc) -> set[str]:
+    """Names of every MONSTER combatant in this encounter's initiative order —
+    the one definition of "which registered monsters are part of this fight"
+    (matched by name against campaign.monsters). Was independently re-derived
+    at three sites (the context formatter, end_encounter's survivor warning,
+    and its defeated-loot branch) — keep them from drifting by keeping it here."""
+    return {e.name for e in enc.initiative_order if e.combatant_type == CombatantType.MONSTER}
 
 
 def build_encounter_context(campaign: Campaign) -> str | None:
@@ -34,7 +43,7 @@ def build_encounter_context(campaign: Campaign) -> str | None:
         marker = "→" if e.is_current_turn else " "
         lines.append(f"  {marker} [{e.initiative:>2}] {e.name} ({e.combatant_type.value})")
 
-    monster_names = {e.name for e in enc.initiative_order if e.combatant_type == CombatantType.MONSTER}
+    monster_names = _encounter_monster_names(enc)
     if monster_names:
         lines.append("\nMonsters:")
         for name in monster_names:
@@ -301,6 +310,21 @@ def make_tools(
         if not campaign.active_encounter or not campaign.active_encounter.is_active:
             return "No active encounter to end."
         enc = campaign.active_encounter
+
+        # Deliberately a warning, not a refusal: a monster can legitimately
+        # still be alive and conscious when combat truly is over (fled,
+        # surrendered — neither is modeled as a condition, so this can't
+        # detect them and would otherwise false-block a correct call). Ending
+        # unconditionally but flagging any real survivor here beats silently
+        # closing the encounter with a live threat still in the room — the
+        # model (or the player, reading the resolution) can catch a genuine
+        # mistake this way instead of it vanishing into is_active=False.
+        monster_names = _encounter_monster_names(enc)
+        survivors = [
+            m.name for m in campaign.monsters
+            if m.name in monster_names and m.current_hp > 0 and ConditionType.UNCONSCIOUS not in m.conditions
+        ]
+
         enc.is_active = False
         enc.xp_awarded = xp_awarded
         campaign.active_encounter = None
@@ -308,16 +332,20 @@ def make_tools(
         msg = f"Encounter ended after {enc.round} round(s)."
         if xp_awarded:
             msg += f" {xp_awarded} XP awarded."
+        if survivors:
+            msg += (
+                f"\n⚠ Still alive and conscious when this was called: {', '.join(survivors)}. "
+                "Ending the encounter anyway — if they actually fled, surrendered, or were "
+                "otherwise neutralized, say so in your narration; if this was a mistake, "
+                "finish resolving them instead of reporting the fight as over."
+            )
 
         if enc.loot_already_granted:
             msg += "\nLoot for this encounter was already handled during the fight — nothing further to reveal."
         else:
-            defeated_names = {
-                e.name for e in enc.initiative_order if e.combatant_type == CombatantType.MONSTER
-            }
             defeated = [
                 m for m in campaign.monsters
-                if m.name in defeated_names and m.current_hp <= 0
+                if m.name in monster_names and m.current_hp <= 0
             ]
             location = next((l for l in campaign.locations if l.id == enc.location_id), None)
             location_name = location.name if location else enc.location_description

@@ -46,8 +46,12 @@ from psycopg_pool import AsyncConnectionPool
 
 from backend.config import settings
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS
+from backend.llm import ollama_chat
+from backend.locks import campaign_write_lock
 from backend.models import Campaign, CombatantType, InitiativeEntry
-from backend.agent.prompts import get_mechanics_system_prompt, get_narrator_system_prompt
+from backend.agent.prompts import (
+    OOC_MARKER, VERIFIED_ROLLS_MARKER, get_mechanics_system_prompt, get_narrator_system_prompt,
+)
 from backend.agent.session_zero_prompt import get_session_zero_mechanics_prompt, get_session_zero_narrator_prompt
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import DraftStore
@@ -69,17 +73,6 @@ log = logging.getLogger(__name__)
 
 _pool: AsyncConnectionPool | None = None
 _checkpointer: AsyncPostgresSaver | None = None
-
-# Per-campaign locks to serialize parallel tool calls. LangGraph's ToolNode
-# runs multi-tool AIMessages via asyncio.gather; each tool does load→mutate→save
-# on the campaign. Without serialization the last writer silently wins.
-_tool_locks: dict[str, asyncio.Lock] = {}
-
-
-def _get_tool_lock(campaign_id: str) -> asyncio.Lock:
-    if campaign_id not in _tool_locks:
-        _tool_locks[campaign_id] = asyncio.Lock()
-    return _tool_locks[campaign_id]
 
 
 @asynccontextmanager
@@ -131,60 +124,16 @@ def _get_model() -> ChatOllama:
     failure class rather than working around it per call site. Note this
     model choice didn't fully close the gap for Session 0 either, hence the
     2026-07-04 structural split — see above."""
-    return ChatOllama(
-        model=settings.mechanics_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.7,
-        reasoning=False,
-        # client_kwargs timeout (all three ChatOllama instances in this
-        # file, 2026-07-08) — this is very likely the same underlying issue
-        # as the "MLX runner stuck reporting 'Stopping...' indefinitely"
-        # hang noted in _get_mechanics_model()'s docstring below, just
-        # finally traced to its actual mechanism: with no client-level
-        # timeout, a hung request blocks its thread forever (unkillable —
-        # neither asyncio.to_thread nor asyncio.wait_for can reclaim a
-        # thread stuck in a blocking socket read), permanently leaking a
-        # slot from the shared thread-pool executor every time it happens.
-        # Enough leaks exhaust that pool and freeze the whole app for every
-        # user, not just the one call that hung. 120s (vs. 60s on the
-        # embedding-only clients) — a real multi-step tool-calling turn can
-        # legitimately take tens of seconds per call.
-        client_kwargs={"timeout": 120.0},
-    )
+    return ollama_chat(temperature=0.7)
 
 
 def _get_mechanics_model() -> ChatOllama:
     """Low-temperature tool-calling model for the in-game agent.
-
-    reasoning=False (2026-07-04, applies to all three ChatOllama instances
-    in this file): gemma4:26b-mlx always wraps output in a
-    <|channel>thought...<channel|> block, empty or not, whenever thinking
-    isn't explicitly disabled. langchain_ollama's `reasoning` param
-    defaults to None, which per its own docs leaves any such tags embedded
-    directly in `.content` instead of split into `additional_kwargs` — a
-    near-exact match for a previously-investigated bug (garbled
-    <channel|>thought fragments leaking into a Session 0 reply, "fixed" at
-    the time by purging unbounded scratch, which likely just made the leak
-    rarer rather than addressing its cause). None of these three roles ever
-    read reasoning_content, so False (skip reasoning entirely) rather than
-    True (perform it, but capture it separately) is the right call — no
-    product value in paying the latency for reasoning nothing uses.
-
-    keep_alive is left at Ollama's default (idle-timeout eviction) rather
-    than forced residency — tried keep_alive=-1 while chasing a live hang
-    during combat testing (a request landing mid-idle-eviction seemed to
-    leave the MLX runner stuck reporting "Stopping..." indefinitely), and it
-    did get further before a second, different stall hit even with the
-    model pinned resident — so forced residency wasn't a real fix for that
-    class of hang, just extra always-on memory pressure for an unconfirmed
-    benefit. Reverted."""
-    return ChatOllama(
-        model=settings.mechanics_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.1,
-        reasoning=False,
-        client_kwargs={"timeout": 120.0},  # see _get_model()'s comment above
-    )
+    Cross-cutting client policy (reasoning=False, the client-level timeout,
+    keep_alive) is owned and documented by backend/llm.py — the reasoning
+    and keep_alive investigation history that used to live in this
+    docstring moved there and to config.py's ollama_keep_alive comment."""
+    return ollama_chat(temperature=0.1)
 
 
 def _get_narrator_model() -> ChatOllama:
@@ -196,13 +145,7 @@ def _get_narrator_model() -> ChatOllama:
     at raw generation and to incur no residency/swap cost either way, so a
     second model wasn't worth the extra ~7.6GB resident and the added
     config surface."""
-    return ChatOllama(
-        model=settings.mechanics_model,
-        base_url=settings.ollama_base_url,
-        temperature=0.8,
-        reasoning=False,
-        client_kwargs={"timeout": 120.0},  # see _get_model()'s comment above
-    )
+    return ollama_chat(temperature=0.8)
 
 
 # ── message trimmer ────────────────────────────────────────────────────────────
@@ -392,7 +335,36 @@ class DMState(TypedDict):
                                         # (e.g. a missing combat-roll-backing catch a few combatants
                                         # earlier in the same response) left zero budget by the time
                                         # this genuinely distinct failure — a DM companion's turn
-                                        # later in the same sequence — needed its own retry.
+                                        # later in the same sequence — needed its own retry. Further
+                                        # closed 2026-07-11 by narrator_node itself resetting this
+                                        # (and the other three counters) to 0 on every loop-back to
+                                        # mechanics for the next combatant — each combatant's turn is
+                                        # now its own mechanics->narrator round-trip (see narrator_node
+                                        # and TURN_BOUNDARY), so every counter genuinely starts fresh
+                                        # per combatant rather than being shared across a whole
+                                        # multi-combatant response. This field/split stays as a
+                                        # backstop for the remaining case: several distinct guardrail
+                                        # failures on the SAME combatant's turn within its own budget.
+                                        # 2026-07-11: the "reset every combatant" part of this now
+                                        # lives in stream_response's own per-combatant loop (each
+                                        # iteration is its own astream_events call with these counters
+                                        # freshly zeroed in its input) rather than in narrator_node —
+                                        # see stream_response's docstring for why a shared
+                                        # recursion_limit across a whole multi-combatant response had
+                                        # the same starvation problem one level up.
+
+
+# Every per-combatant-turn guardrail budget above, zeroed. stream_response
+# spreads this into each loop iteration's input so every combatant's turn
+# starts with fresh budgets (see its docstring for the starvation this
+# prevents). Add any new DMState counter that must reset per combatant HERE
+# — this constant is the single definition; the loop's two input literals
+# both build from it. narrator_correction_count is deliberately absent: it
+# self-resets in narrator_node.
+_FRESH_GUARDRAIL_BUDGETS = {
+    "correction_count": 0, "tool_error_count": 0,
+    "lore_guardrail_count": 0, "stalled_turn_guardrail_count": 0,
+}
 
 
 # ── agent factory ──────────────────────────────────────────────────────────────
@@ -420,7 +392,7 @@ def _make_tool_node(tools: list[BaseTool], campaign_id: str) -> ToolNode:
     store uses delete-all/reinsert so the last writer wins. The lock ensures
     only one tool's load→mutate→save cycle runs at a time per campaign.
     """
-    lock = _get_tool_lock(campaign_id)
+    lock = campaign_write_lock(campaign_id)
 
     async def _serialize(request, execute):
         async with lock:
@@ -435,26 +407,42 @@ _STATE_CHANGE_TOOLS = {
 }
 
 
-def _messages_since_last_human(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Messages appended since the current player turn started — walks
-    backward until (excluding) the most recent HumanMessage. This is the
-    mechanics loop's scratch-work for the turn in progress: tool-call
-    AIMessages and their ToolMessage results."""
+def _messages_since_last_turn_boundary(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Messages appended since the current combatant-turn's resolution
+    started — walks backward until (excluding) the most recent HumanMessage
+    OR tool-call-free AIMessage (a completed narrator reply), whichever is
+    more recent. This is the mechanics loop's own scratch-work: tool-call
+    AIMessages and their ToolMessage results.
+
+    Named/scoped this way (not just "since last human") because narrator_node
+    can now loop back to mechanics multiple times per player message — once
+    per combatant's turn, see get_agent()'s narrator_node — and each of its
+    AIMessages becomes a PERMANENT part of `messages` (a real chat bubble the
+    player already saw), not scratch. The old "since last human" boundary
+    would sweep up a prior combatant's already-final narrator reply and try
+    to RemoveMessage it, corrupting history. A tool-call-free AIMessage can
+    only ever be a completed narrator reply here: mechanics_node's own
+    non-tool-calling response (the resolution report) is captured into
+    `notes` via _extract_text and never itself appended to `messages` before
+    reaching narrator, so this can't accidentally stop mid-turn."""
     since: list[BaseMessage] = []
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
+            break
+        if isinstance(m, AIMessage) and not m.tool_calls:
             break
         since.append(m)
     since.reverse()
     return since
 
 
-def _tools_called_since_last_human(messages: list[BaseMessage]) -> set[str]:
-    """Tool names called since the current player turn started. Used by
-    _detect_missing_followup to see what the mechanics model has already
-    done this turn without needing extra state to track it."""
+def _tools_called_since_last_turn_boundary(messages: list[BaseMessage]) -> set[str]:
+    """Tool names called since the current combatant-turn's resolution
+    started. Used by _detect_missing_followup to see what the mechanics
+    model has already done this turn without needing extra state to track
+    it."""
     called: set[str] = set()
-    for m in _messages_since_last_human(messages):
+    for m in _messages_since_last_turn_boundary(messages):
         if isinstance(m, AIMessage) and m.tool_calls:
             called.update(c["name"] for c in m.tool_calls)
     return called
@@ -479,17 +467,61 @@ def _last_tool_batch_had_error(messages: list[BaseMessage]) -> bool:
     return False
 
 
+def _orphaned_interrupted_turn(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Detects a PRIOR turn that was interrupted mid-execution — a process
+    crash/restart landing between the mechanics node checkpointing a
+    tool-call decision and the tools node actually executing it. That leaves
+    scratch (the run of messages between the turn's HumanMessage and the
+    next one) ending in an AIMessage with unresolved tool_calls: no
+    ToolMessage results, no narrator reply ever followed. Left in place,
+    this turn's mechanics call would hand the model (and Ollama's chat API)
+    a malformed sequence — an assistant tool_calls message with no matching
+    tool results before the next human turn — which errors outright rather
+    than degrading gracefully. Returns [] for a turn that resolved normally
+    (scratch ending in a tool-call-free narrator AIMessage) or if there's no
+    prior turn to check."""
+    humans = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+    if len(humans) < 2:
+        return []
+    # Everything after the last turn boundary before the latest human. The
+    # boundary rule (HumanMessage OR completed narrator reply) is OWNED by
+    # _messages_since_last_turn_boundary — reusing it rather than re-walking
+    # here matters because stream_response's multi-combatant loop can leave
+    # several completed narrator AIMessages (real chat bubbles the player
+    # already saw) between two HumanMessages, and a cleanup using a stale
+    # hand-rolled copy of the rule would RemoveMessage those replies too,
+    # silently deleting them from the persisted transcript.
+    scratch = _messages_since_last_turn_boundary(messages[:humans[-1]])
+    if scratch and isinstance(scratch[-1], AIMessage) and scratch[-1].tool_calls:
+        return scratch
+    return []
+
+
+def _recover_orphaned_turn(messages: list[BaseMessage]) -> Command | None:
+    """The recovery half of _orphaned_interrupted_turn: the RemoveMessage
+    cleanup Command both mechanics nodes must issue, before anything else,
+    for a thread that died mid-turn. One implementation so a future recovery
+    tweak (extra state reset, logging) can't land in only one node."""
+    orphaned = _orphaned_interrupted_turn(messages)
+    if not orphaned:
+        return None
+    return Command(
+        goto="mechanics",
+        update={"messages": [RemoveMessage(id=m.id) for m in orphaned if m.id]},
+    )
+
+
 def _turn_was_explicitly_ended(messages: list[BaseMessage]) -> bool:
     """True if this turn's scratch already advanced (or asked to advance) the
     initiative pointer — either a direct advance_initiative call, or a
     resolve_attack/resolve_saving_throw call with end_turn=True. Distinct from
-    _tools_called_since_last_human because this needs each call's ARGS, not
+    _tools_called_since_last_turn_boundary because this needs each call's ARGS, not
     just its name. Doesn't specially recognize a resolve_pending_action call
     honoring a stored attacker_wanted_end_turn — that intent lives in
     persisted PendingAction state, not in this turn's own call args; accepted
     as a minor blind spot since that path is rare and resolve_pending_action's
     own docstring already tells the model when a turn still needs finishing."""
-    for m in _messages_since_last_human(messages):
+    for m in _messages_since_last_turn_boundary(messages):
         if not (isinstance(m, AIMessage) and m.tool_calls):
             continue
         for c in m.tool_calls:
@@ -503,9 +535,7 @@ def _turn_was_explicitly_ended(messages: list[BaseMessage]) -> bool:
 _RESOLUTION_TOOLS = {"resolve_attack", "resolve_saving_throw", "cast_spell", "resolve_pending_action"}
 
 
-async def _detect_missing_followup(
-    state: DMState, campaign_id: str, store: CampaignStore
-) -> str | None:
+def _detect_missing_followup(state: DMState, campaign: Campaign) -> str | None:
     """Catches the mechanics model stopping mid-resolution during combat —
     observed live: rolling an attack/damage and narrating a hit or a turn
     passing without ever calling the tool that actually makes it true, or in
@@ -521,11 +551,11 @@ async def _detect_missing_followup(
     the turn actually advance (see _turn_was_explicitly_ended)? The older
     "bare roll_dice with no _STATE_CHANGE_TOOLS follow-up" check stays for
     roll_dice's own fallback use (a raw roll not tied to any resolution
-    tool)."""
-    campaign = await store.load(campaign_id)
-    if not campaign or not campaign.active_encounter or not campaign.active_encounter.is_active:
+    tool). Like every detector in the chain, reads the caller's one shared
+    live snapshot (see mechanics_node) rather than loading its own."""
+    if not campaign.active_encounter or not campaign.active_encounter.is_active:
         return None
-    called = _tools_called_since_last_human(state["messages"])
+    called = _tools_called_since_last_turn_boundary(state["messages"])
     if not called:
         return (
             "You're resolving a turn during an active encounter but made no tool calls at "
@@ -562,10 +592,88 @@ _COMBAT_ROLL_TOOLS = {
     "resolve_pending_action", "roll_dice",
 }
 
+# Superset for the narrator-side VERIFIED ROLLS capture (mechanics_node and
+# the chargen mechanics node): every tool whose return string embeds a
+# roll_notation()/d20 breakdown the narrator must relay verbatim.
+# Deliberately wider than _COMBAT_ROLL_TOOLS, which pairs with
+# _COMBAT_ROLL_MENTION_RE to answer a different question — "does a die roll
+# back this turn's combat narration?" — where a mere ability check must NOT
+# count as backing for a narrated attack. Skill checks and death saves are
+# exactly the roll types most easily misreported by the mechanics model's
+# free-text notes, so leaving them out of the capture (as originally
+# shipped) silently dropped their real breakdowns while the tools most
+# likely to be double-checked kept theirs.
+_VERIFIED_ROLL_TOOLS = _COMBAT_ROLL_TOOLS | {"resolve_check", "resolve_death_save"}
+
+# Chargen additionally captures roll_ability_scores — chargen-only (not an
+# in-game resolution tool, so not in _VERIFIED_ROLL_TOOLS itself) but with
+# the exact same failure mode: its per-score breakdown (e.g. "Roll 1:
+# [4, 5, 2, 6] → drop 2 → 15") is just as easy for the narrator to silently
+# paraphrase away.
+_CHARGEN_VERIFIED_ROLL_TOOLS = _VERIFIED_ROLL_TOOLS | {"roll_ability_scores"}
+
+
+def _verified_rolls_note(scratch: list[BaseMessage], tools: set[str] = _VERIFIED_ROLL_TOOLS) -> str:
+    """The VERIFIED_ROLLS_MARKER block appended to a mechanics resolution
+    report: verbatim tool output for this turn's dice, captured before the
+    scratch purge deletes it — otherwise the only numbers that ever reach
+    the narrator are whatever the mechanics model's own free-text notes
+    claim happened, a paraphrase of a paraphrase with nothing to check it
+    against. roll_notation() (backend/tools/_helpers.py) computes the real
+    breakdown deterministically and every capture-listed tool's return
+    string already includes it (e.g. "damage [1] +4 = 5 piercing").
+    Confirmed live, 2026-07-11: with no such backstop there was no way to
+    tell whether a suspiciously low damage total the player questioned was
+    an actual unlucky roll or the mechanics/narrator hop silently dropping
+    or inventing one. Returns "" when nothing captured ran this turn.
+
+    Both narrator prompts key on the literal marker phrase (prompts.py's
+    VERIFIED_ROLLS_MARKER); this helper is the ONLY code that emits it — it
+    used to be copy-pasted into both mechanics nodes, which meant a wording
+    tweak in one silently broke the verbatim-relay contract for the other."""
+    rolls = [
+        _extract_text(m.content) for m in scratch
+        if isinstance(m, ToolMessage) and m.content and m.name in tools
+    ]
+    if not rolls:
+        return ""
+    return (
+        f"\n\n{VERIFIED_ROLLS_MARKER} (exact tool output — the narrator "
+        "must use these numbers verbatim in its 🎲 lines, never recompute, "
+        "round, or otherwise alter them):\n"
+        + "\n".join(f"- {r}" for r in rolls)
+    )
+
 _COMBAT_ROLL_MENTION_RE = re.compile(
     r"\battack roll\b|\bdamage roll\b|\bsaving throw\b|\brolls?\s+(?:to hit|damage)\b|"
     r"\b\d+\s*(?:slashing|piercing|bludgeoning|fire|cold|lightning|acid|poison|psychic|"
-    r"radiant|necrotic|force|thunder)\s+damage\b",
+    r"radiant|necrotic|force|thunder)\s+damage\b|"
+    # Prose narrating a physical strike with no accompanying number or roll
+    # phrase — e.g. "Elara stepped in and stabbed the goblin" — the patterns
+    # above only fire on an explicit "attack roll"/"X damage" mention, so a
+    # vague action verb like this slipped through with zero resolve_attack
+    # call behind it (a DM companion's whole turn narrated with no dice at
+    # all). Unambiguous strike verbs (stab/slash/pierce/lunge/skewer/gash)
+    # fire on their own; ambiguous ones (strike/hit/swing/drive/plunge) only
+    # fire alongside "at/into/through" a target, since those verbs are
+    # common in non-combat, non-literal prose too ("the realization hits
+    # you", "the storm strikes the coast"). Only the FIRST preposition after
+    # the verb is tested — the tempered gap (?:(?!prep)[^.]) can't skip past
+    # one to a later one, otherwise "swings into place at the end"
+    # backtracks to "at the end" and defeats the object check — and the
+    # negative lookahead after it drops the two idiomatic objects most
+    # plausible in a real resolution report: a scene line's "swings into
+    # place/position" and a rules quote's "hits at half/full damage". Known
+    # residual false positives ("plunges into the river", "struck at dawn")
+    # are accepted: they cost at most one guardrail retry per player turn
+    # (correction_count), and every tighter form tried loses real recall —
+    # e.g. requiring a capitalized target drops "swings his club at the
+    # goblin", the common generic-monster case.
+    r"\b(?:stabs?|stabbed|slashes?|slashed|slices?|sliced|pierces?|pierced|"
+    r"lunges?|lunged|skewers?|skewered|gashes?|gashed)\b|"
+    r"\b(?:strikes?|struck|hits?|swings?|swung|drives?|drove|plunges?|plunged)\b"
+    r"(?:(?!\b(?:at|into|through)\b)[^.]){0,30}"
+    r"\b(?:at|into|through)\b(?!\s+(?:place|position|half|full)\b)",
     re.IGNORECASE,
 )
 
@@ -582,6 +690,15 @@ def _detect_missing_combat_roll_followup(notes: str, called: set[str]) -> str | 
     let this slip through: the bug is precisely that no encounter/monster
     ever gets created in the first place, so there's nothing to gate on."""
     if called & _COMBAT_ROLL_TOOLS:
+        return None
+    # An OOC report is a rules/meta answer, not fiction — quoted rule text
+    # is legitimately full of combat vocabulary ("24 fire damage", "attack
+    # roll", "the spell hits at half damage") with no roll behind it, so
+    # every arm of the mention regex false-fires on it. The mechanics prompt
+    # requires OOC reports to START with the literal marker (see OOC_MARKER
+    # and the OOC section in prompts.py), so a prefix check is the whole
+    # convention.
+    if notes.lstrip().startswith(OOC_MARKER):
         return None
     if not _COMBAT_ROLL_MENTION_RE.search(notes):
         return None
@@ -655,13 +772,48 @@ def _detect_missing_loot_followup(notes: str, called: set[str]) -> str | None:
     )
 
 
+_COMBAT_ENDED_MENTION_RE = re.compile(
+    r"\b(?:combat|the fight|the battle|the encounter)\s+(?:has\s+)?"
+    r"(?:ended|ends|is\s+over|concluded|finished)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_missing_end_encounter_followup(
+    notes: str, called: set[str], campaign: Campaign
+) -> str | None:
+    """Catches the mechanics model's own resolution report declaring combat
+    over (e.g. "the combat has ended") with no end_encounter call backing it
+    this turn. Without this, active_encounter.is_active stays True forever —
+    the encounter/initiative UI keeps showing a fight that's conversationally
+    over, and the automatic post-combat loot roll (end_encounter's job, see
+    loot_generator.py) never fires. Symmetric to
+    _detect_missing_loot_followup/_detect_missing_combat_roll_followup: a
+    narrated claim vs. an actually-called tool, same "don't say it happened
+    unless you made it happen" principle applied to encounter closure.
+    Observed live, 2026-07-11: the model resolved a killing blow, narrated
+    "the combat has ended," moved straight into post-combat roleplay (loot
+    search, tying up prisoners) — and never called end_encounter at all."""
+    if "end_encounter" in called:
+        return None
+    if not _COMBAT_ENDED_MENTION_RE.search(notes):
+        return None
+    if not campaign.active_encounter or not campaign.active_encounter.is_active:
+        return None
+    return (
+        "Your resolution report describes combat as over, but no end_encounter call "
+        "backs it up this turn — the encounter is still marked active, so the combat/"
+        "initiative UI will keep showing it as ongoing and no post-combat loot roll "
+        "has happened. If every enemy is actually dead, fled, or incapacitated, call "
+        "end_encounter now (with xp_awarded if applicable) before reporting the fight "
+        "as finished, then continue resolving whatever the player asked for next."
+    )
+
 
 _COMBAT_RESOLUTION_TOOLS = {"resolve_attack", "resolve_saving_throw"}
 
 
-async def _detect_missing_encounter_followup(
-    state: DMState, campaign_id: str, store: CampaignStore
-) -> str | None:
+def _detect_missing_encounter_followup(state: DMState, campaign: Campaign) -> str | None:
     """Catches resolve_attack/resolve_saving_throw landing against a Monster that
     survived (current_hp > 0) with no active_encounter backing it — observed
     live: a multi-guard ambush resolved entirely through bare resolve_attack
@@ -671,15 +823,14 @@ async def _detect_missing_encounter_followup(
     prompt section covers that); this only fires when the target is still
     capable of acting back and nothing has formalized the fight."""
     calls = [
-        c for m in _messages_since_last_human(state["messages"])
+        c for m in _messages_since_last_turn_boundary(state["messages"])
         if isinstance(m, AIMessage) and m.tool_calls
         for c in m.tool_calls
         if c["name"] in _COMBAT_RESOLUTION_TOOLS
     ]
     if not calls:
         return None
-    campaign = await store.load(campaign_id)
-    if not campaign or (campaign.active_encounter and campaign.active_encounter.is_active):
+    if campaign.active_encounter and campaign.active_encounter.is_active:
         return None
     names: set[str] = set()
     for c in calls:
@@ -721,9 +872,7 @@ def _live_current_turn(campaign: Campaign) -> tuple[InitiativeEntry, bool] | Non
     return current, is_player
 
 
-async def _detect_stalled_non_player_turn_followup(
-    campaign_id: str, store: CampaignStore
-) -> str | None:
+def _detect_stalled_non_player_turn_followup(campaign: Campaign) -> str | None:
     """Catches the mechanics model stopping to prompt the (human) player when
     the combatant actually due to act next — per live initiative_order — is a
     monster, a DM-controlled companion, or an NPC. Nobody is there to act
@@ -737,9 +886,6 @@ async def _detect_stalled_non_player_turn_followup(
     actual player-controlled turn never reached. Exempt whenever there's a
     pending_action — that's a real reaction prompt legitimately awaiting the
     player's decision, not a stall."""
-    campaign = await store.load(campaign_id)
-    if not campaign:
-        return None
     hit = _live_current_turn(campaign)
     if not hit:
         return None
@@ -750,13 +896,14 @@ async def _detect_stalled_non_player_turn_followup(
         f"It's currently {current.name}'s turn ({current.combatant_type.value}, not "
         "player-controlled) — nobody is waiting to act until you resolve it yourself. "
         "Call advance_initiative and resolve their action now with a sensible tactical "
-        "choice, and keep going through any further non-player turns in this same "
-        "response, per the Combat section's auto-continuation rule — don't stop to ask "
-        "the player until it's actually a player-controlled character's turn."
+        "choice, then write your resolution report and stop — don't stop to ask the "
+        "player for input on a turn that isn't theirs. Just this one combatant's turn; "
+        "the game brings you back automatically for the next one if it's also "
+        "non-player, per the Combat section's auto-continuation rule."
     )
 
 
-async def _next_turn_ground_truth_note(campaign_id: str, store: CampaignStore) -> str | None:
+def _next_turn_ground_truth_note(campaign: Campaign) -> str | None:
     """Deterministic "whose turn is it, really" fact, appended to the
     resolution report unconditionally (no retry budget — this never loops,
     just annotates) right before the narrator sees it. Exists because
@@ -776,9 +923,6 @@ async def _next_turn_ground_truth_note(campaign_id: str, store: CampaignStore) -
     worst case where a companion's turn is still technically unresolved when
     this response ends; the player's own next message starts a fresh
     stalled_turn_guardrail_count budget that can then force the real fix."""
-    campaign = await store.load(campaign_id)
-    if not campaign:
-        return None
     hit = _live_current_turn(campaign)
     if not hit:
         return None
@@ -818,7 +962,7 @@ def _lore_tool_outputs_since_last_human(messages: list[BaseMessage]) -> list[str
     spoiler-leak detection below."""
     return [
         _extract_text(m.content)
-        for m in _messages_since_last_human(messages)
+        for m in _messages_since_last_turn_boundary(messages)
         if isinstance(m, ToolMessage) and getattr(m, "name", None) in _LORE_TOOLS
     ]
 
@@ -951,6 +1095,9 @@ def get_agent(
     narrator_model = _get_narrator_model()
 
     async def mechanics_node(state: DMState) -> Command[Literal["tools", "narrator", "mechanics"]]:
+        if (recovery := _recover_orphaned_turn(state["messages"])) is not None:
+            return recovery
+
         correction_count = state.get("correction_count", 0)
 
         # Bounded retry for a bad/hallucinated tool call (see DMState.tool_error_count) —
@@ -962,7 +1109,7 @@ def get_agent(
         tool_error_count = state.get("tool_error_count", 0)
         tool_error_count = tool_error_count + 1 if _last_tool_batch_had_error(state["messages"]) else 0
         if tool_error_count > _MAX_TOOL_ERROR_RETRIES:
-            scratch = _messages_since_last_human(state["messages"])
+            scratch = _messages_since_last_turn_boundary(state["messages"])
             removals = [RemoveMessage(id=m.id) for m in scratch if m.id]
             return Command(
                 goto="narrator",
@@ -994,15 +1141,24 @@ def get_agent(
         # (see PendingAction's docstring) — close it rather than let it survive
         # indefinitely. Re-running this on a guardrail retry (see below) is safe:
         # once cleared, enc.pending_action is None and this is a no-op.
-        called_this_turn = _tools_called_since_last_human(state["messages"])
+        called_this_turn = _tools_called_since_last_turn_boundary(state["messages"])
         if "resolve_attack" not in called_this_turn and "cast_spell" not in called_this_turn:
-            async with _get_tool_lock(campaign.id):
+            async with campaign_write_lock(campaign.id):
                 live_campaign = await store.load(campaign.id)
                 enc = live_campaign.active_encounter
                 if enc and enc.pending_action:
                     decline_note = await resolve_pending_action_impl(live_campaign)
                     await store.save(live_campaign)
                     notes = (notes + "\n" if notes else "") + f"[Stale pending reaction auto-declined] {decline_note}"
+
+        # ONE live snapshot for everything below — the guardrail chain, the
+        # stalled-turn check, and the ground-truth note are all read-only
+        # consumers of the same post-tool-execution state, and the
+        # stale-pending block above is the last mutator this pass. Each
+        # detector used to load its own copy: 3-5 full Campaign loads
+        # (Postgres round-trip + pydantic parse) per combatant resolution,
+        # multiplied again by stream_response's per-combatant loop.
+        live_campaign = await store.load(campaign.id)
 
         # Guardrail chain: catch the mechanics model stopping mid-resolution
         # during an already-active encounter (rolling/narrating an outcome
@@ -1021,19 +1177,24 @@ def get_agent(
         # treasure and any adventure-specific item alike, rather than by
         # nagging the model to remember to check); or resolving an attack/save
         # against a surviving monster with no active encounter backing it (see
-        # _detect_missing_encounter_followup). Capped at one retry per PLAYER
-        # TURN via correction_count (reset in stream_response), not per
+        # _detect_missing_encounter_followup); or declaring combat over in prose
+        # with no end_encounter call backing it, leaving active_encounter stuck
+        # True forever (see _detect_missing_end_encounter_followup). Capped at
+        # one retry per PLAYER TURN via correction_count (reset in
+        # stream_response), not per
         # no-tool-calls cycle — a model that stops short after nearly every
         # real tool call could otherwise re-trigger this every loop iteration
         # and never reach the recursion limit's stop condition.
-        if correction_count < 1:
-            issue = await _detect_missing_followup(state, campaign.id, store)
+        if live_campaign and correction_count < 1:
+            issue = _detect_missing_followup(state, live_campaign)
             if not issue:
                 issue = _detect_missing_combat_roll_followup(notes, called_this_turn)
             if not issue:
                 issue = _detect_missing_loot_followup(notes, called_this_turn)
             if not issue:
-                issue = await _detect_missing_encounter_followup(state, campaign.id, store)
+                issue = _detect_missing_encounter_followup(state, live_campaign)
+            if not issue:
+                issue = _detect_missing_end_encounter_followup(notes, called_this_turn, live_campaign)
             if issue:
                 log.info("guardrail fired: %s", issue)
                 return Command(
@@ -1052,8 +1213,8 @@ def get_agent(
         # (stalled_turn_guardrail_count) — see DMState's doc comment for the
         # starvation this was split out to avoid.
         stalled_turn_guardrail_count = state.get("stalled_turn_guardrail_count", 0)
-        if stalled_turn_guardrail_count < 1:
-            stalled_issue = await _detect_stalled_non_player_turn_followup(campaign.id, store)
+        if live_campaign and stalled_turn_guardrail_count < 1:
+            stalled_issue = _detect_stalled_non_player_turn_followup(live_campaign)
             if stalled_issue:
                 log.info("guardrail fired: %s", stalled_issue)
                 return Command(
@@ -1123,14 +1284,20 @@ def get_agent(
         # (up from a ~17GB baseline) after just 4 combat turns before this
         # fix. Only the player's HumanMessage and the narrator's own final
         # AIMessage remain as the permanent record of this turn.
-        scratch = _messages_since_last_human(state["messages"])
+        scratch = _messages_since_last_turn_boundary(state["messages"])
+
+        # Same "don't trust the model to relay something exactly" principle
+        # as the session-start directive handling below, applied to this
+        # turn's dice — see _verified_rolls_note for the full story.
+        notes += _verified_rolls_note(scratch)
+
         removals = [RemoveMessage(id=m.id) for m in scratch if m.id]
 
         # Deterministic "whose turn is it" fact, appended unconditionally —
         # see _next_turn_ground_truth_note's docstring for why this is a
         # necessary backstop even with _detect_stalled_non_player_turn_followup
         # already in the guardrail chain above.
-        ground_truth = await _next_turn_ground_truth_note(campaign.id, store)
+        ground_truth = _next_turn_ground_truth_note(live_campaign) if live_campaign else None
         if ground_truth:
             notes += ground_truth
 
@@ -1303,6 +1470,9 @@ def get_session_zero_agent(
     narrator_model = _get_narrator_model()
 
     async def chargen_mechanics_node(state: DMState) -> Command[Literal["tools", "narrator", "mechanics"]]:
+        if (recovery := _recover_orphaned_turn(state["messages"])) is not None:
+            return recovery
+
         correction_count = state.get("correction_count", 0)
 
         # See get_agent()'s mechanics_node for the full rationale — same bounded
@@ -1310,7 +1480,7 @@ def get_session_zero_agent(
         tool_error_count = state.get("tool_error_count", 0)
         tool_error_count = tool_error_count + 1 if _last_tool_batch_had_error(state["messages"]) else 0
         if tool_error_count > _MAX_TOOL_ERROR_RETRIES:
-            scratch = _messages_since_last_human(state["messages"])
+            scratch = _messages_since_last_turn_boundary(state["messages"])
             removals = [RemoveMessage(id=m.id) for m in scratch if m.id]
             return Command(
                 goto="narrator",
@@ -1339,7 +1509,7 @@ def get_session_zero_agent(
         # whether the model's own note quoted it — this makes the real data
         # structurally present for the narrator rather than depending on the
         # model having followed the "quote it verbatim" prompt instruction.
-        scratch = _messages_since_last_human(state["messages"])
+        scratch = _messages_since_last_turn_boundary(state["messages"])
         tool_outputs = [
             _extract_text(m.content) for m in scratch
             if isinstance(m, ToolMessage) and getattr(m, "name", None) == "list_options"
@@ -1349,6 +1519,11 @@ def get_session_zero_agent(
                 "\n\n[VERBATIM TOOL OUTPUT — the only real menu; do not add to it]\n"
                 + "\n\n".join(tool_outputs)
             )
+
+        # Same reasoning as get_agent()'s mechanics_node — see
+        # _verified_rolls_note; the wider tool set additionally captures
+        # roll_ability_scores (see _CHARGEN_VERIFIED_ROLL_TOOLS).
+        notes += _verified_rolls_note(scratch, _CHARGEN_VERIFIED_ROLL_TOOLS)
 
         if correction_count < 1:
             issue = _detect_fake_tool_call(notes)
@@ -1614,6 +1789,17 @@ STALL = _Stall()
 _DONE = object()
 
 
+class _TurnBoundary:
+    """Sentinel yielded by stream_response between two separate combatant
+    turns in the same player-message reply (see stream_response's own
+    per-combatant astream_events loop). Tells the SSE layer (backend/main.py)
+    to close out the current chat bubble and start a fresh one, same pattern
+    as STALL."""
+
+
+TURN_BOUNDARY = _TurnBoundary()
+
+
 async def watch_for_stalls(source: AsyncIterator, stall_after: float = STALL_TIMEOUT) -> AsyncIterator:
     """Wrap an async iterator, yielding STALL if `stall_after` seconds pass
     with no new item. Draining happens in a background task so a stall
@@ -1673,6 +1859,15 @@ def strip_reasoning_leakage(text: str) -> str:
     return _REASONING_LEAK_RE.sub("", text)
 
 
+# Bounds stream_response's own per-combatant resumption loop below — real
+# multi-round fights shouldn't hit this, but it's a hard stop against a
+# combatant that genuinely never resolves (mechanics exhausts its own
+# guardrail retries every time without ever calling advance_initiative)
+# looping forever in real time. Each iteration gets a fresh recursion_limit,
+# so this isn't bounded by that the way a single shared invocation would be.
+_MAX_COMBATANT_TURNS = 10
+
+
 async def stream_response(
     campaign: Campaign,
     store: CampaignStore,
@@ -1683,28 +1878,72 @@ async def stream_response(
     lore_store: LoreStore,
     graph_store: RelationGraphStore,
 ) -> AsyncIterator[str]:
-    """Yield plain-text tokens from the narrator node as they stream. The
-    mechanics node's tool-calling loop runs first and is never streamed —
-    filtering by langgraph_node keeps its tool-call JSON and reasoning off
-    the wire entirely."""
+    """Yield plain-text tokens from the narrator node as they stream, plus a
+    TURN_BOUNDARY sentinel (interleaved the same way watch_for_stalls
+    interleaves STALL) between two separate combatant turns.
+
+    One player message can auto-resolve several non-player combatants'
+    turns in a row before control returns to a real player (see the Combat
+    prompt section's auto-continuation rule) — each such turn is its own
+    separate `astream_events` call on the same thread_id here, not one call
+    covering all of them. Two reasons this is a loop of separate calls
+    rather than one call with the graph looping internally (which is how
+    this worked until 2026-07-11):
+
+    1. recursion_limit is fixed per astream_events call, not resettable
+       from inside the graph. One call covering a whole multi-combatant
+       response meant every combatant shared the same 60-step budget — a
+       single hard-to-resolve combatant (needing several guardrail-retry
+       round trips) could exhaust most of it, leaving too little for later,
+       perfectly resolvable combatants and ending the whole response in a
+       hard GraphRecursionError instead of any narration at all. Each
+       iteration below gets its own fresh 60.
+    2. Each combatant's guardrail-retry budget (correction_count,
+       tool_error_count, lore_guardrail_count, stalled_turn_guardrail_count
+       — see DMState) needs to start fresh too, for the same
+       starvation reason documented on stalled_turn_guardrail_count's field
+       comment. Passing them as 0 in each iteration's input achieves that
+       directly — LangGraph resumes every other channel (messages, live
+       campaign state) from the checkpoint as normal.
+
+    Only the FIRST iteration carries the player's actual message; later
+    iterations resume the same thread with no new human message, relying
+    entirely on the checkpointer's persisted `messages` plus live campaign
+    state (mechanics_node's own ground-truth checks) to know whose turn it
+    genuinely is. The mechanics node's tool-calling loop runs first each
+    iteration and is never streamed — filtering by langgraph_node keeps its
+    tool-call JSON and reasoning off the wire entirely."""
     agent = get_agent(campaign, store, rules_store, history_store, lore_store, graph_store)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
 
-    async for event in agent.astream_events(
-        {
-            "messages": [HumanMessage(content=user_message)], "correction_count": 0, "tool_error_count": 0,
-            "lore_guardrail_count": 0, "stalled_turn_guardrail_count": 0,
-        },
-        config=config,
-        version="v2",
-    ):
-        if event["event"] != "on_chat_model_stream":
-            continue
-        if event.get("metadata", {}).get("langgraph_node") != "narrator":
-            continue
-        chunk = event["data"].get("chunk")
-        if chunk and chunk.content:
-            yield strip_reasoning_leakage(chunk.content)
+    turn_input: dict = {
+        "messages": [HumanMessage(content=user_message)],
+        **_FRESH_GUARDRAIL_BUDGETS,
+    }
+
+    for _ in range(_MAX_COMBATANT_TURNS):
+        async for event in agent.astream_events(turn_input, config=config, version="v2"):
+            if event["event"] != "on_chat_model_stream":
+                continue
+            if event.get("metadata", {}).get("langgraph_node") != "narrator":
+                continue
+            chunk = event["data"].get("chunk")
+            if chunk and chunk.content:
+                yield strip_reasoning_leakage(chunk.content)
+
+        live_campaign = await store.load(campaign.id)
+        hit = _live_current_turn(live_campaign) if live_campaign else None
+        if hit is None:
+            return
+        _, is_player = hit
+        if is_player:
+            return
+
+        # Another non-player combatant's turn is owed before a real player
+        # can act — resume the same thread for it, no new human message,
+        # every guardrail budget fresh.
+        yield TURN_BOUNDARY
+        turn_input = dict(_FRESH_GUARDRAIL_BUDGETS)
 
 
 # ── transcript retrieval ───────────────────────────────────────────────────────

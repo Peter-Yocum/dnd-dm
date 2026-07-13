@@ -156,13 +156,18 @@ backfill-history-chunks:
 eval-retrieval:
 	docker compose exec app python scripts/eval_retrieval.py $(if $(baseline),--baseline,) $(if $(k),--k $(k),)
 
-## Only index if data/chroma_db is empty (safe to run on first clone).
+## Only index if rule_chunks is empty (safe to run on first clone). Was a
+## data/chroma_db/ empty-directory check before the 2026-07-12 Postgres
+## migration — that directory is never populated anymore, so the old check
+## was always true and silently forced a full reindex on every `make setup`.
+## Requires migrate to have run first (rule_chunks must exist to query it).
 index-if-empty:
-	@if [ -z "$$(ls -A data/chroma_db 2>/dev/null)" ]; then \
-		echo "ChromaDB empty — building index (this takes a while)..."; \
+	@count=$$(docker compose exec -T db psql -U dnd_dm -d dnd_dm -tAc "SELECT count(*) FROM rule_chunks;" 2>/dev/null || echo 0); \
+	if [ "$$count" = "0" ]; then \
+		echo "rule_chunks empty — building index (this takes a while)..."; \
 		docker compose exec app python scripts/build_index.py; \
 	else \
-		echo "ChromaDB already populated — skipping. Run 'make index' to force rebuild."; \
+		echo "rule_chunks already populated ($$count rows) — skipping. Run 'make index' to force rebuild."; \
 	fi
 
 ## First-time setup on a new machine: migrate DB + index if needed.

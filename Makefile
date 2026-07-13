@@ -1,4 +1,4 @@
-.PHONY: up down build restart logs psql migrate migration rollback shell fresh index index-if-empty setup extract-lore reindex-full recontextualize backfill-history-chunks eval-retrieval backfill-lore-links seed-relation-graph setup-venv ingest-book-native merge-chroma load-lore-json test
+.PHONY: up down build restart logs psql migrate migration rollback shell fresh index index-if-empty setup extract-lore reindex-full recontextualize backfill-history-chunks eval-retrieval backfill-lore-links seed-relation-graph setup-venv ingest-book-native merge-chroma load-lore-json test vllm-up vllm-down vllm-up-chat vllm-down-chat vllm-up-embed vllm-down-embed
 
 ## ── Services ──────────────────────────────────────────────────────────────────
 
@@ -74,21 +74,46 @@ fresh:
 ## Usage: make index adventure="Curse of Strahd"
 ##        make index book="D&D 5E - Monster Manual" source_type=core
 ##        make index book="D&D 5E - Monster Manual" source_type=core fresh=1
+## Starts the embed server always, plus the chat server unless
+## skip_context=1 (no contextualization means no chat calls at all), and
+## stops whichever it started when done or on failure/Ctrl-C.
 index:
+ifeq ($(skip_context),)
+	@trap '$(MAKE) --no-print-directory vllm-down' EXIT; \
+	$(MAKE) --no-print-directory vllm-up; \
 	docker compose exec app python scripts/build_index.py \
 		$(if $(adventure),--adventure "$(adventure)",) \
 		$(if $(book),--book "$(book)",) \
 		$(if $(source_type),--source-type "$(source_type)",) \
-		$(if $(skip_context),--skip-contextualization,) \
 		$(if $(fresh),--fresh,)
+else
+	@trap '$(MAKE) --no-print-directory vllm-down-embed' EXIT; \
+	$(MAKE) --no-print-directory vllm-up-embed; \
+	docker compose exec app python scripts/build_index.py \
+		$(if $(adventure),--adventure "$(adventure)",) \
+		$(if $(book),--book "$(book)",) \
+		$(if $(source_type),--source-type "$(source_type)",) \
+		--skip-contextualization \
+		$(if $(fresh),--fresh,)
+endif
 
 ## One-time full corpus rebuild under the parent/child + contextual-
 ## augmentation chunk schema. Expect a long multi-hour/multi-day first run
 ## (many thousands of child chunks, one local LLM call each) — safe to leave
 ## running overnight. If interrupted, resume with `make index` (NOT by
-## re-running this target, which would re-wipe the collection).
+## re-running this target, which would re-wipe the collection). skip_context=1
+## skips contextualization (fast path — e.g. for a full re-embed after an
+## embedding-model/dimension change, where content itself hasn't changed).
 reindex-full:
+ifeq ($(skip_context),)
+	@trap '$(MAKE) --no-print-directory vllm-down' EXIT; \
+	$(MAKE) --no-print-directory vllm-up; \
 	docker compose exec app python scripts/build_index.py --wipe
+else
+	@trap '$(MAKE) --no-print-directory vllm-down-embed' EXIT; \
+	$(MAKE) --no-print-directory vllm-up-embed; \
+	docker compose exec app python scripts/build_index.py --wipe --skip-contextualization
+endif
 
 ## One command for the full nightly per-book pipeline: reindex (with
 ## contextualization) THEN extract lore/monsters, in sequence. Same params
@@ -96,24 +121,107 @@ reindex-full:
 ## plus kinds= (passed to extraction only, e.g. kinds=monster for the
 ## Monster Manual) and skip_context=1 (passed to reindexing only). Both
 ## steps show a live tqdm progress bar. Resumable — safe to Ctrl-C/kill and
-## re-run, same as running the two steps separately.
+## re-run, same as running the two steps separately. Starts/stops the vLLM
+## server(s) the reindexing step needs, same as `index` above.
 ## Usage: make ingest-book adventure="Curse of Strahd"
 ##        make ingest-book book="D&D 5E - Monster Manual" source_type=core kinds=monster
 ingest-book:
 	@test -n "$(adventure)$(book)" || (echo "Usage: make ingest-book adventure=\"Name\" OR book=\"Core Book\" source_type=core [kinds=...] [skip_context=1] [fresh=1]" && exit 1)
 	@echo "=== [1/2] Reindexing: $(or $(adventure),$(book)) ==="
-	docker compose exec app python scripts/build_index.py \
-		$(if $(adventure),--adventure "$(adventure)",) \
-		$(if $(book),--book "$(book)",) \
-		$(if $(source_type),--source-type "$(source_type)",) \
-		$(if $(skip_context),--skip-contextualization,) \
-		$(if $(fresh),--fresh,)
+	$(MAKE) --no-print-directory index adventure="$(adventure)" book="$(book)" source_type="$(source_type)" skip_context="$(skip_context)" fresh="$(fresh)"
 	@echo "=== [2/2] Extracting lore/monsters: $(or $(adventure),$(book)) ==="
 	docker compose exec app python scripts/extract_entities.py --write-postgres \
 		--book "$(or $(adventure),$(book))" \
 		$(if $(source_type),--source-type "$(source_type)",) \
 		$(if $(kinds),--kinds "$(kinds)",)
 	@echo "=== Done: $(or $(adventure),$(book)) ==="
+
+## Internal: start the vLLM-metal CHAT server (mlx-community/Qwen3-30B-A3B-4bit,
+## port 8100) in the background if nothing's already listening there, and
+## block until it's healthy. NOT a real supervised service (open item —
+## launchd or equivalent, see vllm-migration-plan.md §7.1/§9) — a
+## best-effort start-for-this-command helper used by index/reindex-full/
+## recontextualize below. Leaves an already-running server alone; the
+## matching vllm-down-chat won't touch one it didn't start.
+##
+## PID is looked up via `lsof` AFTER startup succeeds, deliberately NOT `$!`
+## — confirmed live (2026-07-13) that `$!` here captures the wrong PID
+## across this nested shell/subshell/backgrounding (it ended up pointing at
+## the recipe's own invoking shell, not the actual `vllm serve` process),
+## silently leaving the real server running after a supposedly-successful
+## stop. Querying who's actually listening on the port is unambiguous.
+vllm-up-chat:
+	@if curl -sf http://localhost:8100/v1/models > /dev/null 2>&1; then \
+		echo "vLLM-metal chat already running on :8100 — leaving it as-is."; \
+	else \
+		echo "Starting vLLM-metal chat (mlx-community/Qwen3-30B-A3B-4bit)..."; \
+		( . ~/.venv-vllm-metal/bin/activate && \
+		  nohup vllm serve mlx-community/Qwen3-30B-A3B-4bit \
+		    --port 8100 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+		    --reasoning-parser qwen3 --max-model-len 8192 \
+		    > /tmp/vllm-metal-chat.log 2>&1 & ); \
+		tries=0; \
+		until curl -sf http://localhost:8100/v1/models > /dev/null 2>&1; do \
+			tries=$$((tries+1)); \
+			if [ $$tries -gt 120 ]; then \
+				echo "vLLM-metal chat failed to start within 10 minutes — see /tmp/vllm-metal-chat.log"; \
+				exit 1; \
+			fi; \
+			sleep 5; \
+		done; \
+		lsof -tiTCP:8100 -sTCP:LISTEN > /tmp/vllm-metal-chat.pid; \
+		echo "vLLM-metal chat is up (pid $$(cat /tmp/vllm-metal-chat.pid))."; \
+	fi
+
+## Internal: stop the vLLM-metal chat server, but ONLY if vllm-up-chat
+## started it during this invocation (/tmp/vllm-metal-chat.pid is only
+## written in that branch). Safe to call even if never started (no-op).
+vllm-down-chat:
+	@if [ -f /tmp/vllm-metal-chat.pid ]; then \
+		pid=$$(cat /tmp/vllm-metal-chat.pid); \
+		echo "Stopping vLLM-metal chat (pid $$pid)..."; \
+		kill $$pid 2>/dev/null || true; \
+		rm -f /tmp/vllm-metal-chat.pid; \
+	fi
+
+## Same pattern as vllm-up-chat/vllm-down-chat, for the EMBEDDING server
+## (mlx-community/Qwen3-Embedding-0.6B-8bit, port 8101, --convert embed —
+## see vllm-migration-plan.md §7.7). Every reindex/recontextualize path
+## embeds, so this is needed alongside the chat server, not instead of it.
+vllm-up-embed:
+	@if curl -sf http://localhost:8101/v1/models > /dev/null 2>&1; then \
+		echo "vLLM-metal embed already running on :8101 — leaving it as-is."; \
+	else \
+		echo "Starting vLLM-metal embed (mlx-community/Qwen3-Embedding-0.6B-8bit)..."; \
+		( . ~/.venv-vllm-metal/bin/activate && \
+		  nohup vllm serve mlx-community/Qwen3-Embedding-0.6B-8bit \
+		    --port 8101 --convert embed \
+		    > /tmp/vllm-metal-embed.log 2>&1 & ); \
+		tries=0; \
+		until curl -sf http://localhost:8101/v1/models > /dev/null 2>&1; do \
+			tries=$$((tries+1)); \
+			if [ $$tries -gt 60 ]; then \
+				echo "vLLM-metal embed failed to start within 5 minutes — see /tmp/vllm-metal-embed.log"; \
+				exit 1; \
+			fi; \
+			sleep 5; \
+		done; \
+		lsof -tiTCP:8101 -sTCP:LISTEN > /tmp/vllm-metal-embed.pid; \
+		echo "vLLM-metal embed is up (pid $$(cat /tmp/vllm-metal-embed.pid))."; \
+	fi
+
+vllm-down-embed:
+	@if [ -f /tmp/vllm-metal-embed.pid ]; then \
+		pid=$$(cat /tmp/vllm-metal-embed.pid); \
+		echo "Stopping vLLM-metal embed (pid $$pid)..."; \
+		kill $$pid 2>/dev/null || true; \
+		rm -f /tmp/vllm-metal-embed.pid; \
+	fi
+
+## Both servers together — chat + embed. Used by any target that both
+## contextualizes (chat) and embeds (embed).
+vllm-up: vllm-up-chat vllm-up-embed
+vllm-down: vllm-down-chat vllm-down-embed
 
 ## Resumable LLM-contextualization pass over rule_chunks that were indexed
 ## without it (contextualized=false — e.g. an initial reindex run with
@@ -125,20 +233,27 @@ ingest-book:
 ## and it does core rulebooks FIRST, then adventures, as two sequential
 ## phases — core is the higher-priority corpus (used by every campaign),
 ## so a kill after phase 1 still leaves all of core done before any
-## adventure work starts.
+## adventure work starts. Starts the vLLM-metal chat server first if it
+## isn't already running (contextualization is a chat call, see
+## vllm-migration-plan.md) and stops it again when done or on failure/Ctrl-C
+## (via `trap`) — but only if this invocation was the one that started it.
 ## Usage: make recontextualize                        # core first, then adventures
 ##        make recontextualize adventure="Curse of Strahd"
 ##        make recontextualize source_type=core
 ifeq ($(adventure)$(book)$(source_type),)
 recontextualize:
-	@echo "=== [1/2] Recontextualizing core rulebooks ==="
+	@trap '$(MAKE) --no-print-directory vllm-down' EXIT; \
+	$(MAKE) --no-print-directory vllm-up; \
+	echo "=== [1/2] Recontextualizing core rulebooks ==="; \
 	docker compose exec app python scripts/build_index.py --recontextualize --source-type core \
-		$(if $(context_model),--context-model "$(context_model)",)
-	@echo "=== [2/2] Recontextualizing adventures ==="
+		$(if $(context_model),--context-model "$(context_model)",) && \
+	echo "=== [2/2] Recontextualizing adventures ===" && \
 	docker compose exec app python scripts/build_index.py --recontextualize --source-type adventure \
 		$(if $(context_model),--context-model "$(context_model)",)
 else
 recontextualize:
+	@trap '$(MAKE) --no-print-directory vllm-down' EXIT; \
+	$(MAKE) --no-print-directory vllm-up; \
 	docker compose exec app python scripts/build_index.py --recontextualize \
 		$(if $(adventure),--adventure "$(adventure)",) \
 		$(if $(book),--book "$(book)",) \

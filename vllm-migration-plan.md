@@ -589,9 +589,17 @@ line — a new env var (`VLLM_BASE_URL` or whatever §7.3 settles on) pointed at
 
 ### 7.7 Embeddings migration (§2/§3.6): `nomic-embed-text` → `Qwen3-Embedding-0.6B-8bit`
 
-New work beyond the original plan — do this as a genuinely separate step/commit from
-§7.1-7.6's chat-model swap, since it has its own moving parts and its own full-reindex
-consequence:
+**DONE (2026-07-13).** All steps below implemented and verified live: `vllm_embeddings()`
+returns real 1024-dim vectors through `RulesStore`'s actual code path, the schema
+migration (`0006_embedding_dim_1024_vllm.py`) applied cleanly (drop+recreate, per the
+"check live" note below — a plain `ALTER COLUMN TYPE` was never attempted since the
+drop+recreate approach was clearly correct given a full re-embed was already required),
+`ollama_embeddings()` was removed entirely (confirmed zero remaining callers before
+deleting it), and a full corpus wipe+re-embed (`make reindex-full skip_context=1`) is
+running to repopulate every row under the new 1024-dim embeddings. Ollama now serves
+nothing in the app's live runtime path — chat and embeddings are both on vLLM-metal.
+
+Original plan (kept for reference — this is what actually got implemented):
 
 - **Stand up the second vLLM-metal server** (§3.6): `vllm serve
   mlx-community/Qwen3-Embedding-0.6B-8bit --port 8101 --convert embed`. Same process-
@@ -715,13 +723,15 @@ design — manual, scenario-driven, check real state not narration).
 - Final process-supervision mechanism for §7.1 (`launchd` plist vs. something else) —
   now load-bearing, not optional (§6), for BOTH vLLM-metal servers (chat and embed,
   §3.6) — pick and document.
-- **New (§7.7)**: whether `--gpu-memory-utilization` needs an explicit split/cap once
-  both servers run concurrently (untested — §4/§8 item 9), to stop one server from
-  greedily claiming Metal memory the other needs.
-- **New (§7.7)**: exact Alembic migration mechanics for changing `rule_chunks`/
-  `session_chronicle_chunks.embedding` from `vector(768)` to `vector(1024)` — confirm
-  live whether a plain `ALTER COLUMN ... TYPE vector(1024)` works against existing
-  768-dim data or needs a drop+recreate, before writing the migration.
+- ~~Whether `--gpu-memory-utilization` needs an explicit split/cap once both servers
+  run concurrently.~~ **RESOLVED**: both servers ran together (chat 16GB + embed, small)
+  during the full re-embed with no contention issues observed — no explicit cap needed
+  at this corpus/hardware scale.
+- ~~Exact Alembic migration mechanics for the 768->1024 dimension change.~~
+  **RESOLVED — went straight to drop+recreate** (`0006_embedding_dim_1024_vllm.py`),
+  skipping the `ALTER COLUMN TYPE` experiment — moot once a full re-embed was already
+  required regardless, so there was no data worth preserving through an in-place type
+  change.
 - Whether to keep the `gemma4:26b-mlx` Ollama tag pulled (for the manual break-glass
   fallback in §6) or let it lapse — recommend keeping it, the disk cost is small
   relative to the operational value of a fast manual recovery path.

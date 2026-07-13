@@ -57,7 +57,7 @@ def _untouched(session) -> bool:
 async def main(dry_run: bool, campaign_id: str | None) -> None:
     engine = create_async_engine(settings.database_url)
     store = CampaignStore(engine)
-    rules_store = RulesStore(engine, settings.ollama_base_url)
+    rules_store = RulesStore(engine, settings.vllm_embed_base_url)
 
     total_backfilled = 0
     total_skipped_touched = 0

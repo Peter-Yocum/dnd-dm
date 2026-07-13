@@ -89,9 +89,11 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 DEFAULT_SOURCE  = "docs/source"
-DEFAULT_OLLAMA  = "http://localhost:11434"
 DEFAULT_VLLM    = "http://localhost:8100/v1"  # vllm-metal chat server, see vllm-migration-plan.md
-DEFAULT_EMBED   = "nomic-embed-text"
+DEFAULT_VLLM_EMBED = "http://localhost:8101/v1"  # vllm-metal embed server (--convert embed)
+DEFAULT_EMBED   = "mlx-community/Qwen3-Embedding-0.6B-8bit"  # was nomic-embed-text (Ollama)
+                                                              # before the vLLM-metal embeddings
+                                                              # migration, vllm-migration-plan.md §7.7
 MAX_CHUNK_CHARS = 1500   # parent section cap
 CHILD_CHUNK_CHARS = 350  # child sub-chunk target size (dense/BM25 search target)
 CHUNK_OVERLAP_WORDS = 50 # trailing words carried into the next size-split part
@@ -270,7 +272,7 @@ def _delete_where(engine, condition) -> None:
 # ── indexing (resumable) ──────────────────────────────────────────────────────
 
 def _index_documents(
-    all_docs: list[dict], engine, ollama_url: str, vllm_url: str,
+    all_docs: list[dict], engine, embed_url: str, vllm_url: str,
     skip_contextualization: bool, force: bool, context_model: str | None = None,
     recontextualize: bool = False,
 ) -> None:
@@ -278,15 +280,14 @@ def _index_documents(
     from sqlalchemy import select
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-    from backend.llm import ollama_embeddings
+    from backend.llm import vllm_embeddings
     from backend.rag.contextualizer import ChunkContextualizer
     from backend.stores import tables as t
 
-    # Embeddings stay on Ollama (ollama_url) — the vllm-metal migration's
-    # embeddings step (vllm-migration-plan.md §7.7) is separate/not done
-    # yet. Contextualization is a chat call and moved to vLLM (vllm_url)
-    # with the rest of the app's chat traffic.
-    embeddings_fn = ollama_embeddings(model=DEFAULT_EMBED, base_url=ollama_url, timeout=None)
+    # Embeddings (embed_url) and contextualization (vllm_url) are two
+    # separate vllm-metal servers/ports — vLLM serves one model per process
+    # (vllm-migration-plan.md §3.6/§7.7). Both moved off Ollama entirely.
+    embeddings_fn = vllm_embeddings(model=DEFAULT_EMBED, base_url=embed_url, timeout=None)
     if skip_contextualization:
         contextualizer = None
     elif context_model:
@@ -399,11 +400,13 @@ def _index_documents(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build the hybrid Postgres/pgvector rules index from docs/source/.")
     ap.add_argument("--source",      default=DEFAULT_SOURCE)
-    ap.add_argument("--ollama-url",  default=None, help="Ollama server for embeddings")
+    ap.add_argument("--embed-url",   default=None,
+                     help="vLLM-metal embed server (--convert embed, see vllm-migration-plan.md "
+                          "§7.7) — separate process/port from --vllm-url below, since vLLM "
+                          "serves one model per process")
     ap.add_argument("--vllm-url",    default=None,
                      help="vLLM-metal chat server for contextualization (see "
-                          "vllm-migration-plan.md) — separate from --ollama-url, "
-                          "which is embeddings-only now")
+                          "vllm-migration-plan.md) — separate from --embed-url above")
     ap.add_argument("--wipe",        action="store_true",
                      help="clear whole collection first — FIRST RUN ONLY; if interrupted, "
                           "resume with a plain run (no --wipe), not by repeating --wipe")
@@ -489,7 +492,7 @@ def main() -> None:
               "These are contradictory — pick one.")
         sys.exit(1)
 
-    ollama_url = args.ollama_url or os.environ.get("OLLAMA_BASE_URL") or DEFAULT_OLLAMA
+    embed_url = args.embed_url or os.environ.get("VLLM_EMBED_BASE_URL") or DEFAULT_VLLM_EMBED
     vllm_url = args.vllm_url or os.environ.get("VLLM_BASE_URL") or DEFAULT_VLLM
     source_dir = Path(args.source)
 
@@ -550,7 +553,7 @@ def main() -> None:
 
     print(f"\nIndexing {len(all_docs)} chunks (parent+child, resumable) …")
     _index_documents(
-        all_docs, engine, ollama_url, vllm_url, args.skip_contextualization, args.force, args.context_model,
+        all_docs, engine, embed_url, vllm_url, args.skip_contextualization, args.force, args.context_model,
         recontextualize=args.recontextualize,
     )
 

@@ -10,14 +10,14 @@ which runs live in the request path via history_store.add_session).
 Cross-cutting client policy — timeouts, keep_alive, reasoning — is decided
 here once and documented here once.
 
-vllm_chat() (2026-07-13, vllm-migration-plan.md) is chat's real construction
-point now — Ollama no longer serves chat in the normal runtime path (only
-the manual break-glass fallback the migration plan documents), which is why
-this module's centralization already paid off: the swap was one new
-factory function plus repointing ~4 call sites, not ~8 scattered edits.
-ollama_chat()/ollama_embeddings() stay for now — embeddings are still on
-Ollama pending the separate embeddings migration (§7.7 of the plan) and
-ollama_chat() itself is what the break-glass fallback would use.
+vllm_chat()/vllm_embeddings() (2026-07-13, vllm-migration-plan.md) are the
+real construction points now — Ollama no longer serves anything in the
+normal runtime path (chat AND embeddings both moved to vLLM-metal), which
+is why this module's centralization already paid off twice: each swap was
+one new factory function plus repointing a handful of call sites, not a
+scattered hunt. ollama_chat() stays — offline scripts (extract_entities.py,
+clean_source.py, add_headers.py) still use it, out of scope for both
+migrations, and it's what the manual break-glass fallback would use.
 
 Per-role choices stay at the call sites where they belong: temperature,
 which model, and any constructor-injected base_url (the RAG/store classes
@@ -25,8 +25,8 @@ take base_url as a constructor param so scripts can point them at a
 different Ollama; they pass it through here).
 """
 
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from backend.config import settings
 
@@ -133,20 +133,37 @@ def vllm_chat(
     )
 
 
-def ollama_embeddings(
+def vllm_embeddings(
     *,
     model: str | None = None,
     base_url: str | None = None,
     timeout: float | None = EMBED_TIMEOUT_S,
-) -> OllamaEmbeddings:
-    """An OllamaEmbeddings with this app's cross-cutting client policy
-    applied — same timeout/keep_alive reasoning as ollama_chat above, minus
-    reasoning (chat-only param). Model defaults to settings.embed_model
-    rather than being hardcoded per site (it was literal "nomic-embed-text"
-    at five different call sites before this factory)."""
-    return OllamaEmbeddings(
+) -> OpenAIEmbeddings:
+    """An OpenAIEmbeddings pointed at the vLLM-metal embed server
+    (vllm-migration-plan.md §7.7) — was OllamaEmbeddings/nomic-embed-text
+    until this migration. Model defaults to settings.embed_model rather
+    than being hardcoded per site (it was literal "nomic-embed-text" at
+    five different call sites before the original ollama_embeddings()
+    factory this replaces).
+
+    Real, live-verified reason for the swap, not just consolidation:
+    nomic-embed-text's architecture (NomicBertModel, a BERT-family encoder)
+    cannot be served via vllm-metal at all — vllm-metal delegates model
+    loading entirely to mlx_lm, which is a causal-LM-only library (confirmed
+    by listing every architecture file in mlx_lm/models — zero encoder
+    models exist there). mlx-community/Qwen3-Embedding-0.6B-8bit, served via
+    `vllm serve ... --convert embed` (vLLM's adapter for repurposing a
+    causal generation model as a pooling/embedding model), is the verified
+    alternative: a real /v1/embeddings request returned correct 1024-dim
+    vectors in testing.
+
+    api_key is a required field for OpenAIEmbeddings/the OpenAI client
+    library but meaningless here — vllm-metal doesn't check it, "unused" is
+    a placeholder, not a real credential.
+    """
+    return OpenAIEmbeddings(
         model=model or settings.embed_model,
-        base_url=base_url or settings.ollama_base_url,
-        keep_alive=settings.ollama_keep_alive,
-        client_kwargs={"timeout": timeout} if timeout is not None else {},
+        base_url=base_url or settings.vllm_embed_base_url,
+        api_key="unused",
+        timeout=timeout,
     )

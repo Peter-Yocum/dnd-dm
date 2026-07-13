@@ -24,7 +24,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from backend.llm import ollama_embeddings
+from backend.llm import vllm_embeddings
 from backend.rag.hybrid import reciprocal_rank_fusion
 from backend.rag.reranker import LLMJudgeReranker, Reranker
 from backend.stores import tables as t
@@ -37,12 +37,11 @@ class HistoryStore:
     def __init__(
         self,
         engine: AsyncEngine,
-        ollama_base_url: str | None = None,
+        vllm_embed_base_url: str | None = None,
         reranker: Reranker | None = None,
     ) -> None:
         self._engine = engine
-        self._ollama_base_url = ollama_base_url
-        self._embeddings = ollama_embeddings(base_url=ollama_base_url) if ollama_base_url else ollama_embeddings()
+        self._embeddings = vllm_embeddings(base_url=vllm_embed_base_url) if vllm_embed_base_url else vllm_embeddings()
         # See rules_store.py's identical choice — LLMJudgeReranker avoids
         # needing torch/sentence-transformers in the container at all.
         self._reranker: Reranker = reranker if reranker is not None else LLMJudgeReranker()
@@ -68,12 +67,12 @@ class HistoryStore:
         if not events:
             return
 
-        # No vllm_base_url override — self._ollama_base_url is scoped to this
-        # store's embeddings (still Ollama, pending the separate embeddings
-        # migration in vllm-migration-plan.md §7.7), not chat. Reusing it
-        # here would point contextualization at the wrong server. Let
-        # ChunkContextualizer fall back to its own settings.vllm_base_url
-        # default instead — same one every other chat call in the app uses.
+        # No vllm_base_url override — this store's constructor param is
+        # scoped to embeddings (vllm_embed_base_url), a different server/
+        # model than chat. Reusing it here would point contextualization at
+        # the wrong server. Let ChunkContextualizer fall back to its own
+        # settings.vllm_base_url default instead — same one every other
+        # chat call in the app uses.
         contextualizer = ChunkContextualizer()
 
         rows = []

@@ -102,15 +102,15 @@ def _store() -> CampaignStore:
     return CampaignStore(_engine)
 
 # One reranker instance shared by both stores (constructor injection).
-# LLMJudgeReranker (Ollama-based), not CrossEncoderReranker — this is a
-# low-throughput single-user app, so the extra Ollama round-trip's latency
-# is negligible next to the mechanics/narrator calls already made every
-# turn, and it keeps the container light: no torch/sentence-transformers,
-# which real testing showed OOM-killing under Docker Desktop's default
-# memory allocation anyway.
+# LLMJudgeReranker (chat-based), not CrossEncoderReranker — this is a
+# low-throughput single-user app, so the extra round-trip's latency is
+# negligible next to the mechanics/narrator calls already made every turn,
+# and it keeps the container light: no torch/sentence-transformers, which
+# real testing showed OOM-killing under Docker Desktop's default memory
+# allocation anyway.
 _reranker = LLMJudgeReranker()
-_rules_store = RulesStore(_engine, settings.ollama_base_url, reranker=_reranker)
-_history_store = HistoryStore(_engine, settings.ollama_base_url, reranker=_reranker)
+_rules_store = RulesStore(_engine, settings.vllm_embed_base_url, reranker=_reranker)
+_history_store = HistoryStore(_engine, settings.vllm_embed_base_url, reranker=_reranker)
 
 def _rules() -> RulesStore:
     return _rules_store

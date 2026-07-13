@@ -7,9 +7,13 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, TSVECTOR, UU
 
 metadata = MetaData()
 
-# nomic-embed-text's real output dimension — confirmed live against the
-# running Ollama instance (2026-07-12), not assumed from documentation.
-EMBEDDING_DIM = 768
+# mlx-community/Qwen3-Embedding-0.6B-8bit's real output dimension — confirmed
+# live against a running vllm-metal --convert embed instance (2026-07-13),
+# not assumed from documentation. Was 768 (nomic-embed-text, via Ollama)
+# before the vLLM-metal embeddings migration (vllm-migration-plan.md §7.7) —
+# a breaking change requiring every existing embedding to be regenerated,
+# not just a config bump (see that section's migration notes).
+EMBEDDING_DIM = 1024
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────

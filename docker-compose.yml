@@ -34,15 +34,21 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg://dnd_dm:dnd_dm@db:5432/dnd_dm
-      # Reaches Ollama running on the host machine (Docker Desktop Mac/Windows).
+      # Ollama no longer serves anything in the live app's runtime path as of
+      # the vLLM-metal embeddings migration (vllm-migration-plan.md §7.7) —
+      # chat AND embeddings both moved to vLLM-metal. Still reachable here
+      # for offline scripts (extract_entities.py etc, out of scope for both
+      # migrations) and the manual break-glass fallback (see the plan's §6).
       # On Linux: set OLLAMA_BASE_URL=http://172.17.0.1:11434 or use host network mode.
-      # Ollama now serves embeddings only (nomic-embed-text) — chat moved to
-      # vLLM-metal, see VLLM_BASE_URL below and vllm-migration-plan.md.
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       # vLLM-metal chat server (see vllm-migration-plan.md) — runs natively
       # on the host Mac (not in Docker), same reachability pattern as Ollama
       # above. On Linux: same 172.17.0.1/host-network-mode note applies.
       VLLM_BASE_URL: http://host.docker.internal:8100/v1
+      # vLLM-metal embed server (--convert embed, vllm-migration-plan.md §7.7)
+      # — a SEPARATE process/port from chat above, since vLLM serves one
+      # model per process. Same reachability pattern.
+      VLLM_EMBED_BASE_URL: http://host.docker.internal:8101/v1
     depends_on:
       db:
         condition: service_healthy

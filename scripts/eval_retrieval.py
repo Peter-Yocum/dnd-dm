@@ -71,7 +71,7 @@ async def _dense_only_search(store: RulesStore, engine, query: str, k: int) -> l
 async def run_eval(k: int, baseline: bool) -> None:
     questions = json.loads(QUESTIONS_PATH.read_text(encoding="utf-8"))
     engine = create_async_engine(settings.database_url)
-    store = RulesStore(engine, settings.ollama_base_url)
+    store = RulesStore(engine, settings.vllm_embed_base_url)
     if not await store.is_ready():
         print("RulesStore is not ready — run build_index.py first.")
         sys.exit(1)

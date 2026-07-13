@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from backend.llm import ollama_embeddings
+from backend.llm import vllm_embeddings
 from backend.rag.reranker import LLMJudgeReranker, Reranker
 from backend.rag.hybrid import reciprocal_rank_fusion
 from backend.stores import tables as t
@@ -64,18 +64,18 @@ class RulesStore:
     def __init__(
         self,
         engine: AsyncEngine,
-        ollama_base_url: str | None = None,
+        vllm_embed_base_url: str | None = None,
         reranker: Reranker | None = None,
     ) -> None:
         self._engine = engine
-        self._embeddings = ollama_embeddings(base_url=ollama_base_url) if ollama_base_url else ollama_embeddings()
-        # LLMJudgeReranker (Ollama-based) rather than CrossEncoderReranker —
-        # this is a low-throughput single-user app, so the extra Ollama
-        # round-trip's latency is negligible next to the mechanics/narrator
-        # calls already made every turn, and it avoids needing torch/
-        # sentence-transformers in the container at all (real memory cost,
-        # confirmed live: Docker Desktop's default memory allocation
-        # couldn't even load the cross-encoder model without OOM-killing).
+        self._embeddings = vllm_embeddings(base_url=vllm_embed_base_url) if vllm_embed_base_url else vllm_embeddings()
+        # LLMJudgeReranker (chat-based) rather than CrossEncoderReranker —
+        # this is a low-throughput single-user app, so the extra round-trip's
+        # latency is negligible next to the mechanics/narrator calls already
+        # made every turn, and it avoids needing torch/sentence-transformers
+        # in the container at all (real memory cost, confirmed live: Docker
+        # Desktop's default memory allocation couldn't even load the
+        # cross-encoder model without OOM-killing).
         self._reranker: Reranker = reranker if reranker is not None else LLMJudgeReranker()
         self._ready: bool | None = None
 

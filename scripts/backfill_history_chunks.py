@@ -42,7 +42,7 @@ from backend.stores.history_store import HistoryStore
 async def main(dry_run: bool, campaign_id: str | None) -> None:
     engine = create_async_engine(settings.database_url)
     store = CampaignStore(engine)
-    history = HistoryStore(engine, settings.ollama_base_url)
+    history = HistoryStore(engine, settings.vllm_embed_base_url)
 
     total = 0
     campaign_ids = [campaign_id] if campaign_id else [s.id for s in await store.list_all()]

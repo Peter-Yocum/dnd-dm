@@ -2,7 +2,7 @@
 
 ## Goal
 
-A local web app that acts as an AI Dungeon Master for D&D 5e. The AI narrates, rules, and rolls dice via a LangGraph agent backed by local models (Ollama). A player visits a localhost page to interact; no cloud services required. Designed to eventually be hosted for friends via Railway.
+A local web app that acts as an AI Dungeon Master for D&D 5e. The AI narrates, rules, and rolls dice via a LangGraph agent backed by local models (vLLM-metal for chat, Ollama for embeddings — see Tech Stack). A player visits a localhost page to interact; no cloud services required. Designed to eventually be hosted for friends via Railway.
 
 ---
 
@@ -10,10 +10,9 @@ A local web app that acts as an AI Dungeon Master for D&D 5e. The AI narrates, r
 
 | Layer | Choice | Reason |
 |---|---|---|
-| LLM (in-game) | Ollama, one model (`gemma4:26b-mlx`) in two roles — mechanics/tool-calling (temp 0.1) and narrator/prose (temp 0.8, no tools) | Originally split across two models (`gemma4:26b-mlx` mechanics + `gemma4:12b-mlx` narrator, on the theory that a smaller model would be faster for narration and that residency-swapping between them was an acceptable tradeoff). Benchmarked and found both assumptions wrong: `gemma4:26b-mlx` generates ~48% *faster* than `gemma4:12b-mlx` (~37.5 vs ~25.3 tok/s, measured via `response_metadata` eval counts), and — contrary to an earlier measurement against a different narrator model (`qwen3:8b`) that genuinely did force a ~6-8s evict-and-reload each handoff — this pairing never evicted at all; both models stayed resident simultaneously (`ollama ps`) even at full native context, using ~24.6GB of 32GB. With no speed or memory-avoidance benefit left, dropped the second model — one model, two temperatures/prompts, ~7.6GB less resident |
-| LLM (Session 0 / world-prep) | Ollama (`qwen2.5:14b`) | Structured/tool-driven passes with no dedicated narration step — single model is enough |
-| Embeddings | Ollama (`nomic-embed-text`) | Paired with Chroma for local RAG |
-| Vector store | ChromaDB (persistent, bind-mounted) | Two collections: `rules` + `session_chronicles` |
+| LLM (in-game, Session 0, world-prep — all roles) | vLLM-metal, one model (`mlx-community/Qwen3-30B-A3B-4bit`, an MoE checkpoint — ~3B active params of 30B total) in three roles: mechanics/tool-calling (temp 0.1), narrator/prose (temp 0.8, no tools), and the single-pass world-prep/party-fill/summarization role (temp 0.7) | Was Ollama (`gemma4:26b-mlx` for mechanics/narrator, `qwen2.5:14b` then `gemma4:26b-mlx` for the single-pass role) until the 2026-07-13 vLLM-metal migration (`vllm-migration-plan.md`) — root cause: Ollama has no real `tool_choice`/forced-tool-calling mechanism at all (confirmed against `langchain_ollama`'s own source), which is the entire reason the guardrail chain in "Agent Architecture" below exists. Qwen3-30B-A3B-4bit was chosen over the plan's originally-spiked Gemma4 checkpoint on the strength of outside research suggesting better tool-calling quality — re-verified empirically before adopting it (see the plan doc's "Step 0"): real `tool_choice="required"` compliance (14/15 on a fresh battery of real tool schemas), throughput beating the original Gemma4 spike. The historical Ollama two-model-vs-one-model benchmarking narrative that used to live in this row (`gemma4:26b-mlx` vs `gemma4:12b-mlx` narrator, `qwen3:8b`'s evict-and-reload behavior) is Ollama-specific and no longer describes the current setup — see git history for that record if needed. |
+| Embeddings | Ollama (`nomic-embed-text`) | Paired with Postgres/pgvector for local RAG (was Chroma — see Vector store row). Not yet migrated to vLLM-metal — `nomic-embed-text`'s BERT-family architecture can't run on vllm-metal's MLX backend at all (confirmed live); a verified alternative (`mlx-community/Qwen3-Embedding-0.6B-8bit` via vLLM's `--convert embed`) exists and is planned (`vllm-migration-plan.md` §7.7) but not implemented yet. |
+| Vector store | PostgreSQL 16 + `pgvector` (same instance as campaign data) | Was ChromaDB (two collections: `rules` + `session_chronicles`) until the 2026-07-12 migration — root cause: Chroma's own local vector index needed ~2.6GB resident just to query the 441k-vector `rules` collection, independent of any keyword-index approach, and this app is meant to be hosted on Railway (this repo's own "one DB everywhere" principle — see Database row below — argued directly against a second, Chroma-shaped storage engine). Now two tables (`rule_chunks`, `session_chronicle_chunks`) with `Vector` columns + native `tsvector`/GIN full-text search, fused via the same `reciprocal_rank_fusion()` as before — see "Datastores" below. |
 | Agent framework | LangGraph | Tool-calling loop with checkpointed memory |
 | Session memory | PostgreSQL (`langgraph-checkpoint-postgres`) | Same DB as campaign data; persists by `thread_id` |
 | Database | PostgreSQL 16 (Docker locally, Railway in prod) | One DB everywhere; no SQLite/Postgres divergence |
@@ -44,7 +43,7 @@ dnd-dm/
 │       └── 0001_initial_schema.py
 │
 ├── backend/
-│   ├── config.py                # Settings: DATABASE_URL, OLLAMA_BASE_URL, CHROMA_PERSIST_DIR
+│   ├── config.py                # Settings: DATABASE_URL, OLLAMA_BASE_URL (embeddings), VLLM_BASE_URL (chat)
 │   ├── models.py                # all Pydantic v2 domain models
 │   ├── main.py                  # FastAPI app, all routes, lifespan
 │   ├── agent/
@@ -57,8 +56,8 @@ dnd-dm/
 │   ├── stores/
 │   │   ├── tables.py            # SQLAlchemy Core Table definitions (13 tables)
 │   │   ├── campaign_store.py    # CampaignStore: CRUD, dice log, parallel entity load
-│   │   ├── rules_store.py       # RulesStore: ChromaDB "rules" collection, book-filtered search
-│   │   ├── history_store.py     # HistoryStore: ChromaDB "session_chronicles" collection, RAG
+│   │   ├── rules_store.py       # RulesStore: Postgres/pgvector "rule_chunks" table, book-filtered search
+│   │   ├── history_store.py     # HistoryStore: Postgres/pgvector "session_chronicle_chunks" table, RAG
 │   │   └── draft_store.py       # DraftStore: in-memory character drafts during Session 0
 │   └── tools/
 │       ├── _helpers.py          # find_char, find_npc, find_monster, char_summary, etc.
@@ -107,13 +106,14 @@ dnd-dm/
 │           ├── Storm King's Thunder/
 │           └── Waterdeep - Dragon Heist/
 │
-├── data/
-│   └── chroma_db/               # ChromaDB — bind-mounted ./data/chroma_db, gitignored
+├── data/                        # was also home to chroma_db/ (bind-mounted, gitignored) before the
+│                                 # 2026-07-12 Postgres/pgvector migration — rule/session-chronicle
+│                                 # vectors now live in Postgres itself, no local data directory for them
 │
 ├── ocr_ingest.py                # PDF → Markdown (Tier 1: native text; Tier 2: Apple Vision OCR, macOS only)
 ├── clean_source.py              # LLM cleanup of garbled extraction artifacts
 ├── validate_source.py           # heuristic QA: repeated lines, HP math, ability scores
-└── build_index.py               # docs/source/ → ChromaDB (core + adventures, with metadata)
+└── build_index.py               # docs/source/ → Postgres/pgvector rule_chunks (core + adventures, with metadata)
 ```
 
 ---
@@ -545,11 +545,11 @@ Surfaced by the same session's confusion: every player message goes through the 
 |---|---|---|
 | `CampaignStore` | PostgreSQL via SQLAlchemy Core | Campaign entities, dice roll log |
 | Checkpoint store | PostgreSQL via `AsyncPostgresSaver` | LangGraph conversation memory per `thread_id` |
-| `RulesStore` | ChromaDB collection `rules` | Rulebook embeddings for RAG, filtered by `books_in_play` |
-| `HistoryStore` | ChromaDB collection `session_chronicles` | Session chronicle embeddings for RAG, filtered by `campaign_id` |
+| `RulesStore` | Postgres/pgvector table `rule_chunks` | Rulebook embeddings for RAG, filtered by `books_in_play` |
+| `HistoryStore` | Postgres/pgvector table `session_chronicle_chunks` | Session chronicle embeddings for RAG, filtered by `campaign_id` |
 | `DraftStore` | In-memory dict (module-level singleton) | Character draft state during Session 0 |
 
-One PostgreSQL instance holds both campaign data and LangGraph checkpoints. ChromaDB uses two collections in the same `data/chroma_db/` directory.
+One PostgreSQL instance holds campaign data, LangGraph checkpoints, AND (since the 2026-07-12 migration off ChromaDB) the rules/session-chronicle vector+keyword search tables — one DB for everything, matching this repo's own "no SQLite/Postgres divergence" principle (Tech Stack table above).
 
 ### Database schema (13 tables)
 
@@ -566,13 +566,10 @@ Source documents are split into two tiers:
 
 Each adventure folder has `_meta.json`: `{"name": "...", "description": "...", "levels": "1-15", "recommended_players": "4-6"}`. `recommended_players` is a free-text range (e.g. `"3-7 (optimized for 4)"`) surfaced to the DM agent via `get_campaign_summary` / the campaign context block, alongside the current party count, so it can decide whether to offer a DM-controlled companion (see `companion.py`).
 
-`campaign.books_in_play` stores the active adventure slugs. `RulesStore.search()` builds a ChromaDB `$or` filter:
+`campaign.books_in_play` stores the active adventure slugs. `RulesStore.search()` builds the equivalent predicate as real SQL now (was a ChromaDB `$or` filter dict before the 2026-07-12 migration):
 
 ```python
-{"$or": [
-    {"source_type": {"$eq": "core"}},
-    {"adventure": {"$in": books_in_play}},
-]}
+or_(t.rule_chunks.c.source_type == "core", t.rule_chunks.c.adventure.in_(books_in_play))
 ```
 
 Core books are always included; adventure books are opt-in per campaign. Adventures can be added mid-campaign via `POST /campaigns/{id}/books`.
@@ -582,8 +579,8 @@ Core books are always included; adventure books are opt-in per campaign. Adventu
 **Tier 1 — Structured campaign state (Postgres):**
 NPCs, quests, party, location, and session records are always current and injected into the system prompt. This is the "always relevant" memory.
 
-**Tier 2 — Session chronicles (ChromaDB `session_chronicles`):**
-When a session ends, the full thread is summarized by the LLM into a narrative chronicle + key events list. The chronicle is embedded in `session_chronicles` with `campaign_id` metadata. The `search_campaign_history` tool retrieves relevant past events on demand — the goblin fight from session 1 is never injected into session 10 unless someone asks about that road.
+**Tier 2 — Session chronicles (Postgres/pgvector `session_chronicle_chunks`, was ChromaDB `session_chronicles` before the 2026-07-12 migration):**
+When a session ends, the full thread is summarized by the LLM into a narrative chronicle + key events list. The chronicle is embedded into `session_chronicle_chunks` with a `campaign_id` column. The `search_campaign_history` tool retrieves relevant past events on demand — the goblin fight from session 1 is never injected into session 10 unless someone asks about that road.
 
 ---
 
@@ -604,7 +601,9 @@ class DMState(TypedDict):
     tool_error_count: int  # caps retries for a bad/hallucinated tool call specifically (2026-07-04, see below)
 
 def get_agent(campaign, store, rules_store, history_store):
-    # mechanics: ChatOllama(settings.mechanics_model, temp=0.1).bind_tools(tools)
+    # mechanics: vllm_chat(temperature=0.1).bind_tools(tools) — was
+    #   ChatOllama(settings.mechanics_model, temp=0.1) before the 2026-07-13
+    #   vLLM-metal migration (see "Backend swap" below).
     #   Loops against the tools node until it returns a message with no tool_calls.
     #   Routes via Command(goto=...) rather than a conditional edge, since the
     #   no-tool-calls branch appends nothing to `messages` — a plain conditional
@@ -612,7 +611,7 @@ def get_agent(campaign, store, rules_store, history_store):
     #   `mechanics_notes` and is NEVER appended to `messages` (never shown to the
     #   player, never a "dm" transcript turn).
     # tools: reuses the existing per-campaign-locked ToolNode unchanged.
-    # narrator: ChatOllama(settings.mechanics_model, temp=0.8), no tools.
+    # narrator: vllm_chat(temperature=0.8), no tools — same backend swap as mechanics.
     #   Sees narrative-only history (_narrative_messages — same predicate
     #   format_transcript uses) + mechanics_notes as a trailing directive.
     #   Its output is the only message ever appended as the turn's DM turn.
@@ -661,7 +660,7 @@ def get_session_zero_agent(campaign, player_slug, store, rules_store, ds):
 ```
 
 Session 0-specific guardrails:
-- `_detect_fake_tool_call` (`_FAKE_TOOL_CALL_RE`) — catches the mechanics node narrating a fenced ` ```json` block that looks like a tool call but isn't one (the original qwen2.5:14b-era failure mode; still checked even after standardizing on `gemma4:26b-mlx`).
+- `_detect_fake_tool_call` (`_FAKE_TOOL_CALL_RE`) — catches the mechanics node narrating a fenced ` ```json` block that looks like a tool call but isn't one (the original qwen2.5:14b-era failure mode; still checked regardless of which model is currently standardized on — `gemma4:26b-mlx` at the time this guardrail was written, `mlx-community/Qwen3-30B-A3B-4bit` via vLLM-metal as of the 2026-07-13 migration).
 - `_detect_invented_spells` — checked on the mechanics node's notes AND (uniquely) re-checked on the narrator's own output in `chargen_narrator_node` before it streams, catching a spell name not on the character's class's real menu (`SPELL_MENUS`). The narrator-side check works because `main.py`'s `session_zero_stream` buffers narrator tokens per-invocation and only forwards the invocation that reaches `END`, so a self-caught retry here never leaks a discarded first draft to the player — the deliberate tradeoff is that Session 0 replies arrive as one block instead of typing out live, unlike the main game's narrator.
 - `chargen_mechanics_node` also appends any `list_options` tool output verbatim to its notes regardless of whether the model's own text quoted it, so the real menu is structurally present for the narrator rather than depending on the model having followed the "quote it verbatim" prompt instruction.
 
@@ -902,6 +901,19 @@ one large commit and was never written up anywhere — the code changed, this
 doc didn't. Written retroactively (2026-07-08) as a record of what the first
 version got right/wrong and what specifically replaced it, for anyone
 (including future-me) who wants the reasoning, not just the current state.
+
+**Superseded note (2026-07-12):** every ChromaDB reference below (`Chroma.similarity_search`,
+the `rules`/`session_chronicles` collections, `data/chroma_db/`, the BM25 pickle sidecar
+file) describes the architecture as it existed through 2026-07-12 — it is **not current**.
+ChromaDB was removed entirely and replaced with Postgres/pgvector (`rule_chunks`/
+`session_chronicle_chunks` tables, native `tsvector`/GIN full-text search instead of the
+BM25 pickle) — see the Tech Stack table and "Datastores" section above for the current
+architecture. The *design decisions* below (parent/child chunking, contextual retrieval,
+Reciprocal Rank Fusion, the CRAG-style grading/reformulation loop) are all unchanged and
+still accurate — only the storage engine underneath them changed. Similarly, every
+`gemma4:26b-mlx`/Ollama reference below describing the in-game chat model is superseded
+by the 2026-07-13 vLLM-metal migration (see "Agent Architecture" above) — left as
+historical record of the reasoning at the time, not current state.
 
 ### Phase 0 — the naive baseline (through 2026-07-05)
 
@@ -1470,9 +1482,9 @@ python clean_source.py --dry-run              # detect only, no writes
 
 Heuristic validation: OCR failure comments, repeated-line clusters, garbled numbers, HP dice math mismatches, ability scores out of range, incomplete stat blocks.
 
-### `build_index.py` — ChromaDB indexer
+### `build_index.py` — Postgres/pgvector indexer
 
-Reads `docs/source/core/` and `docs/source/adventures/{slug}/`, splits each `##`/`###` section into a parent chunk (max 1500 chars, 50-word overlap on size-split oversized parents) and further into ~350-char child chunks, contextualizes each child (Anthropic-style — see "Evolution" section above) unless `--skip-contextualization`, embeds children with `nomic-embed-text`, and writes to `data/chroma_db/` in batches of 8 (small on purpose — a kill loses at most one small in-flight batch; resumability is via Chroma's own existing-chunk-id check, not a separate cache). Also rebuilds `data/bm25_rules.pkl` (the sparse half of hybrid search) from the same indexed text.
+Reads `docs/source/core/` and `docs/source/adventures/{slug}/`, splits each `##`/`###` section into a parent chunk (max 1500 chars, 50-word overlap on size-split oversized parents) and further into ~350-char child chunks, contextualizes each child (Anthropic-style — see "Evolution" section above; contextualization is a chat call, served via `vllm_chat`/`--vllm-url` since the 2026-07-13 vLLM-metal migration, separate from `--ollama-url` which is embeddings-only now) unless `--skip-contextualization`, embeds children with `nomic-embed-text` (via Ollama), and upserts into the `rule_chunks` table in batches of 8 (small on purpose — a kill loses at most one small in-flight batch; resumability is via a plain `chunk_id` existence check against the table itself, not a separate cache). `content_tsv` (the sparse/keyword half of hybrid search) is a Postgres `GENERATED ALWAYS AS` column — always in sync automatically, no separate rebuild step (was a `data/bm25_rules.pkl` rebuild before the 2026-07-12 ChromaDB→pgvector migration). Was ChromaDB (`data/chroma_db/`) before that same migration. A scoped run (`--book`/`--adventure`/`--source-type`) is incremental by default — existing rows are left alone unless `--fresh` (delete just that scope first) or `--wipe` (delete everything first) is passed explicitly.
 
 Metadata per chunk: `book`, `section`, `source_type` (`"core"` | `"adventure"`), `adventure` (slug, empty for core), `granularity` (`"parent"` | `"child"`), `chunk_id`, `parent_chunk_id` (child only).
 
@@ -1581,19 +1593,21 @@ the third.**
 ```bash
 touch .env        # can be empty — overrides set in docker-compose.yml
 make up
-make setup        # migrate DB + build index if data/chroma_db is empty
+make setup        # migrate DB + build index if rule_chunks is empty
 # visit http://localhost:8000
 ```
 
-Source is volume-mounted (`./:/app`) so `uvicorn --reload` picks up changes without rebuilding. `OLLAMA_BASE_URL=http://host.docker.internal:11434` reaches Ollama on the host.
+Source is volume-mounted (`./:/app`, plus `scripts/`, `docs/source/core`, `docs/source/adventures` explicitly — see docker-compose.yml's own comments for why each is listed) so `uvicorn --reload` picks up changes without rebuilding. `OLLAMA_BASE_URL=http://host.docker.internal:11434` reaches Ollama on the host (embeddings only, since the 2026-07-13 vLLM-metal migration); `VLLM_BASE_URL=http://host.docker.internal:8100/v1` reaches the vLLM-metal chat server the same way.
 
-**ChromaDB portability:** `data/chroma_db/` is a bind mount (not a Docker volume), so the embeddings travel with the project folder. Copy the directory to a new machine and skip `make index`. Delete it and re-run `make index` to rebuild from source.
+**Postgres/pgvector portability (was "ChromaDB portability" — `data/chroma_db/` — before the 2026-07-12 migration):** rule/session-chronicle vectors now live in the same Postgres instance as everything else — no separate bind-mounted directory to copy between machines. A fresh machine just needs `DATABASE_URL` pointed at a reachable Postgres and `make index`/`make reindex-full` run once.
+
+**Known stale check (not yet fixed):** the Makefile's `index-if-empty`/`setup` targets still literally check whether `data/chroma_db` is empty on disk to decide whether to reindex — a leftover from before the Postgres migration. Since that directory is never populated anymore, this check is always true, so `setup` always re-triggers a full reindex rather than actually detecting whether `rule_chunks` already has data. Not dangerous (the reindex itself is safe/idempotent), just wasteful on a repeat `make setup` — worth fixing to check the table instead, not done here.
 
 ### Production (Railway)
 
-- Add PostgreSQL plugin → `DATABASE_URL` injected automatically
-- Set `OLLAMA_BASE_URL` to wherever Ollama is hosted
-- Mount a Railway persistent volume at `/app/data/chroma_db`
+- Add PostgreSQL plugin → `DATABASE_URL` injected automatically (also now holds the rule/session-chronicle vector tables, see above)
+- Set `OLLAMA_BASE_URL` to wherever Ollama is hosted (embeddings only)
+- Set `VLLM_BASE_URL` to wherever the vLLM-metal chat server is hosted
 - Same Docker image; `CMD` runs `alembic upgrade head` before uvicorn
 
 ### Makefile targets
@@ -1612,8 +1626,8 @@ Source is volume-mounted (`./:/app`) so `uvicorn --reload` picks up changes with
 | `make psql` | Open psql shell in db container |
 | `make shell` | Bash into app container |
 | `make fresh` | Tear down volumes, restart clean, run migrations |
-| `make index` | Full ChromaDB reindex from `docs/source/` |
-| `make index-if-empty` | Reindex only if `data/chroma_db/` is empty (safe on fresh clone) |
+| `make index` | Reindex `rule_chunks` (Postgres/pgvector) from `docs/source/` — incremental by default, see build_index.py's `--fresh`/`--wipe` |
+| `make index-if-empty` | Intended to reindex only on a fresh clone — currently checks `data/chroma_db/` (stale, see "Known stale check" above), always triggers |
 | `make setup` | `migrate` + `index-if-empty` — the one-command new-machine bootstrap |
 | `make ingest-book book="…" source_type=core` | Reindex + extract lore/monsters for one book, via `docker compose exec` — fine for small scoped runs, but see the ingestion-incident writeup above before using this for a big overnight job |
 | `make ingest-book-native book="…" source_type=core write_postgres=1` | Same, but native (host `.venv`, no Docker) — bypasses the Docker Desktop VM's memory ceiling entirely; **preferred for bulk/overnight ingestion, even on this machine** |
@@ -1639,8 +1653,8 @@ Source is volume-mounted (`./:/app`) so `uvicorn --reload` picks up changes with
 
 **RAG / Vector stores**
 - `docs/source/` restructured: `core/` + `adventures/{slug}/` with `_meta.json`
-- `backend/stores/rules_store.py` — ChromaDB `rules` collection, `books_in_play` filter
-- `backend/stores/history_store.py` — ChromaDB `session_chronicles` collection
+- `backend/stores/rules_store.py` — Postgres/pgvector `rule_chunks` table, `books_in_play` filter (was ChromaDB `rules` collection before the 2026-07-12 migration)
+- `backend/stores/history_store.py` — Postgres/pgvector `session_chronicle_chunks` table (was ChromaDB `session_chronicles` collection)
 - `build_index.py` — full indexer with core/adventure metadata, targeted re-index flags
 
 **Tools (37+ total — this count predates the combat-resolution refactor's resolution.py tools; not re-audited)**

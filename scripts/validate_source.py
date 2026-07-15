@@ -37,6 +37,12 @@ SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 REPEAT_THRESHOLD = 3
 REPEAT_WINDOW    = 60    # lines
 
+# Below this paragraphs/lines ratio, flag the get_text("text") pagination-
+# collapse bug (see check_paragraph_density) — healthy adventures checked so
+# far sit around 0.2+, the one known-bad sample (Out of the Abyss) sits
+# around 0.011.
+PARAGRAPH_RATIO_THRESHOLD = 0.05
+
 # Stat block anchor phrases (case-insensitive).
 STAT_BLOCK_ANCHORS = [
     r"armor class",
@@ -168,6 +174,37 @@ def check_ability_scores(lines: list[str], fname: str) -> list[Issue]:
     return issues
 
 
+def check_paragraph_density(lines: list[str], fname: str) -> list[Issue]:
+    """Flag the Tier-1 PyMuPDF get_text("text") pagination-collapse bug (see
+    ocr_ingest.py/design.md): that extraction method only inserts a paragraph
+    break (blank line) BETWEEN pages, not within one, so a PDF whose pages
+    don't happen to have enough internal blank lines survives extraction as
+    a handful of giant blobs instead of real paragraphs — starving
+    add_headers.py's candidate detection (requires a heading to be the first
+    line of a blank-line-delimited paragraph) down to zero hits, silently.
+
+    Found live 2026-07-04 in Out of the Abyss: 64 paragraphs across 5803
+    lines (ratio ~0.011), vs. 800+ paragraphs for similarly-sized adventures
+    (ratio ~0.2+) extracted cleanly. PARAGRAPH_RATIO_THRESHOLD sits well
+    below every healthy sample checked so far and well above the one known-bad
+    sample, so it should catch the same failure mode elsewhere without
+    false-positiving on ordinary short-paragraph-style writing."""
+    n = len(lines)
+    if n < 200:
+        return []  # too short for the ratio to be a meaningful signal
+    text = "\n".join(l.rstrip() for l in lines)
+    paragraphs = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    ratio = len(paragraphs) / n
+    if ratio < PARAGRAPH_RATIO_THRESHOLD:
+        return [Issue(
+            "error", "low_paragraph_density", fname, 0,
+            f"{len(paragraphs)} paragraphs across {n} lines (ratio {ratio:.4f}, "
+            f"threshold {PARAGRAPH_RATIO_THRESHOLD}) — likely the get_text(\"text\") "
+            f"pagination-collapse bug; re-extract with get_text(\"blocks\") instead."
+        )]
+    return []
+
+
 def check_incomplete_stat_blocks(lines: list[str], fname: str) -> list[Issue]:
     """Warn when AC is present but HP or ability scores are missing nearby (±30 lines)."""
     issues = []
@@ -195,6 +232,7 @@ CHECKS = [
     check_ocr_failures,
     check_repeated_lines,
     check_garbled_numbers,
+    check_paragraph_density,
     check_hp_dice_math,
     check_ability_scores,
     check_incomplete_stat_blocks,
@@ -223,7 +261,7 @@ def main() -> None:
     args = ap.parse_args()
 
     in_dir = Path(args.input)
-    files = sorted(in_dir.glob("*.md"))
+    files = sorted(in_dir.rglob("*.md"))
     if not files:
         print(f"No .md files found in {in_dir}/")
         sys.exit(1)

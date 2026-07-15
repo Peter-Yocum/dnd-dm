@@ -828,7 +828,8 @@ input[type="text"]:focus, textarea:focus { outline: 2px solid var(--accent2); bo
   color: var(--text); font-size: 1.1rem; margin-bottom: 0.75rem;
 }
 
-.sz-party-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.sz-party-body { display: flex; gap: 1.5rem; align-items: flex-start; }
+.sz-party-list { flex: 1; display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
 .sz-char-card {
   display: flex;
   align-items: center;
@@ -837,6 +838,17 @@ input[type="text"]:focus, textarea:focus { outline: 2px solid var(--accent2); bo
   border: 1px solid var(--bg3);
   border-radius: var(--radius);
   padding: 0.6rem 1rem;
+}
+.sz-char-card.clickable { cursor: pointer; }
+.sz-char-card.clickable:hover { background: var(--bg3); }
+.sz-char-card.active { outline: 1px solid var(--accent2); }
+.sz-party-body .sz-sheet {
+  width: 300px;
+  min-width: 240px;
+  border-left: none;
+  border: 1px solid var(--bg3);
+  border-radius: var(--radius);
+  max-height: 480px;
 }
 .sz-char-card .char-name { flex: 1; color: var(--accent2); font-weight: bold; }
 .sz-char-card .char-class { color: var(--text-dim); font-size: 0.85rem; }
@@ -923,6 +935,7 @@ input[type="text"]:focus, textarea:focus { outline: 2px solid var(--accent2); bo
 
 .preview-identity { margin-bottom: 0.75rem; padding-bottom: 0.6rem; border-bottom: 1px solid var(--bg3); }
 .preview-name { color: var(--accent2); font-size: 1.05rem; font-weight: bold; }
+.preview-pronouns { color: var(--text-dim); font-size: 0.8rem; font-weight: normal; }
 .preview-subtitle { color: var(--text-dim); font-size: 0.78rem; margin-top: 0.15rem; }
 
 .preview-scores {
@@ -954,3 +967,61 @@ input[type="text"]:focus, textarea:focus { outline: 2px solid var(--accent2); bo
 }
 .preview-value { font-size: 0.82rem; line-height: 1.5; color: var(--text); }
 .preview-backstory { font-style: italic; color: var(--text-dim); font-size: 0.78rem; }
+
+/* ── maps browser — roguelike/MUD-style colored grid ─────────────────────── */
+.map-grid {
+  display: inline-block;
+  background: var(--bg);
+  border: 1px solid var(--bg3);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  font-family: var(--font-mono);
+  line-height: 1;
+}
+.map-row { display: flex; }
+.map-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4em;
+  height: 1.4em;
+  font-size: 0.95rem;
+  color: var(--text-dim);
+}
+.map-cell-floor       { background: var(--bg); color: #444; }
+.map-cell-wall        { background: #6b6b6b; color: #2a2a2a; }
+.map-cell-door        { background: #8a6a3d; color: #2a2a2a; }
+.map-cell-water        { background: #1f5fa8; color: #cfe8ff; }
+.map-cell-vegetation  { background: #2e7d32; color: #d7ffd9; }
+.map-cell-rock        { background: #5c4a3a; color: #e8ddc9; }
+.map-cell-difficult   { background: #7a6a2e; color: #f0e6b8; }
+.map-cell-furniture   { background: #9c7a4a; color: #2a2a2a; }
+.map-cell-other       { background: var(--bg3); color: var(--text-dim); }
+.map-cell-fog         { background: #0a0a0a; color: #333; }
+
+.map-legend { display: flex; flex-wrap: wrap; gap: 0.9rem; margin-top: 0.75rem; font-size: 0.8rem; color: var(--text-dim); }
+.map-legend-item { display: inline-flex; align-items: center; gap: 0.4rem; }
+.map-legend-item .map-cell { width: 1.2em; height: 1.2em; font-size: 0.8rem; }
+
+/* ── live combat map (sidebar, game.html) ────────────────────────────────── */
+/* Same .map-grid/.map-row/.map-cell-* classes as the Maps browser, scaled
+   down to fit the sidebar and with room for a combatant-marker overlay. */
+.combat-map { margin-top: 0.6rem; overflow-x: auto; }
+.combat-map .map-grid { padding: 0.4rem; }
+.combat-map .map-cell { width: 1.1em; height: 1.1em; font-size: 0.75rem; position: relative; }
+
+.combatant-marker {
+  display: block;
+  width: 0.7em;
+  height: 0.7em;
+  border-radius: 50%;
+  margin: auto;
+  box-sizing: border-box;
+}
+.marker-party    { background: var(--green); border: 1px solid #1f4a20; }
+.marker-hostile  { background: var(--red); border: 1px solid #5a1410; }
+.marker-current-turn { outline: 2px solid var(--accent2); outline-offset: 1px; }
+
+.combatant-marker.hp-bloodied { filter: brightness(0.85) saturate(1.3); }
+.combatant-marker.hp-critical { filter: brightness(0.7) saturate(1.6); }
+.combatant-marker.hp-downed   { background: var(--bg3) !important; border-color: var(--text-dim) !important; }

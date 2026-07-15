@@ -110,10 +110,11 @@ dnd-dm/
 │                                 # 2026-07-12 Postgres/pgvector migration — rule/session-chronicle
 │                                 # vectors now live in Postgres itself, no local data directory for them
 │
-├── ocr_ingest.py                # PDF → Markdown (Tier 1: native text; Tier 2: Apple Vision OCR, macOS only)
-├── clean_source.py              # LLM cleanup of garbled extraction artifacts
-├── validate_source.py           # heuristic QA: repeated lines, HP math, ability scores
-└── build_index.py               # docs/source/ → Postgres/pgvector rule_chunks (core + adventures, with metadata)
+├── scripts/                      # moved here from repo root 2026-07-05 — see "Prep Scripts" below
+│   ├── ocr_ingest.py             # PDF → Markdown (MinerU vlm-engine, MLX-accelerated, macOS only)
+│   ├── clean_source.py           # LLM cleanup of garbled extraction artifacts
+│   ├── validate_source.py       # heuristic QA: repeated lines, HP math, ability scores
+│   └── build_index.py           # docs/source/ → Postgres/pgvector rule_chunks (core + adventures, with metadata)
 ```
 
 ---
@@ -489,6 +490,89 @@ Detect Magic succeeds with slots unchanged; the same call with Magic Missile (kn
 not ritual-tagged) and Fire Bolt (a cantrip) both correctly refuse; a normal
 (non-ritual) cast of Detect Magic still consumes a slot as before; an unprepared
 ritual-tagged spell still correctly refuses via the pre-existing prepared-check.
+
+**Follow-up — three issues reported live, investigated 2026-07-13. Items 1-2
+resolved; item 3 confirmed to be model non-compliance, not a code bug (nothing to fix
+there beyond the guardrail idea noted at the end). Regression coverage:
+`tests/test_chargen_and_character_details.py`.**
+
+1. **Starting equipment missing daggers (Ranger, Rogue) — fixed 2026-07-13.**
+   `STARTING_KITS` (`backend/data/equipment.py`) is a flat per-class dict —
+   `"weapon"` becomes the character's one mechanical `Attack`, and any second weapon
+   rides along in `"gear"` (`_helpers.py`'s `_starting_equipment` turns each `gear`
+   string into an `Item`). Rogue's kit already listed `"Shortbow"` in `gear` (so that
+   half worked), but **neither kit listed a Dagger**, despite both classes' real 2024
+   PHB "Option A" kit including two (confirmed directly against
+   `docs/source/core/D&D 5.5E - Player's Handbook.md`'s own Starting Equipment table
+   rows for Ranger/Rogue). Added `"Dagger (x2)"` to both kits' `gear` lists.
+2. **Starting gold correction — fixed 2026-07-13, and a correction to this doc's own
+   earlier note.** Investigating "gold should be rolled, not flat" surfaced something
+   that changes the fix: the **2024 PHB does not roll dice for starting gold at all**
+   — every class's Starting Equipment row is "Choose A or B," where A is a fixed kit
+   + a small flat GP remainder and B is a larger flat GP total with no items. There is
+   no "5d4 × 10 gp"-style roll anywhere in this ruleset's actual source text (that's a
+   2014-edition habit, not what this app is grounded in). So the real bug wasn't
+   "flat instead of rolled" — it was that `STARTING_KITS`' flat GP values don't match
+   the real Option A remainders for every class (checked against the source table:
+   Ranger's real Option A leftover is 7 gp, Rogue's is 8 gp; this app had both at a
+   generic 10). Corrected Ranger → 7, Rogue → 8 gp alongside the dagger fix above.
+   **Full-table pass done, 2026-07-13:** all 12 classes' `STARTING_KITS` entries
+   rewritten to match their real Option A row exactly (weapon/armor/shield/gear/gold),
+   transcribed directly from the PHB's per-class Starting Equipment table cells —
+   same discipline as `spells.py`/this file's own WEAPONS/ARMOR tables. Added five
+   WEAPONS entries that didn't exist yet but are needed by real Option A kits
+   (Sickle, Spear, Greatsword, Flail, Javelin — stats transcribed from the PHB's own
+   weapon table, `docs/source/core/D&D 5.5E - Player's Handbook.md`). Several classes'
+   mechanical mismatches went well beyond the two originally reported (Ranger/Rogue
+   daggers): Bard and Rogue's `"weapon"` (Rapier) wasn't in either real kit at all;
+   Fighter had Longsword + a Shield neither real option grants; Cleric/Druid/Ranger's
+   armor didn't match (Scale Mail vs. real Chain Shirt, Leather vs. real Studded
+   Leather); several classes' gold was a generic round number instead of the real
+   per-class Option A remainder. Verified live: built a level-1 character of every
+   class through `_starting_equipment()` directly, confirmed each one's attack/armor/
+   gear/gold now matches its real PHB row.
+3. **Ability-check die/modifier breakdown sometimes not narrated.** Checked whether
+   this is a data gap — it isn't. `resolve_check` (`resolution.py`) genuinely computes
+   and returns the full breakdown string (`"{name} — {label} check: d20 {roll} + {mod}
+   = {total}"`, proficiency/expertise already folded into `mod`), `resolve_check` is in
+   `_VERIFIED_ROLL_TOOLS` (`dm_agent.py`), and the narrator prompt (`prompts.py`)
+   explicitly instructs copying that exact string into a 🎲 line, "never recompute,
+   round, or 'correct' them." So when a check gets narrated as a bare result with no
+   roll shown, that's the narrator model failing to follow an already-correctly-plumbed
+   instruction, not a missing-data bug — same shape of problem the loot-line and
+   verified-roll guardrails elsewhere in this doc exist to catch for combat rolls. Not
+   yet checked: whether the existing guardrail-detection functions (e.g.
+   `_detect_missing_combat_roll_followup`) actually cover `resolve_check` output the
+   same way they cover combat/damage rolls, or whether there's a narrower enforcement
+   gap for plain ability checks specifically that a similar regex guardrail could close.
+
+**Character/companion pronouns — added 2026-07-13.** Reported live: a player couldn't
+tell how the DM should refer to a party member (Kaelen) because nothing ever asked.
+`Character.pronouns: str` (freeform, `models.py`) is now collected the same way
+`appearance` already was — `update_character_draft`'s `pronouns` field
+(`chargen.py`), a matching `DraftStore._empty()` key, a new Session 0 prompt step
+right next to the existing appearance-ask instruction (never inferred from name/race),
+and a `pronouns` param on `generate_companion_character` (`companion.py`) for
+DM-generated companions. Surfaced in the character sheet preview
+(`static/character-sheet.js`'s `renderCharacterSheet()`, next to the name) — shared by
+both `game.html` and the Session 0 lobby's sheet preview (see the clickable-cards item
+above). `NPC.pronouns` was also added to the model for symmetry but **is not yet wired
+into `create_npc`** — narrator-facing NPCs still have nowhere to record this.
+**Fixed 2026-07-13:** added `update_character_detail(character_name, field, value)`
+(`party.py`) — the in-game counterpart to `update_character_draft`, for a party member
+who was already finalized before this fix (or whose player skipped the question).
+Deliberately narrow: only `pronouns`/`appearance`/`alignment`/`notes` are editable —
+mechanical fields (race, class, ability scores, equipment, ...) aren't, since those
+cascade into derived stats (HP, AC, spell slots, ...) this tool doesn't recompute, and
+changing them mid-campaign is a DM judgment call beyond "fix a forgotten detail."
+`value="CLEAR"` blanks a field (`None` for `alignment`, matching its `str | None`
+type; `""` for the others). Regression coverage for both the draft→finalize
+pronouns path and `update_character_detail` (including its mechanical-field
+refusal and the alignment `CLEAR` → `None` behavior):
+`tests/test_chargen_and_character_details.py`.
+changing them mid-campaign is a bigger DM decision than "fix a forgotten cosmetic
+detail." `value="CLEAR"` blanks a field (`None` for `alignment`, matching its
+`str | None` type; `""` for the others).
 
 ### `companion.py` (1 tool — Session 0 and in-game)
 | Tool | Description |
@@ -1464,15 +1548,24 @@ cleaner top level) — run as `python scripts/<name>.py` from the repo root.
 
 ### `ocr_ingest.py` — PDF → Markdown
 
-Two-tier extraction per PDF, macOS only:
-- **Tier 1 (digital)**: PyMuPDF `get_text("text")` — instant, perfect for official/purchased PDFs. Detected by sampling avg chars/page (threshold: 100). A PDF that's *visually* selectable in a viewer isn't necessarily digital at the file level — macOS Live Text (Preview/Quick Look) does its own on-the-fly OCR over pure page-image PDFs, which can look identical to real embedded text until you check the file itself (`page.get_text()` / raw content-stream operators).
-  - **Known gap (found 2026-07-04, fixed for Out of the Abyss only):** `get_text("text")` only inserts a paragraph break (`\n\n`) *between* pages, not within one — for most digital PDFs enough within-page blank lines survive naturally, but for some (Out of the Abyss: 64 paragraphs across 5803 lines, vs. 800+ for similarly-sized adventures) it collapses whole pages into a few giant blobs, starving `add_headers.py`'s candidate detection (which requires a heading to be the first line of a `\n\n` paragraph) down to zero hits — silently, no error. Fixed there by re-extracting with `get_text("blocks")` instead (one-off script, not yet folded into `ocr_ingest.py`). TODO: check the other already-ingested campaigns (Curse of Strahd, Ghosts of Saltmarsh, Icewind Dale, Storm King's Thunder, Tales of the Yawning Portal, Tomb of Annihilation, Tyranny of Dragons, Waterdeep) for the same low paragraph-to-line ratio, and re-extract+reindex any that show it.
-- **Tier 2 (scanned)**: Apple's on-device Vision framework (the same engine behind Live Text) — fast, no model download, no GPU/VRAM contention with Ollama. Uses Vision's own layout-aware result ordering (verified correct on real two-column pages — do not re-sort by position, it interleaves columns). Occasionally garbles stylized/decorative sidebar text; `clean_source.py`'s LLM pass is the intended fix-up for that.
+**Superseded 2026-07-07 — this doc had gone stale describing the old pipeline until corrected 2026-07-14.** Every PDF (digital or scanned) now goes through one uniform path: **MinerU's `vlm-engine` backend** (MLX-accelerated on Apple Silicon), a purpose-built PDF→Markdown pipeline with a real layout/reading-order model. This replaced the two-tier PyMuPDF-native-text + Apple-Vision-OCR pipeline described below until this correction — that pipeline had neither a real layout model (raw PyMuPDF text extraction has no layout awareness at all) nor reliable multi-column handling (Vision, the engine behind Live Text, scrambled some multi-column pages and let running headers/footers bleed into body text). MinerU strips running headers/footers/page numbers natively instead of needing the two-tier approach's `page.get_text()`-vs-Live-Text detection heuristics.
+
+Tradeoff, stated directly in the script's own docstring: this costs meaningfully more time on already-digital PDFs than the old fast PyMuPDF path did (MinerU is a page-image VLM read, tens of seconds per page, regardless of whether the PDF already had a clean text layer) — but a uniform path is what actually fixes the reading-order/header bugs, and per-PDF speed isn't the bottleneck for a personal library ingested once. PyMuPDF (`fitz`) is still imported, but now only for page counts, not extraction.
+
+**Chunked, checkpointed extraction:** MinerU's `vlm-engine` batches a multi-page run into internal 64-page windows and hands off between them — confirmed live to crash reproducibly ("Timed out waiting for result of task") at exactly page 128 (2×64) on two separate full-book runs, while an isolated 15-page run spanning that same page range completed cleanly (the window-to-window handoff itself is broken, not any particular page). `_extract_with_mineru` sidesteps this by keeping every individual MinerU invocation at or under `_CHUNK_PAGES` (60) and checkpointing each window's raw text to a `.{stem}.ocr_chunks/` cache dir before concatenating into the final `.md` — a crash loses at most one window's work, not the whole book; a re-run skips windows whose cache file already exists (same discipline as `extract_entities.py`'s per-entity checkpointing). A `.partial` staging file (written first, renamed to the real output only on success) means a mid-run crash leaves no file at the final path, so a later run without `--force` correctly treats the book as not-yet-done rather than trusting a truncated file.
+
+**Backend-name portability caveat:** the `-b`/`--backend` value (`--mineru-backend`, default `vlm-engine`) isn't stable across MinerU versions/platforms — confirmed live that a fresh `pip install -U "mineru[all]"` on Windows resolved a newer MinerU release whose valid choices are `pipeline`/`vlm-http-client`/`hybrid-http-client`/`vlm-auto-engine`/`hybrid-auto-engine` (no bare `vlm-engine`/`hybrid-engine` at all), while this project's Mac install (3.4.2) only has the un-`"auto"` names. Run `mineru --help` and check the `-b`/`--backend` valid-choices list if you hit "invalid value for -b."
+
+**Windows console codec fix:** Windows' default console codec (cp1252/"charmap") can't encode the em-dashes/box-drawing/arrow characters this script prints for readability — confirmed live as a real `UnicodeEncodeError` crash on a fresh Windows venv (Mac/Linux default to UTF-8 stdout so this never surfaced there). stdout/stderr are reconfigured with `errors="replace"` so a genuinely unencodable character degrades to "?" instead of crashing an otherwise-successful book mid-run.
+
+**Requirements:** `uv pip install -U "mineru[all]"`. The MLX backend needs macOS 13.5+ on Apple Silicon and `mlx-vlm` to import cleanly, or MinerU silently falls back to a much slower CPU/transformers path — verify before a big job with `python -c "from mineru.utils.engine_utils import _select_mac_engine; print(_select_mac_engine())"` (must print `"mlx"`, not `"transformers"`; if it prints `"transformers"`, `import mlx_vlm` is failing, e.g. a Python built without `_lzma` support breaking the transformers/torchvision import chain).
+
+**Open question, surfaced 2026-07-14 during the map/text-linking survey (`research/map-text-linking-survey.md`):** whether the paragraph-density bug documented below (found against the *old* Tier-1 PyMuPDF pipeline's Out of the Abyss output) is still representative of current MinerU output was not confirmed — would need a re-ingest to check, out of scope for that survey. Historical record, from the now-replaced pipeline: `get_text("text")` only inserted a paragraph break (`\n\n`) *between* pages, not within one, which for some PDFs (Out of the Abyss: 64 paragraphs across 5803 lines, vs. 800+ for similarly-sized adventures) collapsed whole pages into a few giant blobs, starving `add_headers.py`'s candidate detection (which requires a heading to be the first line of a `\n\n` paragraph) down to zero hits — silently, no error. `check_paragraph_density()` (`scripts/validate_source.py`) was built as a permanent, reusable check for this (flags any `.md` whose paragraphs-to-lines ratio falls under `PARAGRAPH_RATIO_THRESHOLD`, 0.05) and remains a sound audit tool regardless of which extraction pipeline produced a given `.md` — just re-run it (`python scripts/validate_source.py --input docs/source/adventures --severity error`) against any newly-produced MinerU output to confirm the bug class doesn't recur there. The still-open per-book audit gap described below (7 adventures with no source `.md` on this machine to check) is unaffected by this pipeline change — those books simply haven't been (re-)ingested here yet, under either pipeline.
 
 ```bash
-python ocr_ingest.py                          # whole docs/raw/ folder
-python ocr_ingest.py --file foo.pdf --pages 5 # smoke test
-python ocr_ingest.py --no-ocr                 # skip scanned PDFs entirely
+python scripts/ocr_ingest.py                                    # whole docs/raw/ folder
+python scripts/ocr_ingest.py --file docs/raw/foo.pdf --pages 5   # smoke test
+python scripts/ocr_ingest.py --force                             # re-process even if .md exists
 ```
 
 ### `clean_source.py` — LLM artifact cleanup
@@ -1480,8 +1573,8 @@ python ocr_ingest.py --no-ocr                 # skip scanned PDFs entirely
 Scans extracted `.md` files for garbled paragraphs. Sends only flagged paragraphs to a local Ollama text model for correction. Length ratio guard (0.5–2.0×) rejects bad LLM output.
 
 ```bash
-python clean_source.py --model qwen2.5:3b     # recommended — fast enough
-python clean_source.py --dry-run              # detect only, no writes
+python scripts/clean_source.py --model qwen2.5:3b     # recommended — fast enough
+python scripts/clean_source.py --dry-run              # detect only, no writes
 ```
 
 ### `validate_source.py` — QA report
@@ -1504,9 +1597,9 @@ python build_index.py --source-type core           # core books only
 ### Full prep pipeline
 
 ```bash
-python ocr_ingest.py
-python clean_source.py --model qwen2.5:3b
-python validate_source.py
+python scripts/ocr_ingest.py
+python scripts/clean_source.py --model qwen2.5:3b
+python scripts/validate_source.py
 make index
 ```
 
@@ -1607,7 +1700,7 @@ Source is volume-mounted (`./:/app`, plus `scripts/`, `docs/source/core`, `docs/
 
 **Postgres/pgvector portability (was "ChromaDB portability" — `data/chroma_db/` — before the 2026-07-12 migration):** rule/session-chronicle vectors now live in the same Postgres instance as everything else — no separate bind-mounted directory to copy between machines. A fresh machine just needs `DATABASE_URL` pointed at a reachable Postgres and `make index`/`make reindex-full` run once.
 
-**Known stale check (not yet fixed):** the Makefile's `index-if-empty`/`setup` targets still literally check whether `data/chroma_db` is empty on disk to decide whether to reindex — a leftover from before the Postgres migration. Since that directory is never populated anymore, this check is always true, so `setup` always re-triggers a full reindex rather than actually detecting whether `rule_chunks` already has data. Not dangerous (the reindex itself is safe/idempotent), just wasteful on a repeat `make setup` — worth fixing to check the table instead, not done here.
+**Stale check — fixed.** The Makefile's `index-if-empty` target used to literally check whether `data/chroma_db` was empty on disk to decide whether to reindex — a leftover from before the Postgres migration that always tripped true (that directory is never populated anymore), so `setup` always re-triggered a full reindex instead of actually detecting whether `rule_chunks` already had data. Now queries `SELECT count(*) FROM rule_chunks` directly via `psql` and only reindexes when it's actually empty.
 
 ### Production (Railway)
 
@@ -1633,13 +1726,64 @@ Source is volume-mounted (`./:/app`, plus `scripts/`, `docs/source/core`, `docs/
 | `make shell` | Bash into app container |
 | `make fresh` | Tear down volumes, restart clean, run migrations |
 | `make index` | Reindex `rule_chunks` (Postgres/pgvector) from `docs/source/` — incremental by default, see build_index.py's `--fresh`/`--wipe` |
-| `make index-if-empty` | Intended to reindex only on a fresh clone — currently checks `data/chroma_db/` (stale, see "Known stale check" above), always triggers |
+| `make index-if-empty` | Reindex only on a fresh clone — checks `rule_chunks`' real row count via `psql`, skips if already populated |
 | `make setup` | `migrate` + `index-if-empty` — the one-command new-machine bootstrap |
 | `make ingest-book book="…" source_type=core` | Reindex + extract lore/monsters for one book, via `docker compose exec` — fine for small scoped runs, but see the ingestion-incident writeup above before using this for a big overnight job |
 | `make ingest-book-native book="…" source_type=core write_postgres=1` | Same, but native (host `.venv`, no Docker) — bypasses the Docker Desktop VM's memory ceiling entirely; **preferred for bulk/overnight ingestion, even on this machine** |
 | `make setup-venv` | Create/refresh the host `.venv` used by the `-native` targets |
 | `make merge-chroma source=…` | Merge a second machine's `data/chroma_db/` into this one's (native) |
 | `make load-lore-json book="…"` | Load a `-native` run's JSON entity registry (from a Postgres-less machine) into this machine's canonical Postgres |
+| `make qa-campaign` | Build/rebuild the "QA Test Campaign" (`scripts/qa_smoke_test.py`) — see "QA smoke-test campaign" below |
+
+### QA smoke-test campaign (2026-07-13)
+
+`scripts/qa_smoke_test.py` (`make qa-campaign`) — a small, self-contained
+scenario ("The Rusty Anchor," a tavern building) exercising every mechanic
+from the grid-maps/opportunity-attacks/pronouns/chargen-fidelity work in one
+deterministic pass: an authored grid (walls/doors/furniture), a two-PC party
+via real chargen (pronouns, subclass validation reject-then-accept, real
+starting equipment/gold), an allied DM-companion NPC, ability checks/saves,
+a combat encounter with opportunity attacks (a standard-reach monster and a
+10 ft reach-weapon monster both firing off one retreat — multi-attacker
+resolution — plus a separate reaction-pause demonstration via a War
+Caster-style feature), loot via both paths (`end_encounter`'s automatic
+CR-scaled roll and manual `reveal_loot`), a magic item, a map-item location
+unlock, a level-up (subclass validation again), fog-of-war (partial reveal
+from real combat movement), and a session-log export.
+
+Calls the real tool functions directly — no LLM, deterministic and fast,
+since this is testing mechanics, not narration (the same style used
+throughout this project's manual live verification). Safe to re-run
+(deletes the previous "QA Test Campaign" by name first) and leaves the
+result in Postgres afterward, printing direct links — a tangible fixture to
+click through in the browser (`game.html`, the Maps browser, Session
+History), not just a pass/fail check. 31 checks, all passing as of writing.
+
+**A real, indexed adventure module, so it can also be played live (not just
+scripted) — added same day.** The deterministic script above proves the
+mechanics work in isolation; it doesn't exercise the actual RAG/DM-agent
+pipeline (`search_rules`, world-prep, a live LLM session) at all. To close
+that gap, the same scenario was back-written as a real adventure document —
+`docs/source/adventures/The Rusty Anchor/The Rusty Anchor.md` (prose,
+`# HEADING`-per-section, same style as the other indexed books) +
+`_meta.json` (`opening_hook`/`opening_location`/`opening_section_marker`,
+same fields every other adventure uses) — then indexed for real via
+`make ingest-book-native adventure="The Rusty Anchor" source_type=adventure
+skip_context=1` (the documented low-memory-safe path, not the Docker
+`docker compose exec` path — see the ingestion-incident notes elsewhere in
+this doc; running the Docker path concurrently with other memory-heavy work
+OOM-killed it, exit 137, during this same session). 78 chunks indexed;
+verified retrievable with real, on-topic content via
+`RulesStore.search_adventure_only("smugglers cellar loot strongbox",
+adventure="The Rusty Anchor")` — grid ingestion pipeline confirmed sound
+end to end, not just the mechanics tools in isolation. A real campaign can
+now be created with `books_in_play: ["The Rusty Anchor"]` and actually
+played through live. `extract_entities.py`'s lore/monster-registry
+extraction step was skipped for this content — it still requires Ollama
+(intentionally not running this session for memory reasons, see
+`ollama_base_url`'s note in `config.py`), which isn't needed for the
+adventure to be searchable/playable, only for the separate Lore Registry
+feature.
 
 ---
 
@@ -1684,17 +1828,17 @@ Source is volume-mounted (`./:/app`, plus `scripts/`, `docs/source/core`, `docs/
 - Game sidebar: world clock/weather, faction/NPC relationship list, safety tool (X-card) — see **Feature Brainstorm** below
 
 **Prep pipeline**
-- `ocr_ingest.py` — two-tier PDF extraction (native text + Apple Vision OCR, macOS only)
+- `ocr_ingest.py` — PDF extraction via MinerU's vlm-engine (MLX-accelerated, macOS only) — was two-tier native-text/Apple-Vision-OCR until the 2026-07-07 migration; see "Prep Scripts" above
 - `clean_source.py` — LLM artifact cleanup
 - `validate_source.py` — heuristic QA
 
 ### Planned Future Features
 
-- **TODO:** audit other campaigns for the Tier 1 `get_text("text")` low-paragraph-density bug described under `ocr_ingest.py` above (only Out of the Abyss has been checked/fixed so far)
-- Live party tracker panel updating during combat (HTMX polling)
-- Initiative tracker UI panel in sidebar
-- Long-rest / short-rest quick buttons
-- Session summary export (markdown or PDF)
+- **TODO, partially done (2026-07-13):** audit other campaigns for the Tier 1 `get_text("text")` low-paragraph-density bug described under `ocr_ingest.py` above. Now a permanent one-command check (`scripts/validate_source.py`'s `check_paragraph_density`) instead of a one-off script. Curse of Strahd and Lost Mine of Phandelver checked clean; the other 7 (Ghosts of Saltmarsh, Icewind Dale, Storm King's Thunder, Tales of the Yawning Portal, Tomb of Annihilation, Tyranny of Dragons, Waterdeep) have no source markdown on this machine to check — blocked, not skipped, see the full note above.
+- Live party tracker panel updating during combat (HTMX polling) — partially done: `game.html`'s sidebar already renders the initiative order/round while combat is active (see "Initiative tracker UI panel" below), but whether it live-updates via HTMX polling mid-turn or only refreshes on the next full page load hasn't been re-verified — worth confirming before calling this fully done.
+- ~~Initiative tracker UI panel in sidebar~~ — Done: `templates/game.html`'s `.combat-active` sidebar section (round counter + initiative order, current-turn highlighted).
+- ~~Long-rest / short-rest quick buttons~~ — Done, see "Rest buttons (2026-07-03)" below.
+- ~~Session summary export (markdown or PDF)~~ — Markdown half done 2026-07-13: `backend/session_export.py`'s `render_session_export_markdown()` (pure function, no DB) flattens every recorded `Session` (summary, key events, adventure progress, XP, loot, quest names resolved from ID, notes), oldest first, into one document. `GET /campaigns/{id}/sessions/export/markdown` (`main.py`) loads the campaign and returns it as a downloadable `.md` (`Content-Disposition: attachment`); a "⬇ Export Session Log" link was added to `sessions.html`'s sidebar, gated on there being at least one session. Verified live against a real campaign ("The Lost Mine of Ragdelver") via curl — correct filename, content-type, and rendered body. PDF still not built — flagged as a trivial follow-up (pipe this same markdown through a converter) rather than adding a new rendering dependency for this pass. Regression coverage: `tests/test_session_export.py`.
 - Multi-player support (Redis pub/sub replacing in-memory queue)
 - Railway deployment guide + one-click deploy button
 - NPC/faction relationships, world clock/weather, safety tool, and map support — see **Feature Brainstorm** below for full detail; these are accepted and superseding the old "Grid map renderer" / "NPC relationship display" bullets.
@@ -1732,22 +1876,29 @@ These four ideas all reduce to the same two abstractions, one of which is alread
 
 Net effect: design the scale-aware model *before* building any one of these, so the site-grid renderer (item 2) isn't thrown away when regional travel (item 4) needs its own map.
 
-**1. Map grids (ASCII/XY)**
+**1. Map grids (ASCII/XY) — Done ✅ (2026-07-13)**
 Add `grid: list[str]` (ASCII rows) + `legend: dict[str, str]` to `Location` as a JSONB field, gated to `scale: SITE`. A new tool, `get_location_grid()`, lets the agent reason spatially ("you're 15ft from the door"). `combat.py`'s `set_combatant_position` extends to validate `(x, y)` against grid bounds — finally populating `CombatantPosition.coordinates`.
 *Feasibility: High for DM-authored grids (small JSON or in-app editor). Low–Medium for auto-extracting maps from PDF map images — would need a vision-capable model to interpret floor plans, experimental and error-prone. Ship authored grids first; auto-extraction is a stretch goal, not a dependency.*
+*Shipped as: `Location.grid`/`.legend` (`backend/models.py`, ANY scale — not gated to SITE after all, since a region-scale settlement's street layout turned out to want a grid just as much as a dungeon room; see the Maps-browser note below). `set_location_grid`/`get_location_grid` (`backend/tools/world.py`, in `make_authoring_tools` so both live play and the world-prep pass get them) — validates a rectangular grid and that every non-`.` symbol has a legend entry, same "no silent invented data" discipline as `validate_subclass`/`build_spells_known`. `CombatantPosition.coordinates` finally populated via `set_combatant_position`'s new `x`/`y` params (`combat.py`), validated against grid bounds and wall cells. `start_encounter` hard-refuses without a grid on the party's current location — **every fight now requires one, wilderness included** (a direct, explicit user requirement — no zone-only fallback). Went beyond the original sketch in one real way: this directly replaced a rejected zone-transition heuristic for opportunity attacks (see that item below) rather than shipping as an isolated rendering feature — real coordinates existing is what made a real distance check possible instead of a heuristic. Auto-extraction from PDF map images is still not built (stretch goal, as originally scoped) — grids are DM/model-authored, live during play or precomputed for settlements during world-prep (see the Maps-browser note below).*
 
-**2. Visual map for players**
+**2. Visual map for players — Done ✅ (2026-07-13)**
 A pure CSS-grid table in `game.html`'s sidebar — cells colored by terrain/lighting, combatant tokens placed by coordinate, refreshed via the same HTMX polling pattern already planned for the live party tracker. No npm, no JS framework. Built generically enough (grid renderer takes a node list + coordinates) that it can later be reparameterized for the region-scale map in item 4 rather than rewritten.
 *Feasibility: High, once (1) exists.*
+*Shipped as: `GET /campaigns/{id}/combat-map` (`backend/main.py`) — reuses `render_grid()` (`map_render.py`) as-is for terrain, plus a `combatants` array (name/x/y/side/is_current_turn/hp_pct) built from `Encounter.combatant_positions` cross-referenced with `initiative_order`. Refreshed via `refreshCombatMap()` (`game.html`), hooked into the exact same trigger points the existing `refreshCombatPanel()` already used — page load + the SSE `"done"` event after each DM turn — not a new polling timer, since that event-driven pattern already existed for the combat turn-builder. Renders into a `#combat-map` div inside the sidebar's `.sidebar-section.combat-active` block (paired with round/initiative), reusing the Maps browser's own `.map-grid`/`.map-row`/`.map-cell-*` CSS classes for terrain and a small marker overlay (`.combatant-marker`, party/hostile colors, current-turn outline, HP-tint via `.hp-bloodied/.hp-critical/.hp-downed`) — simpler than a separate absolute-position overlay grid: a combatant's marker is just rendered *inside* its own cell's span instead of the raw terrain symbol. Deliberately unfogged (see item 3) — this is real-time battlefield awareness for a fight the party is already in, not exploration secrecy, so it always shows the true state.*
 
-**3. Fog of war (hide what players shouldn't see)**
+**3. Fog of war (hide what players shouldn't see) — Done ✅ (2026-07-13, coarse version)**
 Coarse version: only render cells belonging to *revealed* rooms, reusing the existing `reveal_hidden_element` tool pattern and `LocationConnection.is_visible`. True line-of-sight (raycasting per cell) is a real algorithm, not just data plumbing.
 *Feasibility: High for room-level concealment. Medium for true LOS — likely not worth the complexity for a narrative-first tool.*
+*Shipped as (Maps browser only — never `get_location_grid`, the DM/mechanics model always sees the real grid): `Location.revealed_positions: list[tuple[int,int]]` (`backend/models.py`) — append-only, populated by `set_combatant_position` (`combat.py`) whenever a `side=="party"` combatant's real `(x,y)` is set (a monster walking through a cell doesn't mean the party has seen it). New `render_grid_fogged(grid, legend, revealed_positions, radius=2)` (`map_render.py`) — same Chebyshev-distance convention `check_opportunity_attacks` already established (`_helpers.py`), any cell farther than `radius` squares from every revealed position becomes a `{"symbol": "?", "kind": "fog"}` placeholder, same output shape as `render_grid` so `maps.html` needed zero template changes beyond a `.map-cell-fog` CSS class. The `/campaigns/{id}/maps` route calls `render_grid_fogged` only when `revealed_positions` is non-empty, falling back to the original unfogged `render_grid` otherwise — a location nobody's ever fought in (most non-combat visits) still shows its whole layout immediately once visited, matching the original ask ("if we're in town in Phandalin, having the streets laid out would be nice") rather than defaulting to a useless solid-black map. Not true LOS raycasting, as scoped — a radius-around-visited-cells reveal, the "likely not worth the complexity" version this note already called out.*
 
 **4. Regional travel & distance logistics — Done ✅ (2026-06-30)**
 Give the DM agent grounded answers to "how far is it from A to B, and how long does it take to get there" instead of inventing numbers — the same philosophy as `roll_dice` replacing invented rolls. Reuses `LocationConnection` at `scale: REGION`: add `distance_miles: float | None` and `terrain: TravelTerrain` (road / trail / wilderness / mountain / swamp / water) alongside the existing `distance_ft` / `is_passable` / `is_visible`, so travel routes are edges in the same graph as dungeon connections, not a parallel model. Two new tools: `get_travel_estimate(destination)` walks the region-scale subgraph (simple BFS/Dijkstra over `distance_miles` — branching factor is small enough that no real pathfinding library is needed) and returns distance plus days at normal/slow/fast pace per DMG travel rules (24/18/30 mi/day, with mounted/wagon modifiers); `travel_to(destination, pace)` works like `move_party` but advances `Campaign.days_elapsed` and `time_of_day` by the computed duration — the first tool to ever actually increment `days_elapsed`, which today is tracked but dead. Stretch: a per-day random-encounter roll during multi-day travel, reusing indexed monster data via `search_rules`.
 *Feasibility: High for the graph model and tools — small, well-scoped, reuses an existing shape rather than inventing one. Medium for the region-scale map rendering (the item-2 renderer reparameterized) — same no-npm, CDN-script approach as the NPC/faction graph. Auto-sourcing real-world distances between named PHB/module locations is out of scope; distances are DM-authored, same as grids in item 1.*
 *Shipped as: `Location.scale`, `LocationConnection.distance_miles`/`terrain` (`backend/models.py`); `create_location`/`connect_locations`/`get_travel_estimate`/`travel_to` in `backend/tools/world.py` (split into `make_movement_tools`/`make_authoring_tools`/`make_travel_tools`); `advance_clock`/`find_connection` helpers in `backend/tools/_helpers.py`. Direct connections only, as scoped — no multi-hop pathfinding (deferred, per the original brainstorm's stretch framing). Beyond the original brainstorm: since there was no DM persona to author locations by hand (the AI is the DM), an automatic background pass now seeds region-scale locations/distances from a campaign's `books_in_play` — `backend/agent/world_prep.py` + `world_prep_prompt.py`, a one-shot non-checkpointed agent (`get_world_prep_agent` in `dm_agent.py`) fired via `asyncio.create_task` from `POST /campaigns` and `POST /campaigns/{id}/books` (`Campaign.world_prep_status`/`world_prep_error` track progress). Grounded only — only distances the adventure text states or clearly implies get created; gaps are left for later. Seed retrieval uses a new `RulesStore.search_adventure_only()` rather than the mixed core+adventure `search()`, since core rulebooks (~5k chunks) drown out a single adventure's own text (~500 chunks) for generic "regional overview" queries. Verified end-to-end against "Tyranny of Dragons": 6 locations, grounded mileage converted from stated travel times, `get_travel_estimate`/`travel_to` correctly advance `days_elapsed`/`time_of_day` and refuse ungrounded requests instead of inventing numbers.*
+
+**5. Maps browser (persistent world-map viewer) — Done ✅ (2026-07-13)** (idea from user, expanded scope during planning for item 1)
+Not originally scoped as its own idea — grew out of item 1's planning conversation when the user asked for a way to browse "what does this town look like" at any time, not just mid-combat, plus purchased-map unlocking and zoom navigation between a settlement's street grid and the wider region. Reuses item 1's `Location.grid`/`.legend` (now ungated from `scale: SITE` — a region-scale settlement gets a grid too) and item 4's already-shipped `LocationConnection` travel graph for zoom navigation, rather than inventing a new hierarchy/coordinate-transform concept.
+*Shipped as:* `Location.visited`/`.map_known` (`backend/models.py`) — `visited` set automatically on arrival (`move_party`/`travel_to`, `backend/tools/world.py`); `map_known` set independently via a purchased/found map item (`Item.is_map`/`.map_location_id`, new `apply_map_reveal_if_needed()` in `_helpers.py`, wired into `add_item_to_character`'s new `map_of_location` param, `backend/tools/party.py`). `GET /campaigns/{id}/maps` (`backend/main.py`) lists every location where `visited or map_known`; the detail pane renders the selected location's grid as colored HTML cells — `backend/map_render.py`'s `classify_symbol()`/`render_grid()` (pure, testable) buckets each symbol into a small fixed palette (wall/door/water/vegetation/rock/difficult/furniture/floor/other) by keyword-matching the legend's free text, rendered black-background/monospace, roguelike-style (`static/style.css`'s `.map-cell-*` classes). "Zoom" navigation is just links to a location's already-existing `LocationConnection`s that also happen to be visited/map_known — no new coordinate-transform math. `templates/maps.html` mirrors `sessions.html`'s list+detail layout; a "🗺 Maps" link was added to `game.html`'s and `sessions.html`'s nav. World-prep's region-seeding pass (`world_prep_prompt.py`) also got an optional, best-effort instruction to draft a coarse settlement grid when the adventure text grounds one, so a town can already have a browsable layout before the party ever arrives — explicitly skipped (not invented) when the source text doesn't describe one. Site-scale room-by-room precomputation (individual dungeon rooms) was NOT added — bigger, separate future work, same "ship live-authoring first" call as the original PDF-auto-extraction stretch goal.
 
 ### Under Consideration
 
@@ -1759,36 +1910,72 @@ Same backend as (4), triggered by an agent tool (`generate_scene_image(prompt)`)
 
 *Feasibility for 4 & 5: Medium. Local image generation (Stable Diffusion via ComfyUI/A1111) needs a GPU and a separate service beyond Ollama's text models — but it could plausibly join `docker-compose.yml` as another container alongside `ollama` and `postgres`, same bind-mount pattern as `data/chroma_db/`, keeping the project's "no cloud services" stance intact. Not solving the infra question now — flagged here so it's not forgotten when this gets picked up. A cloud image API would be easier to prototype but breaks that design goal, so it's a fallback, not the default.*
 
-**7. Local TTS narration (Piper)**
-Stream the DM's narration through a fully offline TTS engine for read-aloud immersion on boxed text, alongside the existing SSE token stream.
-*Feasibility: Medium — lightweight to run and fits the local-only ethos better than image gen does, but it's a new streaming/audio code path.*
-
-**11. Clickable character cards in the Session 0 lobby** (idea from user, 2026-07-04)
-During a live game session, clicking a party member in `game.html`'s sidebar (`.party-member[data-char-id]`, `onclick="loadCharacterSheet(id)"`) fetches `GET /campaigns/{id}/party/{character_id}` and renders the full sheet into a side pane (`renderCharacterSheet()` → `#sheet-preview`). The Session 0 lobby (`session_zero_index.html`) has the equivalent party grid (`.sz-char-card`) but the cards are static — only a "Remove" button, no way to inspect a finalized character's full sheet the way you can mid-session.
-*Prototype sketch: since a finalized Session 0 party member is already the same `Character` model used in-game (not the flat draft dict — that only exists pre-finalization in `draft_store.py` and has no HP/AC/inventory/spell slots yet), this reuses the existing route as-is. Add a `.sz-sheet`-style `<aside>` to `session_zero_index.html`, give `.sz-char-card` the same `data-char-id` + click handler as `game.html`, and reuse `renderCharacterSheet()` (verbatim or shared via a small JS include) against the same `/party/{character_id}` endpoint. No backend changes needed.*
-*Feasibility: High — almost pure reuse of code that already works in `game.html`; the harder problem (unifying the draft-dict renderer `renderDraft()` with the Character-model renderer `renderCharacterSheet()`) doesn't block this, since the lobby only ever shows finalized characters.*
+**11. Clickable character cards in the Session 0 lobby — Done ✅ (2026-07-13)**
+During a live game session, clicking a party member in `game.html`'s sidebar (`.party-member[data-char-id]`, `onclick="loadCharacterSheet(id)"`) fetches `GET /campaigns/{id}/party/{character_id}` and renders the full sheet into a side pane (`renderCharacterSheet()` → `#sheet-preview`). The Session 0 lobby (`session_zero_index.html`) had the equivalent party grid (`.sz-char-card`) but the cards were static — only a "Remove" button, no way to inspect a finalized character's full sheet the way you can mid-session.
+*Shipped as: `renderCharacterSheet()`/`abilityRow()`/`itemLink()`/`rarityClass()`/`escapeHtml()` extracted verbatim out of `game.html`'s inline script into a new shared `static/character-sheet.js`, included by both templates instead of duplicated. `.sz-char-card` gained `data-char-id` + `onclick="loadSzCharacterSheet(id)"` (mirroring `game.html`'s pattern exactly), a `#sheet-preview` `<aside>` was added next to the party list, and a small `loadSzCharacterSheet()` reuses the shared renderer against the same `/party/{character_id}` endpoint — no backend changes. New CSS: `.sz-party-body` (flex row for list + sheet), `.sz-char-card.clickable/.active`, and a scoped `.sz-party-body .sz-sheet` override so the shared sheet-panel style fits the lobby's plain page layout instead of the full-height chat layout it was built for.*
 
 **10. Homebrew content (per-campaign)**
 Let a DM register custom rules/monsters/items scoped to a single campaign, without code edits and without polluting other campaigns' RAG results. Mirrors the existing `docs/source/adventures/{slug}/` pattern but keyed by `campaign_id` instead of an opt-in slug list: a new `docs/source/per_campaign_rules/{campaign_id}/` folder, indexed with metadata `source_type: "homebrew"`, `campaign_id`. `RulesStore.search()` gains a third `$or` branch — `{"campaign_id": {"$eq": campaign.id}}` — alongside the existing `core` and `adventure` branches, and is always active for its own campaign (no `books_in_play` opt-in needed).
 *Feasibility: Medium — same indexing path as adventures, but needs a campaign_id metadata filter and an upload/management UI for the DM.*
 
-**11. Intra-session rolling memory summarization**
-Right now `_MAX_MESSAGES` (mechanics) and `_NARRATOR_MAX_TURNS` (narrator) are hard cutoffs — once a thread's raw/narrative message count passes the window, older turns are silently dropped from context with no replacement. Raising `_MAX_MESSAGES` (30 → 100, done 2026-07-02) bought back real session length but doesn't fix the underlying shape of the problem: any long enough session still eventually hits a wall and starts losing real information, it just takes longer to get there. The actual fix is closer to what `summarize_session()` already does at session end (`dm_agent.py`), but triggered mid-session instead: once the trim window starts filling, summarize the oldest chunk of narrative turns about to fall out of context into a compact running recap, store it in new graph state (e.g. `session_recap: str`), and have both `_make_state_modifier` and `_make_narrator_modifier` prepend it (after the system prompt) alongside whatever raw/narrative turns still fit. The raw turns that get summarized away can then be dropped from the window without simply losing them — their gist persists in the recap instead.
-*Feasibility: Medium — no new infra (reuses the summarization LLM-call pattern already proven at session end), but real design work: deciding the trigger point (e.g. once `_NEAR_LIMIT_MARGIN` is hit), keeping the recap itself from growing unbounded across a very long session (summarize the recap-plus-new-chunk together each time, not just append), and making sure the mechanics model doesn't treat recap prose as a substitute for calling state-reading tools it should still call fresh (`get_character`, `get_current_location`, etc.) rather than trusting a summary of what those said last time.*
+**11. Intra-session rolling memory summarization — Done ✅ (2026-07-13)**
+`_MAX_MESSAGES` (mechanics) and `_NARRATOR_MAX_TURNS` (narrator) are still hard cutoffs, but older narrative turns falling out of the narrator's window are no longer simply lost. `DMState` gained `session_recap: str` (the running recap) and `session_recap_through: int` (how many narrative turns are already folded in, so each update only sends the LLM the NEW turns that just crossed the boundary, not an ever-growing prefix). `_maybe_update_session_recap()` (`dm_agent.py`) is called once per player turn from `stream_response` (not per mechanics-loop iteration or per auto-resolved combatant turn) — a cheap early-exit when nothing's about to trim, otherwise a small LLM call (same `_get_model()`/timeout/fallback-on-failure shape as `summarize_session`, plus the same `_party_ground_truth` anti-fabrication grounding) that merges the new turns into a short 2-4 sentence recap. Both `_make_mechanics_modifier` and `_make_narrator_modifier` prepend it (right after the system message, before the trimmed/narrative window) wrapped in a `[SESSION RECAP — internal, not player dialogue...]` marker that explicitly tells the model to treat it as background color and call `get_character`/`get_current_location`/`get_party_status` for anything it needs to act on precisely — matching this file's existing "don't trust narrated state" doctrine (`_MECHANICS_BASE`, `build_session_kickoff_message`) rather than inventing new phrasing. Regression coverage: `tests/test_session_recap.py` (LLM and checkpointer both monkeypatched — exercises the trim/fold/merge decision logic, not real model output).
 
 **12. Subclass mechanics modeling**
 `Character.subclass` is a bare free-text string (already noted above for `level_up`) and `Character.features` is explicitly freeform — nothing validates a subclass against its class's real subclass list, and no data table encodes what a subclass actually *changes* mechanically (Ranger's Fey Wanderer bonus cantrip, Gloom Stalker's bonus first-round attack, Beast Master's companion rules, Hunter's combat options, etc.). In practice a subclass's rule alterations only exist if the model remembers and correctly applies them from freeform text each time they're relevant — the same shape of problem `SPELL_MENUS`/`SPELL_REQUIREMENTS` (spells.py) already solved for base-class cantrips/level-1 spells, just unaddressed for subclasses. Surfaced 2026-07-04 during a live Session 0 conversation — not the cause of that session's actual bug (an unrelated tool-call-fidelity failure; see the chargen.py Tools section's "Verified live..." narrative and Agent Architecture's "Session 0 agent" section for the fix, the same session's two-node mechanics/narrator restructure), but adjacent enough to flag while fresh.
-*Feasibility: Medium-large — a `SUBCLASS_FEATURES` table mirroring `SPELL_MENUS`'s shape is straightforward for well-known feature names, but many subclass features are genuinely bespoke mechanics (a companion creature, a save-or-suck rider, a resource pool) rather than a consistent shape like "N spells from a list." Validating `subclass` against `level_3_features`'s real subclass names is a small, independent win that could ship first, ahead of full mechanical modeling.*
+*Feasibility: Medium-large — a `SUBCLASS_FEATURES` table mirroring `SPELL_MENUS`'s shape is straightforward for well-known feature names, but many subclass features are genuinely bespoke mechanics (a companion creature, a save-or-suck rider, a resource pool) rather than a consistent shape like "N spells from a list."*
+
+**The name-validation slice — done ✅ (2026-07-13).** `SUBCLASSES: dict[str, list[str]]` (`backend/data/fivee_options.py`) extracts the real subclass names straight out of each class's own `level_3_features` string above (e.g. Fighter → Battle Master/Champion/Eldritch Knight/Psi Warrior; Warlock is a special case — its subclass IS the level-1 Otherworldly Patron choice, same 4 names). New `validate_subclass(char_class, subclass)` (`_helpers.py`, mirrors `build_spells_known`'s shape/return convention) does a case-insensitive check, returning the canonical-cased name on a match or a corrective error listing the real options — deliberately soft, not a hard universe: an unset subclass, or a class/homebrew subclass this table doesn't cover, passes through unchanged. Wired into `finalize_character` (`chargen.py`), `generate_companion_character` (`companion.py`), and `level_up` (`levelup.py`, validated *before* any stat mutation — a rejected level-up leaves the character completely untouched, same discipline the spell-selection check there already follows). Regression coverage: `tests/test_subclass_validation.py`.
+
+**The level-3 mechanical-modeling slice — done ✅ (2026-07-13), higher levels still open.** `SUBCLASS_FEATURES: dict[str, dict[str, dict[int, list[str]]]]` (`fivee_options.py`) transcribes each of the 48 real subclasses' actual level-3 feature text from `docs/source/core/D&D 5.5E - Player's Handbook.md`, condensed to the same terse freeform-string style as `CLASSES[cls]["level_1_features"]` — scope deliberately limited to level 3 (the universal subclass-unlock level), same incremental-slice precedent as the name-validation table itself; levels 6/7/9/10+ are a documented follow-up, not attempted here, since many later features are genuinely bespoke (resource pools, summoned companions, save-or-suck riders) rather than a uniform shape. A companion `SUBCLASS_BONUS_SPELLS` table covers the small subset of level-3 grants that are both "always prepared" spell lists AND resolve against a spell already in `ALL_SPELLS`' curated cantrip/level-1 subset (Life Domain, Oath of the Ancients, Aberrant Sorcery, Archfey Patron) — most subclass spell-list grants name spells outside that curated set and aren't modeled, same "don't claim to be the only universe" caveat `SPELL_MENUS` already carries. New `apply_subclass_features(char)` (`_helpers.py`) appends any newly-unlocked feature text onto `Character.features` and any resolvable bonus spells onto `spells_known`/`spells_prepared`, idempotently (safe to call again on a re-level). Wired into `finalize_character`, `generate_companion_character`, and `level_up` (which now also reports "New subclass features" in its resolution text when a level-up crosses into one). Regression coverage: `tests/test_subclass_mechanics.py`.
 
 **13. Mass combat / mob rules for large enemy groups** (idea from user, 2026-07-05)
 Surfaced while adding the mechanics prompt's turn-auto-continuation rule (see Agent Architecture — the mechanics model now resolves every non-player combatant's turn in a row within one response, stopping only once initiative comes back to a player-controlled character). A large hostile group (many individual monsters) queued between two of the player's own turns can burn a lot of the per-message `recursion_limit=60` LangGraph step budget (`backend/main.py`, ~2 graph steps per combatant round-trip) in a single reply. Checked the currently indexed core rulebooks (2024 PHB, DMG) for an official mass-combat/mob rule to ground this against — not present in `docs/source/core/`. The well-known version is the unofficial community "mob rule" (one attack roll for a mob of N identical creatures, with a to-hit/damage bonus scaling by group size) — not an indexed sourcebook rule, so it'd need to be flagged as a DM improvisation the same way homebrew monster stats already are, unless a book containing it gets indexed later.
 *Prototype sketch: likely a `mob` flag (or new `CombatantType`) on `Monster`/`InitiativeEntry` representing a group as a single initiative slot with a `count`, resolved with one roll per mob turn (scaled damage/to-hit) instead of N individual `resolve_attack` calls — sidesteps the step-budget risk entirely rather than just raising `recursion_limit`.*
 *Feasibility: Medium — no urgent trigger yet (most encounters are small enough that the step budget isn't a real risk); revisit if the recursion limit is actually hit in play, or if encounters routinely run 10+ hostile combatants.*
 
-**14. Freeform narrative time advancement** (idea from user, 2026-07-09)
-Reported live: the DM narrated dusk falling, but the sidebar's World clock (`campaign.time_of_day`, `templates/game.html:73`) still read "morning" — the underlying field was never updated to match. Investigated: `time_of_day`/`days_elapsed` (`backend/models.py:828-829`) only ever advance through three paths — `travel_to` (region travel, `backend/tools/world.py`), and the long/short rest routes (`apply_long_rest`/`apply_short_rest`, `backend/tools/_helpers.py`) — all three work correctly. There is no tool for freeform time passage outside those three (no "advance time by N hours" for a scene where hours pass without travel — a stakeout, an evening spent in town, a long conversation that runs past dusk), no prompt instruction anywhere telling the model to notice narrated time-skips and act on them (`prompts.py`'s only clock-related guidance is travel-specific), and no guardrail backstop (unlike the combat-loot guardrail chain — see "Combat loot generation" above). So this isn't the model being flaky with an existing mechanism; the mechanism doesn't exist for the non-travel case.
-*Prototype sketch: same two-layer pattern as the loot fix — (1) a new general-purpose `advance_time(hours, reason="")` tool (thin wrapper over the existing `advance_clock` helper, already used by `travel_to`/rests) so the model has something to call; (2) explicit prompt guidance for recognizing non-travel time-skip narration (dusk/nightfall, "several hours later," extended downtime, watching/waiting) with rough hour estimates for common cases; (3) a regex guardrail (mirroring `_detect_missing_loot_followup`'s shape) catching obvious time-skip phrasing in the narration with no backing `advance_time`/`travel_to`/rest call that turn, prompting a self-correction.*
-*Feasibility: Medium — the tool and guardrail are small and mechanical (real precedent in the loot guardrail chain), but this is fuzzier than loot in one real way: a monster's defeat is a clean boolean the code can check, while "how many hours did that scene take" is an inherent judgment call with no ground truth to verify against — the guardrail can catch obviously-missed phrasing, but can't guarantee the hour estimate itself is right the way the loot fix could guarantee no double-payout.*
+**14. Freeform narrative time advancement — Done ✅ (2026-07-13)** (idea from user, 2026-07-09)
+Reported live: the DM narrated dusk falling, but the sidebar's World clock (`campaign.time_of_day`) still read "morning" — the underlying field was never updated to match. Root cause: `time_of_day`/`days_elapsed` only ever advanced through `travel_to` and the two rest routes — there was no tool, no prompt guidance, and no guardrail for a non-travel time-skip (a stakeout, an evening in town, "a week passes"). Shipped the same three-layer pattern the loot guardrail already established: (1) two new tools, `advance_time(hours, reason)` and `take_rest(kind)` (`backend/tools/world.py`, thin wrappers over the existing `advance_clock`/`apply_long_rest`/`apply_short_rest` helpers — no changes to the deterministic rest math itself); `take_rest` closes the other real gap here too — rests were previously UI-button-only, with no way for the model to apply them when narrating the party making camp as part of the story. (2) A new "Time passage" prompt section (`prompts.py`, parallel to the existing Travel section, not folded into it) giving the model concrete anchors for estimating how much time a narrated scene covers — sub-minute actions need no call, an hour-plus scene calls `advance_time`, an explicit skip always does, and actual resting/making camp calls `take_rest` — so the model can call these proactively rather than relying solely on the backstop. (3) `_detect_missing_time_advance_followup` (`dm_agent.py`, own `time_guardrail_count` budget, same starvation-avoidance shape as `lore_guardrail_count`/`stalled_turn_guardrail_count`) — a regex over the resolution report for time-skip/resting language with no `advance_time`/`take_rest`/`travel_to` call backing it, deliberately un-gated from combat, same reasoning as `_detect_missing_loot_followup`. Regression coverage: `tests/test_freeform_time_and_rests.py`.
+
+**15. Feats / Ability Score Improvement at level-up**
+`level_up` (`levelup.py`) currently has no feat-or-ASI choice at the levels 2024 rules grant one — a character just gains HP/proficiency bonus/class features with no player decision point. Needs a small `FEATS` data table (mirrors `SUBCLASS_FEATURES`'s shape: name → prerequisite/effect text) and a new `level_up` param/tool step to pick one, or take the flat +2/+1/+1 ASI instead.
+*Feasibility: Medium — the data table is straightforward transcription work (same discipline as `SPELL_MENUS`/`SUBCLASS_FEATURES`), but many feats have bespoke mechanical effects (not a uniform "+N to a skill" shape) that would need individual handling wherever they matter (e.g. Lucky's reroll, Alert's initiative bonus).*
+
+**16. Spell content beyond level 1**
+`backend/data/spells.py`'s `ALL_SPELLS`/`SPELL_MENUS`/`SPELL_REQUIREMENTS` only cover cantrips and level-1 spells — Ranger/Sorcerer/Bard/Warlock/Wizard/Cleric/Druid's higher-level spell-slot progression and 2nd-level+ spell selection is entirely unmodeled today. A natural follow-on to the existing interactive spell-selection system (see chargen.py's Tools section above), same transcription-and-validation approach.
+*Feasibility: Medium-large — mechanically it's the same shape already solved for level 1 (curated menu + flat per-tier counts + `cast_spell`'s `resolution_type` dispatch), but the sheer number of additional spells to transcribe and verify against the source PHB text is a much bigger lift than level 1 was.*
+
+**17. NPC daily schedules**
+NPCs currently sit static wherever they were created/placed — a shopkeeper is always "at the shop," a guard is always "on the wall," regardless of `time_of_day`. A simple time-of-day routine (open/closed hours, a patrol location swap) would make `advance_time`/`take_rest` (idea 14, already shipped) feel consequential to the world rather than just a clock number ticking over.
+*Feasibility: Medium — needs a small schedule data shape on `NPC` (e.g. a list of `(time_range, location)` pairs) and a check wired into `get_current_location`/`get_npc`, but no new subsystem; can start with only NPCs that matter (shopkeepers, quest-givers) rather than every NPC in the campaign.*
+
+**18. Downtime activities**
+Crafting, training, carousing, running a business, and similar between-adventure activities have real rules in the 2024 DMG. This hooks naturally into the existing world clock (`Campaign.days_elapsed`, `advance_time`) rather than needing a new time-tracking concept.
+*Feasibility: Medium — the DMG's downtime rules are a real, boundable rule set (not open-ended homebrew), but modeling activity outcomes (crafting progress, business income, carousing complications) is more state than a single tool call; likely its own small subsystem.*
+
+**19. Dynamic shops**
+Buying/selling against a real per-settlement stock list (with prices, limited quantities) instead of ad hoc narrated purchases the model currently has to invent on the spot. Pairs naturally with the existing `Container`/currency model already used for loot and the party treasury.
+*Feasibility: Medium — the data model is simple (a `Container`-shaped inventory per shop, keyed to a `Location`), but populating realistic per-settlement stock (grounded vs. invented) raises the same "don't invent, ground or abstain" question this app already applies to loot and world-prep.*
+
+**20. Encounter-budget guardrail**
+`Encounter.xp_budget` already exists as a field but nothing currently checks a generated fight against the real DMG XP budget/thresholds for the actual party (level, size). A deterministic warn-or-block check when a `start_encounter`/`create_monster` combo is wildly over or under budget fits this repo's existing "never trust the model for arithmetic it can get wrong" principle — same spirit as the loot, time-advancement, and turn-order guardrails already shipped (see Tools section above).
+*Feasibility: High — pure arithmetic against already-modeled fields (`Encounter.xp_budget`, party levels, monster CR/XP), no new data needed; same shape as the deterministic rest routes.*
+
+**21. In-combat tactical hint mode**
+An opt-in toggle where the narrator surfaces a plain-language suggestion ("your reaction is available; Shield would help here," "you're both flanking — consider Help") for newer players, without touching the mechanics layer's actual resolution logic at all — purely a narrator-prompt addition gated behind a campaign setting.
+*Feasibility: Medium — the mechanics layer already tracks the exact state a hint would need (`reaction_available`, positions, HP); the work is mostly prompt design plus a per-campaign toggle field, not new state.*
+
+**22. Milestone vs. XP leveling toggle**
+A small DM-facing campaign preference: award levels at story milestones instead of `end_encounter`'s XP-based awarding — a real 2024 DMG-supported alternative leveling scheme, not homebrew.
+*Feasibility: High — a boolean `Campaign` field and a branch in the leveling-trigger logic; XP can still be tracked/displayed even when it's not what actually triggers a level-up.*
+
+**23. Campaign keepsake export**
+A compiled PDF/ebook of an entire campaign — all session chronicles, final character sheets, and discovered maps bound together as a keepsake. Bigger in scope than the already-listed single-session markdown/PDF export (see "Deferred" bullets above) — this is a whole-campaign document, not a per-session one.
+*Feasibility: Medium — the underlying data (sessions, characters, maps) all already exists and is queryable; the new work is a rendering/layout pass (likely HTML-to-PDF) plus assembling it into one coherent document rather than separate exports.*
+
+**24. Accessibility pass** (long-horizon — not near-term)
+Screen-reader labeling for the map/fog-of-war grid (currently a CSS-grid of colored cells with no semantic markup) and a colorblind-safe palette option for `map_render.py`'s symbol classification. Flagged here mainly so it isn't forgotten, not because it's next in line.
+*Feasibility: Medium-large — the map rendering path would need real semantic markup (ARIA labels per cell or a text-equivalent description) added without disrupting the existing visual layout, plus a second palette mode threaded through `classify_symbol()`'s CSS classes; a genuinely separate project from the nearer-term ideas above, not a quick add-on.*
 
 ### Deferred from the combat resolution refactor (2026-07-03)
 
@@ -1796,13 +1983,48 @@ Everything below was explicitly scoped out of the `resolution.py`/reaction-syste
 `Spell`-schema work landed this date, each for a stated reason — not oversights.
 Collected here in one place rather than left scattered across old plan-file prose.
 
-**NPC combatants can't take damage.** `resolve_attack`/`resolve_saving_throw`/
-`resolve_check` only resolve `Character`/`Monster` — there is no `update_npc_hp` tool
-anywhere in the codebase, despite `NPC.combat_stats` (`CombatStatBlock`) and
-`CombatantType.NPC` clearly anticipating NPCs fighting. Pre-existing gap, surfaced but
-not caused by this refactor. Small follow-up: `apply_damage_to_npc` mirroring
-`apply_damage_to_character`/`apply_damage_to_monster` in `_helpers.py`, plus wiring
-`find_npc` into the resolution tools' lookup chains — proportionally ~10 lines.
+**NPC combatants can't take damage — fixed 2026-07-13.** `resolve_attack`/
+`resolve_pending_action`/`cast_spell`'s attack-roll and automatic-effect paths only
+resolved `Character`/`Monster` — there was no `update_npc_hp` tool anywhere, despite
+`NPC.combat_stats` (`CombatStatBlock`) and `CombatantType.NPC` clearly anticipating
+NPCs fighting. Turned out to be a bit more than the originally-estimated ~10 lines,
+since `Character`/`Monster` both expose `ac`/`current_hp`/`max_hp`/`attacks`/
+`ability_scores` at the top level while `NPC` nested them under `combat_stats` — every
+generic attacker/target code path in `resolution.py` reads those names directly off
+whatever it's given. Fixed by adding matching read-only `@property` proxies to `NPC`
+(`models.py`) that delegate to `combat_stats` (defaulting to inert values — ac 10, 0
+HP, no attacks — when `combat_stats` is `None`, though `find_combatant` below never
+hands out a combat_stats-less NPC in the first place), rather than threading an
+NPC-specific branch through every call site. Added: `apply_damage_to_npc` (mirrors
+`apply_damage_to_character`/`_monster` exactly, `_helpers.py`); `find_combatant()`
+(3-way `find_char`/`find_npc`/`find_monster` lookup, only returns an NPC if
+`combat_stats is not None`) and `apply_damage_to_combatant()` (isinstance dispatch)
+to replace the repeated `find_char(...) or find_monster(...)` + Character/Monster
+ternary pattern at every attack/automatic-damage site in `resolution.py`; a new
+`update_npc_hp` tool (`combat.py`, mirrors `update_monster_hp`) for freeform NPC
+damage/healing outside a resolved attack; and a fix to `start_encounter`'s initiative-
+modifier lookup (`combat.py`), which previously always reported an NPC combatant as
+"not found in campaign" and rolled it at +0 DEX regardless of its real stats.
+**Follow-up closed same day:** `resolve_saving_throw`/`resolve_check`/`cast_spell`'s
+saving-throw branch also now resolve NPCs for real, not just attacks. The gap wasn't
+actually a proxy-vs-real distinction to begin with — `saving_throw_bonuses`/
+`skill_bonuses`/`conditions` just didn't exist anywhere on `NPC`/`CombatStatBlock` yet.
+Added all three to `CombatStatBlock` (same dict/list shape Monster already uses —
+"only list what this NPC is actually proficient in," same convention `_save_bonus`/
+`resolve_check` already followed for Monster) plus matching proxy properties on `NPC`
+(`conditions` returns `combat_stats`' own list object, not a copy, so `.append()` at
+the call site mutates the real persisted list). `find_combatant` (not the old
+`find_char`/`find_monster` pair) now backs `resolve_saving_throw`, `resolve_check`,
+and `cast_spell`'s `SAVING_THROW` branch, same as the attack-roll paths above — an NPC
+with `combat_stats.saving_throw_bonuses={"dexterity": 5}` and `skill_bonuses=
+{"deception": 4}` now rolls its own real dex save and deception check instead of
+either being invisible to these tools or silently falling back to a bare ability mod.
+Verified live: an NPC stat-blocked with real save/skill overrides rolled both
+correctly, a failed save applied damage AND a condition, and the condition landed in
+`combat_stats.conditions` (not lost). Full pytest suite still green throughout.
+Permanent regression coverage for all of this (damage as attacker/target, freeform
+`update_npc_hp`, the no-`combat_stats` refusal path, save/check overrides, condition
+persistence, and `start_encounter`'s initiative fix): `tests/test_npc_combat.py`.
 
 **Time-windowed resurrection magic (Revivify, Raise Dead, ...).** Death saves
 (`resolve_death_save`) and the "ordinary healing can't revive a truly-dead character"
@@ -1819,18 +2041,63 @@ that window. A dead character does already correctly stay in `campaign.party`
 indefinitely today (no tool anywhere removes a party member), so a future revival tool
 has something to target — that part needs no fix.
 
-**Opportunity attacks (movement-triggered reactions).** Found live during testing
-2026-07-03, and higher-priority than Counterspell/Absorb-Elements below since it's a
-*universal* reaction every combatant with `reaction_available` has by default (not a
-special spell/feature) and is likely the single most common reaction in actual 5e
-play. `has_plausible_reaction()` only models "does this character have a reaction
-*spell or feature*" — it has no concept of "a hostile creature just left my reach
-without disengaging," which is a movement-based trigger, not an incoming-attack-based
-one, and `resolve_attack`'s pause gate has no visibility into combatant
-positions/reach at all. Needs its own `PendingAction.trigger_type` (e.g.
-`"movement_away"`), fired from whatever resolves a monster's movement rather than from
-`resolve_attack`, checking the mover's distance against `CombatantPosition` data the
-gate doesn't currently look at.
+**Opportunity attacks (movement-triggered reactions) — Done ✅ (2026-07-13).** Found
+live during testing 2026-07-03, and higher-priority than Counterspell/Absorb-Elements
+below since it's a *universal* reaction every combatant with `reaction_available` has
+by default (not a special spell/feature) and is likely the single most common reaction
+in actual 5e play. `has_plausible_reaction()` only modeled "does this character have a
+reaction *spell or feature*" — it had no concept of "a hostile creature just left my
+reach without disengaging."
+
+A cheap fix was proposed first — trigger off `ZoneType`'s existing melee/adjacent/
+near/far/distant abstraction whenever a combatant's zone transitions away from
+`melee` — and explicitly rejected: zone is a single abstract value per combatant, not
+pairwise, so it can't answer "who exactly was adjacent" when multiple combatants share
+a zone, meaning it would need a compounding pile of guardrails/prompt instructions to
+patch edge cases. Built the real thing instead, once item 1 above gave the app actual
+`(x, y)` positions: `check_opportunity_attacks()` (`_helpers.py`) — real Chebyshev
+distance (5e diagonal-counts-as-5ft) against each reacting combatant's own real reach
+(see below) — wired into `set_combatant_position` (`combat.py`).
+`resolve_opportunity_attack()` (`resolution.py`) rolls the swing immediately (the
+attacker's own reaction isn't a decision point this app models — hostile creatures
+already resolve automatically elsewhere) and, on a hit against a player-controlled
+`Character` with a reaction available, pauses using the exact same `PendingAction`
+shape `resolve_attack` itself already produces — **no changes needed to
+`resolve_pending_action`/`resolve_pending_action_impl` at all**, since that machinery
+was already generic over which call site created the pending action. Verified live
+end-to-end, including the reaction-pause path (a mover with Shield known correctly
+pauses, then resolves via the unmodified `resolve_pending_action`). Regression
+coverage: `tests/test_location_grids_and_opportunity_attacks.py`.
+
+**Three follow-up gaps closed same day (2026-07-13):**
+- **Reach weapons.** `Attack.reach_ft: int = 5` (`models.py`) — 10 for a real reach
+  weapon (Glaive/Halberd/Lance/Pike, added to `WEAPONS` with the `"reach"` property;
+  `weapon_reach_ft()` in `equipment.py` derives it) or a monster/NPC with genuinely
+  long reach (`create_monster`'s `attacks` dicts now accept an optional `reach_ft`).
+  Wired everywhere an `Attack` gets built from a real weapon lookup — chargen's
+  `_starting_equipment`, `add_weapon_attack`, `create_magic_item` (all in
+  `_helpers.py`/`party.py`). `check_opportunity_attacks` now compares against the
+  reacting combatant's own `attacks[0].reach_ft // 5` squares instead of a flat 1.
+- **NPCs excluded from opportunity attacks.** Real gap, not a guess this time:
+  `InitiativeEntry.side: str = "hostile"` (`models.py`) — set from `start_encounter`'s
+  new per-combatant `"side": "party"|"hostile"` key, defaulting by `combatant_type`
+  when omitted (character → party, monster/npc → hostile) — an NPC fighting *for* the
+  party must have `"side": "party"` passed explicitly. `_is_hostile_pair()`
+  (`_helpers.py`) now checks `side` instead of `combatant_type`. Surfaced a second,
+  genuinely separate bug while wiring this in: `NPC`/`CombatStatBlock` had no
+  `reaction_available` field at all (unlike `Character`/`Monster`, which both have
+  one) — an NPC could never qualify as an attacker or a reaction-eligible target no
+  matter what `side` said. Added `CombatStatBlock.reaction_available: bool = True`
+  plus a read/write `NPC.reaction_available` property (needs a setter, unlike the
+  other `NPC` proxies, since `resolve_pending_action_impl` writes `target.reaction_available
+  = False` after a declared reaction).
+- **Only the first qualifying attacker resolved.** Turned out to be a one-line fix:
+  `resolve_opportunity_attack`'s `eligible_for_pause` check already required
+  `not enc.pending_action`, so looping over *every* qualifying attacker (instead of
+  just `qualifying[0]`) means the first hit against an eligible target still pauses
+  correctly, and every attacker after that just resolves immediately (rolls, applies
+  damage) since the pause slot is already taken — nobody is silently skipped anymore,
+  and no new queuing logic was needed.
 
 **Downed-character narration lagging the mechanics.** Also found live 2026-07-03: when
 `resolve_attack` returns PENDING, the narrator sometimes describes the hit as already
@@ -1856,23 +2123,16 @@ on one thing at a time. Whether a multi-target pause should defer *all* targets 
 only offer the window to the first eligible one is a real design fork that deserves
 its own pass. `trigger_type="incoming_save_damage"` is reserved for this.
 
-**Spell data population.** `chargen.py`'s `_build_character` never sets
-`spells_known`, `spellcasting_ability`, `spell_save_dc`, or `spell_attack_bonus` for
-any character today — the same shape of gap as the pre-existing "0 gold, no
-inventory" bug fixed earlier this session, just for spells instead of equipment. The
-new `cast_spell` tool and `Spell.resolution_type`/`effect_dice`/`save_ability`/etc.
-fields (`backend/models.py`) are schema-ready but will mostly have nothing to look up
-until this lands — `cast_spell` degrades to a clear error message pointing at the
-`resolve_attack`(`spell_name`+overrides)/`resolve_saving_throw` fallback path in the
-meantime. Three tiers of scope already worked out, so the next pass doesn't have to
-re-derive them: (1) schema only — done; (2) auto-populate at chargen, mirroring
-`equipment.py`'s precedent exactly (a small class→spellcasting-ability data table +
-`derive_level1_stats` wiring, plus an auto-assigned default spell list per class,
-matching the "default kit" philosophy already used for starting gear — not
-interactive choice), with a backfill script like `backfill_character_equipment.py`
-for existing characters; (3) a full interactive Session-0 spell-choice step (a new
-chargen tool, real UX/conversation design) instead of an auto-assigned list — bigger,
-deserves its own dedicated plan.
+**Spell data population — superseded, done.** This item (written before 2026-07-03)
+described `chargen.py` never setting `spells_known`/`spellcasting_ability`/etc. and
+sketched three tiers of fix, up to and including a full interactive Session-0
+spell-choice step as the ambitious end state. That end state has since shipped in
+full — see "Interactive spell selection (2026-07-03)" under `chargen.py` above:
+`SPELL_MENUS`/`SPELL_REQUIREMENTS` (`spells.py`), real per-player spell choice via
+`update_character_draft('spells_known', ...)`, validated at `finalize_character`, plus
+`generate_companion_character` and a `backfill_character_spells.py` for characters
+created before this landed. Left here only as a pointer so this stale paragraph
+doesn't get mistaken for open work again.
 
 **Verbal/Somatic component enforcement.** `cast_spell` (`resolution.py`) checks Material
 ("M") components as of 2026-07-04 — refuses if the spell needs a focus/pouch (or, for a

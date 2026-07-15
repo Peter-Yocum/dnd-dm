@@ -45,22 +45,34 @@
   {% if campaign.party %}
   <section class="sz-party">
     <h2>Characters Created</h2>
-    <div class="sz-party-list">
-      {% for c in campaign.party %}
-      <div class="sz-char-card">
-        <span class="char-name">{{ c.name }}</span>
-        <span class="char-class">{{ c.race }} {{ c.char_class }} {{ c.level }}</span>
-        <span class="char-hp">{{ c.current_hp }}/{{ c.max_hp }} HP · AC {{ c.ac }}</span>
-        {% if not c.is_player_controlled %}<span class="char-companion-tag">DM companion</span>{% endif %}
-        <button class="btn-danger btn-sm"
-                hx-delete="/campaigns/{{ campaign.id }}/party/{{ c.id }}"
-                hx-confirm="Remove {{ c.name }} from the party? This cannot be undone."
-                hx-target="body"
-                hx-push-url="/campaigns/{{ campaign.id }}/session-zero">
-          Remove
-        </button>
+    <div class="sz-party-body">
+      <div class="sz-party-list">
+        {% for c in campaign.party %}
+        <div class="sz-char-card clickable" data-char-id="{{ c.id }}" onclick="loadSzCharacterSheet('{{ c.id }}')">
+          <span class="char-name">{{ c.name }}</span>
+          <span class="char-class">{{ c.race }} {{ c.char_class }} {{ c.level }}</span>
+          <span class="char-hp">{{ c.current_hp }}/{{ c.max_hp }} HP · AC {{ c.ac }}</span>
+          {% if not c.is_player_controlled %}<span class="char-companion-tag">DM companion</span>{% endif %}
+          <button class="btn-danger btn-sm"
+                  onclick="event.stopPropagation()"
+                  hx-delete="/campaigns/{{ campaign.id }}/party/{{ c.id }}"
+                  hx-confirm="Remove {{ c.name }} from the party? This cannot be undone."
+                  hx-target="body"
+                  hx-push-url="/campaigns/{{ campaign.id }}/session-zero">
+            Remove
+          </button>
+        </div>
+        {% endfor %}
       </div>
-      {% endfor %}
+      <aside class="sz-sheet">
+        <div class="sz-sheet-header">
+          <h3>Character Sheet</h3>
+          <span class="sz-sheet-hint text-dim">Click a party member to inspect</span>
+        </div>
+        <div id="sheet-preview">
+          <p class="text-dim preview-empty">Select a party member to view their sheet.</p>
+        </div>
+      </aside>
     </div>
   </section>
   {% endif %}
@@ -108,6 +120,30 @@
 
 {% endif %}
 </div>
+
+{% if campaign.party %}
+<script src="/static/character-sheet.js"></script>
+<script>
+  const CAMPAIGN_ID = "{{ campaign.id }}";
+
+  async function loadSzCharacterSheet(charId) {
+    document.querySelectorAll(".sz-char-card").forEach(el => el.classList.toggle("active", el.dataset.charId === charId));
+    const el = document.getElementById("sheet-preview");
+    el.innerHTML = `<p class="text-dim preview-empty">Loading…</p>`;
+    try {
+      const resp = await fetch(`/campaigns/${CAMPAIGN_ID}/party/${charId}`);
+      if (!resp.ok) {
+        el.innerHTML = `<p class="text-dim preview-empty">Couldn't load that character.</p>`;
+        return;
+      }
+      const data = await resp.json();
+      el.innerHTML = renderCharacterSheet(data);
+    } catch (err) {
+      el.innerHTML = `<p class="text-dim preview-empty">Couldn't load that character.</p>`;
+    }
+  }
+</script>
+{% endif %}
 
 {% if recommended %}
 <script>

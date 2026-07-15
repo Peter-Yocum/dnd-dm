@@ -1,0 +1,108 @@
+# GPU-host override for docker-compose.yml — containerizes the two vLLM
+# processes that run natively on a Mac (vllm-metal, MLX-backed) so the same
+# app image works unchanged on a Linux + NVIDIA box. This file is never
+# auto-loaded on its own; Docker Compose (v2) auto-merges a file literally
+# named docker-compose.override.yml if one exists next to docker-compose.yml.
+# One-time setup on the GPU host, AFTER installing the NVIDIA Container
+# Toolkit (`nvidia-ctk runtime configure --runtime=docker` + restart docker):
+#
+#   ln -s docker-compose.gpu.yml docker-compose.override.yml
+#
+# That symlink is the only host-specific step. Every subsequent `git pull &&
+# docker compose up` (exactly what the auto-deploy watcher already runs) then
+# picks this up automatically with zero flags — a plain Mac clone with no
+# override file present gets the original host.docker.internal/vllm-metal
+# behavior in docker-compose.yml completely unchanged. Add
+# docker-compose.override.yml to .gitignore (done) so the symlink itself
+# never gets committed as a real file from either machine.
+#
+# Chat model: same Qwen3-30B-A3B this app already validated for tool-calling
+# compliance on vllm-metal (design.md's Tech Stack row / the 2026-07-13
+# "dedicated CUDA GPU host" note) — but MLX checkpoints are Apple-only, so
+# this points at a community AWQ 4-bit requantization instead
+# (cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit) for vLLM's mainline CUDA
+# backend (a much more mature code path than vllm-metal). NOT YET VERIFIED
+# LIVE on real hardware — this is the "test the VRAM by just doing the
+# docker compose" pass. Qwen3-30B-A3B is MoE: every expert stays resident in
+# VRAM regardless of ~3B active params/token, so AWQ 4-bit is ~15.25GB
+# against this card's 16GB — tight even alone. If it OOMs: lower
+# --gpu-memory-utilization first, then look for a 3-bit AWQ/GPTQ requant
+# (design.md's own 3-bit MLX figure, ~11.4GB, already confirmed equivalent
+# tool-calling compliance to 4-bit — no CUDA-side 3-bit checkpoint confirmed
+# to exist yet, may need to quantize one yourself with AutoAWQ/GPTQModel).
+#
+# Embedding model: per explicit instruction, kept OFF the GPU entirely so it
+# never competes with the chat model for the one card's VRAM — runs on CPU
+# instead, via vLLM's separate CPU-target Docker image (mainline CUDA image
+# cannot run a CPU-only workload). Same Qwen3-Embedding-0.6B this app already
+# uses via vllm-metal on Mac (a real, non-MLX-specific checkpoint on HF —
+# confirmed, not assumed: github.com/vllm-project/vllm's own docs list
+# Qwen/Qwen3-Embedding-0.6B as vLLM-supported directly, no MLX dependency).
+# vLLM's CPU backend has a known v1-engine incompatibility in some versions
+# (NotImplementedError under VLLM_USE_V1=1, the current default) — if
+# vllm-embed fails to start, check its logs first and set VLLM_USE_V1=0 if
+# that's the failure signature; see docs.vllm.ai/en/latest/getting_started/
+# installation/cpu/ if the image tag or flags below have moved on.
+
+services:
+  vllm-chat:
+    image: vllm/vllm-openai:latest
+    command:
+      - "--model"
+      - "cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit"
+      - "--quantization"
+      - "awq_marlin"
+      - "--max-model-len"
+      - "8192"
+      - "--gpu-memory-utilization"
+      - "0.90"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+      - "--reasoning-parser"
+      - "qwen3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  # CPU-only — deliberately not given a GPU reservation, per the "keep the
+  # GPU clean for the chat model" instruction above. Threads/KV-cache space
+  # are capped conservatively (this is a 0.6B embedding model, not the chat
+  # model) so it doesn't starve the app container or the GPU driver's own
+  # host-side overhead on this 8-core/16-thread 3700x.
+  vllm-embed:
+    image: vllm/vllm-openai-cpu:latest
+    command:
+      - "--model"
+      - "Qwen/Qwen3-Embedding-0.6B"
+      - "--convert"
+      - "embed"
+    environment:
+      VLLM_CPU_KVCACHE_SPACE: "2"
+      VLLM_CPU_OMP_THREADS_BIND: "0-3"
+    privileged: true    # matches vLLM's own documented CPU-image invocation
+    shm_size: "4g"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  app:
+    environment:
+      VLLM_BASE_URL: http://vllm-chat:8000/v1
+      VLLM_EMBED_BASE_URL: http://vllm-embed:8000/v1
+    depends_on:
+      vllm-chat:
+        condition: service_started
+      vllm-embed:
+        condition: service_started
+
+volumes:
+  hf-cache:

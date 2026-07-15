@@ -52,7 +52,37 @@ WEAPONS: dict[str, dict] = {
                          "category": "martial", "weapon_type": "ranged", "properties": ["ammunition", "heavy", "two-handed"], "versatile_damage_dice": None, "mastery": "slow", "weight_lbs": 2, "value_gp": 50},
     "Light Crossbow":  {"damage_dice": "1d8",  "damage_type": DamageType.PIERCING,    "range_ft": "80/320", "finesse": False,
                          "category": "simple", "weapon_type": "ranged", "properties": ["ammunition", "loading", "two-handed"], "versatile_damage_dice": None, "mastery": "slow", "weight_lbs": 5, "value_gp": 25},
+    "Sickle":          {"damage_dice": "1d4",  "damage_type": DamageType.SLASHING,    "range_ft": "5",      "finesse": False,
+                         "category": "simple", "weapon_type": "melee", "properties": ["light"], "versatile_damage_dice": None, "mastery": "nick", "weight_lbs": 2, "value_gp": 1},
+    "Spear":           {"damage_dice": "1d6",  "damage_type": DamageType.PIERCING,    "range_ft": "20/60",  "finesse": False,
+                         "category": "simple", "weapon_type": "melee", "properties": ["thrown", "versatile"], "versatile_damage_dice": "1d8", "mastery": "sap", "weight_lbs": 3, "value_gp": 1},
+    "Greatsword":      {"damage_dice": "2d6",  "damage_type": DamageType.SLASHING,    "range_ft": "5",      "finesse": False,
+                         "category": "martial", "weapon_type": "melee", "properties": ["heavy", "two-handed"], "versatile_damage_dice": None, "mastery": "graze", "weight_lbs": 6, "value_gp": 50},
+    "Flail":           {"damage_dice": "1d8",  "damage_type": DamageType.BLUDGEONING, "range_ft": "5",      "finesse": False,
+                         "category": "martial", "weapon_type": "melee", "properties": [], "versatile_damage_dice": None, "mastery": "sap", "weight_lbs": 2, "value_gp": 10},
+    "Javelin":         {"damage_dice": "1d6",  "damage_type": DamageType.PIERCING,    "range_ft": "30/120", "finesse": False,
+                         "category": "simple", "weapon_type": "melee", "properties": ["thrown"], "versatile_damage_dice": None, "mastery": "slow", "weight_lbs": 2, "value_gp": 0.5},
+    # Real reach weapons (the "reach" property doubles melee reach to 10 ft,
+    # see weapon_reach_ft below) — not used by any default STARTING_KITS
+    # entry, added for add_weapon_attack/create_magic_item lookups and
+    # opportunity-attack reach calculation.
+    "Glaive":          {"damage_dice": "1d10", "damage_type": DamageType.SLASHING,    "range_ft": "5",      "finesse": False,
+                         "category": "martial", "weapon_type": "melee", "properties": ["heavy", "reach", "two-handed"], "versatile_damage_dice": None, "mastery": "graze", "weight_lbs": 6, "value_gp": 20},
+    "Halberd":         {"damage_dice": "1d10", "damage_type": DamageType.SLASHING,    "range_ft": "5",      "finesse": False,
+                         "category": "martial", "weapon_type": "melee", "properties": ["heavy", "reach", "two-handed"], "versatile_damage_dice": None, "mastery": "cleave", "weight_lbs": 6, "value_gp": 20},
+    "Lance":           {"damage_dice": "1d10", "damage_type": DamageType.PIERCING,    "range_ft": "5",      "finesse": False,
+                         "category": "martial", "weapon_type": "melee", "properties": ["heavy", "reach", "two-handed"], "versatile_damage_dice": None, "mastery": "topple", "weight_lbs": 6, "value_gp": 10},
+    "Pike":            {"damage_dice": "1d10", "damage_type": DamageType.PIERCING,    "range_ft": "5",      "finesse": False,
+                         "category": "martial", "weapon_type": "melee", "properties": ["heavy", "reach", "two-handed"], "versatile_damage_dice": None, "mastery": "push", "weight_lbs": 18, "value_gp": 5},
 }
+
+
+def weapon_reach_ft(weapon: dict) -> int:
+    """10 ft for a real reach weapon (Glaive/Halberd/Lance/Pike — the
+    'reach' property), 5 ft standard melee reach otherwise. Used wherever
+    an Attack gets built from a WEAPONS entry (chargen, add_weapon_attack,
+    create_magic_item) so Attack.reach_ft reflects the real weapon."""
+    return 10 if "reach" in weapon.get("properties", []) else 5
 
 # A weapon's range_ft containing "/" (short/long range, e.g. "80/320") marks
 # it ranged — ranged weapons always use DEX for to-hit regardless of the
@@ -68,23 +98,27 @@ ARMOR: dict[str, dict] = {
 
 SHIELD_AC_BONUS = 2
 
-# One default kit per class. "weapon" becomes the character's one starting
-# Attack; "gear" items are flavor/utility only (no mechanical stats) — a
-# class that traditionally gets two weapons (e.g. Rogue's rapier + shortbow)
-# only gets one as a real Attack, the other listed as gear. Good enough to
-# guarantee "not empty-handed"; players can equip alternates via the
-# in-game economy tools if they want more.
+# One default kit per class, matching each class's real 2024 PHB "Choose A or
+# B" Starting Equipment row, Option A — transcribed and cross-checked directly
+# against the in-repo PHB text (docs/source/core/D&D 5.5E - Player's
+# Handbook.md), same discipline as WEAPONS/ARMOR above and spells.py.
+# "weapon" becomes the character's one mechanical Attack; "gear" carries
+# everything else Option A grants (including any second/third weapon a class
+# gets, e.g. Rogue's shortbow+dagger alongside its shortsword) as flavor/
+# utility items with no separate mechanical stats. Good enough to guarantee
+# "not empty-handed, with the real Option A loadout"; players can equip
+# alternates via the in-game economy tools if they want more.
 STARTING_KITS: dict[str, dict] = {
-    "Barbarian": {"weapon": "Greataxe",      "armor": None,             "shield": False, "gear": ["Explorer's Pack", "Javelin (x4)"],                       "gold": 10},
-    "Bard":      {"weapon": "Rapier",        "armor": "Leather Armor",  "shield": False, "gear": ["Diplomat's Pack", "Lute"],                                "gold": 15},
-    "Cleric":    {"weapon": "Mace",          "armor": "Scale Mail",     "shield": True,  "gear": ["Priest's Pack", "Holy Symbol"],                           "gold": 10},
-    "Druid":     {"weapon": "Scimitar",      "armor": "Leather Armor",  "shield": True,  "gear": ["Explorer's Pack", "Druidic Focus (Sprig of Mistletoe)"], "gold": 10},
-    "Fighter":   {"weapon": "Longsword",     "armor": "Chain Mail",     "shield": True,  "gear": ["Explorer's Pack"],                                        "gold": 10},
-    "Monk":      {"weapon": "Quarterstaff",  "armor": None,             "shield": False, "gear": ["Explorer's Pack", "Darts (x10)"],                         "gold": 5},
-    "Paladin":   {"weapon": "Longsword",     "armor": "Chain Mail",     "shield": True,  "gear": ["Priest's Pack", "Holy Symbol"],                           "gold": 10},
-    "Ranger":    {"weapon": "Shortbow",      "armor": "Leather Armor",  "shield": False, "gear": ["Explorer's Pack", "Quiver of 20 Arrows"],                 "gold": 10},
-    "Rogue":     {"weapon": "Rapier",        "armor": "Leather Armor",  "shield": False, "gear": ["Burglar's Pack", "Thieves' Tools", "Shortbow"],           "gold": 10},
-    "Sorcerer":  {"weapon": "Dagger",        "armor": None,             "shield": False, "gear": ["Dungeoneer's Pack", "Arcane Focus (Crystal)"],            "gold": 15},
-    "Warlock":   {"weapon": "Light Crossbow","armor": "Leather Armor",  "shield": False, "gear": ["Scholar's Pack", "Arcane Focus (Rod)"],                   "gold": 15},
-    "Wizard":    {"weapon": "Quarterstaff",  "armor": None,             "shield": False, "gear": ["Scholar's Pack", "Spellbook", "Arcane Focus (Wand)"],     "gold": 15},
+    "Barbarian": {"weapon": "Greataxe",    "armor": None,             "shield": False, "gear": ["Explorer's Pack", "Handaxe (x4)"],                                                      "gold": 15},
+    "Bard":      {"weapon": "Dagger",      "armor": "Leather Armor",  "shield": False, "gear": ["Entertainer's Pack", "Musical Instrument", "Dagger"],                                   "gold": 19},
+    "Cleric":    {"weapon": "Mace",        "armor": "Chain Shirt",    "shield": True,  "gear": ["Priest's Pack", "Holy Symbol"],                                                         "gold": 7},
+    "Druid":     {"weapon": "Sickle",      "armor": "Leather Armor",  "shield": True,  "gear": ["Explorer's Pack", "Herbalism Kit", "Druidic Focus (Quarterstaff)"],                     "gold": 9},
+    "Fighter":   {"weapon": "Greatsword",  "armor": "Chain Mail",     "shield": False, "gear": ["Dungeoneer's Pack", "Flail", "Javelin (x8)"],                                           "gold": 4},
+    "Monk":      {"weapon": "Spear",       "armor": None,             "shield": False, "gear": ["Explorer's Pack", "Dagger (x5)", "Artisan's Tools or Musical Instrument"],             "gold": 11},
+    "Paladin":   {"weapon": "Longsword",   "armor": "Chain Mail",     "shield": True,  "gear": ["Priest's Pack", "Holy Symbol", "Javelin (x6)"],                                         "gold": 9},
+    "Ranger":    {"weapon": "Longbow",     "armor": "Studded Leather","shield": False, "gear": ["Explorer's Pack", "Quiver of 20 Arrows", "Scimitar", "Shortsword", "Druidic Focus (Sprig of Mistletoe)"], "gold": 7},
+    "Rogue":     {"weapon": "Shortsword",  "armor": "Leather Armor",  "shield": False, "gear": ["Burglar's Pack", "Thieves' Tools", "Shortbow", "Quiver of 20 Arrows", "Dagger (x2)"],   "gold": 8},
+    "Sorcerer":  {"weapon": "Dagger",      "armor": None,             "shield": False, "gear": ["Dungeoneer's Pack", "Arcane Focus (Crystal)", "Spear", "Dagger"],                       "gold": 28},
+    "Warlock":   {"weapon": "Dagger",      "armor": "Leather Armor",  "shield": False, "gear": ["Scholar's Pack", "Arcane Focus (Orb)", "Book (Occult Lore)", "Sickle", "Dagger"],       "gold": 15},
+    "Wizard":    {"weapon": "Dagger",      "armor": None,             "shield": False, "gear": ["Scholar's Pack", "Spellbook", "Robe", "Arcane Focus (Quarterstaff)", "Dagger"],         "gold": 5},
 }

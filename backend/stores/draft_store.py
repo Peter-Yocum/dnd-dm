@@ -17,6 +17,7 @@ def _empty() -> dict:
         "background": "",
         "alignment": "",
         "appearance": "",
+        "pronouns": "",
         "strength": 0,
         "dexterity": 0,
         "constitution": 0,

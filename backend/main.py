@@ -34,7 +34,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
@@ -67,11 +67,13 @@ from backend.data.equipment import ARMOR, WEAPONS
 from backend.data.fivee_options import CLASSES
 from backend.locks import campaign_write_lock
 from backend.models import Campaign, CoverType, Session, ZoneType
+from backend.map_render import classify_symbol, render_grid, render_grid_fogged
 from backend.rag.reranker import LLMJudgeReranker
+from backend.session_export import render_session_export_markdown
 from backend.tools._helpers import (
     apply_long_rest, apply_short_rest, assign_container_currency, assign_container_item,
-    find_char, find_container_by_id, find_item_anywhere, find_location, find_npc, read_adventure_meta,
-    spell_action_type,
+    find_char, find_combatant, find_container_by_id, find_item_anywhere, find_location, find_npc,
+    read_adventure_meta, spell_action_type,
 )
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import draft_store
@@ -440,6 +442,51 @@ async def end_session(campaign_id: str, thread_id: str = Form(...)):
     })
 
 
+@app.get("/campaigns/{campaign_id}/maps", response_class=HTMLResponse)
+async def maps_index(request: Request, campaign_id: str, location_id: str = ""):
+    """Persistent world-map browser — every Location the party has visited
+    or unlocked via a purchased/found map item (Location.visited/map_known),
+    any scale. Not gated to combat; see backend/map_render.py for the
+    colored-grid rendering and design.md's mapping-cluster section."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    known = [l for l in campaign.locations if l.visited or l.map_known]
+    known.sort(key=lambda l: (l.scale.value, l.name))
+
+    selected = next((l for l in known if l.id == location_id), None) if location_id else None
+    if not selected and known:
+        selected = next((l for l in known if l.id == campaign.current_location_id), known[0])
+
+    rendered_grid = None
+    if selected and selected.grid:
+        if selected.revealed_positions:
+            rendered_grid = render_grid_fogged(selected.grid, selected.legend, selected.revealed_positions)
+        else:
+            rendered_grid = render_grid(selected.grid, selected.legend)
+    legend_entries = (
+        [{"symbol": sym, "meaning": meaning, "kind": classify_symbol(sym, selected.legend)}
+         for sym, meaning in selected.legend.items()]
+        if selected else []
+    )
+    zoom_links = []
+    if selected:
+        known_ids = {l.id for l in known}
+        zoom_links = [c for c in selected.connections if c.to_location_id in known_ids]
+
+    return templates.TemplateResponse(
+        request, "maps.html", {
+            "campaign": campaign,
+            "locations": known,
+            "selected": selected,
+            "rendered_grid": rendered_grid,
+            "legend_entries": legend_entries,
+            "zoom_links": zoom_links,
+        }
+    )
+
+
 @app.get("/campaigns/{campaign_id}/sessions", response_class=HTMLResponse)
 async def sessions_list(request: Request, campaign_id: str):
     campaign = await _store().load(campaign_id)
@@ -474,6 +521,23 @@ async def session_detail(request: Request, campaign_id: str, session_id: str):
             "selected": session,
             "transcript": transcript,
         }
+    )
+
+
+@app.get("/campaigns/{campaign_id}/sessions/export/markdown")
+async def sessions_export_markdown(campaign_id: str):
+    """Downloadable markdown covering every recorded Session, oldest first —
+    see backend/session_export.py. No PDF yet (design.md's Planned Future
+    Features note) — markdown alone covers the "get a readable session log
+    out of the app" need without a new rendering dependency."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    body = render_session_export_markdown(campaign)
+    filename = re.sub(r"[^a-z0-9]+", "-", campaign.name.lower()).strip("-") or "campaign"
+    return PlainTextResponse(
+        body, media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}-session-log.md"'},
     )
 
 
@@ -701,6 +765,51 @@ async def get_combat_turn_options(campaign_id: str, character_id: str):
         "spells": spells,
         "zones": [z.value for z in ZoneType],
         "covers": [c.value for c in CoverType],
+    })
+
+
+@app.get("/campaigns/{campaign_id}/combat-map")
+async def get_combat_map(campaign_id: str):
+    """Real-time battlefield terrain + combatant positions for the live
+    combat-map sidebar panel (game.html) — polled the same way as
+    combat-status/combat-turn-options (page load + SSE "done"), not on a
+    timer. No fog-of-war here (see render_grid_fogged/the Maps browser
+    route above) — this is situational awareness for a fight the party is
+    already in, not exploration secrecy."""
+    campaign = await _store().load(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    enc = campaign.active_encounter
+    if not enc or not enc.is_active:
+        return JSONResponse({"has_grid": False})
+
+    loc = next((l for l in campaign.locations if l.id == campaign.current_location_id), None)
+    if not loc or not loc.grid:
+        return JSONResponse({"has_grid": False})
+
+    combatants = []
+    for entry in enc.initiative_order:
+        pos = next((p for p in enc.combatant_positions if p.name.lower() == entry.name.lower()), None)
+        if not pos or not pos.coordinates:
+            continue
+        combatant = find_combatant(campaign, entry.name)
+        hp_pct = (
+            combatant.current_hp / combatant.max_hp
+            if combatant and getattr(combatant, "max_hp", 0) else 1.0
+        )
+        combatants.append({
+            "name": entry.name,
+            "x": pos.coordinates[0],
+            "y": pos.coordinates[1],
+            "side": entry.side,
+            "is_current_turn": entry.is_current_turn,
+            "hp_pct": round(hp_pct, 2),
+        })
+
+    return JSONResponse({
+        "has_grid": True,
+        "rendered_grid": render_grid(loc.grid, loc.legend),
+        "combatants": combatants,
     })
 
 

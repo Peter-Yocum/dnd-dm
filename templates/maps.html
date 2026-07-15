@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Maps — {{ campaign.name }}{% endblock %}
+
+{% block content %}
+<div class="sessions-layout">
+
+  <!-- ── location list ────────────────────────────────────────────── -->
+  <aside class="sessions-sidebar">
+    <div class="sessions-header">
+      <a href="/campaigns/{{ campaign.id }}" class="btn-ghost btn-sm">← Back to Game</a>
+      <h2>{{ campaign.name }} — Maps</h2>
+      <p class="text-dim">{{ locations | length }} location{% if locations | length != 1 %}s{% endif %} known</p>
+    </div>
+
+    <ul class="session-list">
+      {% for loc in locations %}
+      <li class="session-item {% if selected and selected.id == loc.id %}active{% endif %}">
+        <a href="/campaigns/{{ campaign.id }}/maps?location_id={{ loc.id }}">
+          <span class="session-num">{{ loc.name }}</span>
+          <span class="session-date">{{ loc.scale.value | title }}{% if not loc.grid %} · no grid drawn{% endif %}</span>
+        </a>
+      </li>
+      {% else %}
+      <li class="empty">No locations discovered yet — visit somewhere, or acquire a map.</li>
+      {% endfor %}
+    </ul>
+  </aside>
+
+  <!-- ── map detail ───────────────────────────────────────────────── -->
+  <main class="session-detail">
+    {% if selected %}
+
+    <div class="session-detail-header">
+      <h2>{{ selected.name }}</h2>
+      <span class="session-date">{{ selected.scale.value | title }}</span>
+    </div>
+
+    {% if rendered_grid %}
+    <section class="detail-section">
+      <div class="map-grid">
+        {% for row in rendered_grid %}
+        <div class="map-row">
+          {% for cell in row %}
+          <span class="map-cell map-cell-{{ cell.kind }}">{{ cell.symbol }}</span>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+      {% if legend_entries %}
+      <div class="map-legend">
+        {% for entry in legend_entries %}
+        <span class="map-legend-item">
+          <span class="map-cell map-cell-{{ entry.kind }}">{{ entry.symbol }}</span>
+          {{ entry.meaning }}
+        </span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+    {% else %}
+    <section class="detail-section">
+      <p class="text-dim">No grid has been drawn for this location yet.</p>
+    </section>
+    {% endif %}
+
+    {% if selected.description %}
+    <section class="detail-section">
+      <h3>Description</h3>
+      <p>{{ selected.description }}</p>
+    </section>
+    {% endif %}
+
+    {% if zoom_links %}
+    <section class="detail-section">
+      <h3>Connected Locations</h3>
+      <ul class="key-events-list">
+        {% for conn in zoom_links %}
+        <li>
+          <a href="/campaigns/{{ campaign.id }}/maps?location_id={{ conn.to_location_id }}">
+            {{ conn.direction ~ " → " if conn.direction }}{{ conn.to_location_name }}
+          </a>
+          {% if conn.distance_miles %}<span class="text-dim"> ({{ conn.distance_miles }} mi)</span>
+          {% elif conn.distance_ft %}<span class="text-dim"> ({{ conn.distance_ft }} ft)</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% else %}
+    <div class="detail-empty">
+      <p>No locations discovered yet. Visiting a place, or acquiring a map of one, adds it here.</p>
+    </div>
+    {% endif %}
+  </main>
+
+</div>
+{% endblock %}

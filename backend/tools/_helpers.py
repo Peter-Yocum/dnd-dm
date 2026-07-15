@@ -4,8 +4,10 @@ import random
 import re
 from pathlib import Path
 
-from backend.data.equipment import ARMOR, SHIELD_AC_BONUS, STARTING_KITS, WEAPONS
-from backend.data.fivee_options import CLASSES, HIT_DICE, STARTING_SPELL_SLOTS
+from backend.data.equipment import ARMOR, SHIELD_AC_BONUS, STARTING_KITS, WEAPONS, weapon_reach_ft
+from backend.data.fivee_options import (
+    CLASSES, HIT_DICE, STARTING_SPELL_SLOTS, SUBCLASSES, SUBCLASS_BONUS_SPELLS, SUBCLASS_FEATURES,
+)
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS, SPELL_REQUIREMENTS, SPELLCASTING_ABILITY
 from backend.models import (
     AbilityScores, Attack, Campaign, Character, Container, Currency, DamageType, Encounter,
@@ -87,6 +89,20 @@ def find_quest(campaign: Campaign, name: str) -> Quest | None:
 def find_location(campaign: Campaign, name: str) -> Location | None:
     n = name.lower()
     return next((l for l in campaign.locations if l.name.lower() == n), None)
+
+
+def apply_map_reveal_if_needed(campaign: Campaign, item: Item) -> None:
+    """If `item` is a map (Item.is_map + map_location_id), mark the linked
+    Location map_known=True — unlocks it in the Maps browser without the
+    party having physically visited. No-op for a non-map item or a
+    map_location_id that doesn't resolve to a real Location. Call whenever
+    an item lands in a character's inventory (see add_item_to_character,
+    party.py). Mutates in place; caller owns the store.save() call."""
+    if not item.is_map or not item.map_location_id:
+        return
+    loc = next((l for l in campaign.locations if l.id == item.map_location_id), None)
+    if loc:
+        loc.map_known = True
 
 
 def find_container(campaign: Campaign, name: str) -> Container | None:
@@ -345,6 +361,7 @@ def _starting_equipment(ab: AbilityScores, char_class: str, dex_mod: int, str_mo
         damage_dice=with_ability_mod(weapon["damage_dice"], to_hit_mod),
         damage_type=weapon["damage_type"],
         range_ft=weapon["range_ft"],
+        reach_ft=weapon_reach_ft(weapon),
     ), unarmed_strike_attack(str_mod)]
 
     inventory = [Item(name=weapon_name)]
@@ -487,6 +504,59 @@ def build_spells_known(char_class: str, chosen_names: list[str]) -> tuple[list[S
 
     names = [s.name for s in resolved]
     return resolved, names, None
+
+
+def validate_subclass(char_class: str, subclass: str | None) -> tuple[str | None, str | None]:
+    """Case-insensitively check a chosen subclass against SUBCLASSES[char_class]
+    (fivee_options.py). Returns (normalized_subclass, error_or_None) — the
+    canonical-cased name on a match, so "battle master" and "Battle Master"
+    both store identically. Deliberately soft, not a hard universe: an
+    unset subclass, a class this table doesn't cover (homebrew/other-book),
+    or a class with no SUBCLASSES entry all pass through unchanged with no
+    error — this only catches a name that doesn't match this class's real
+    2024 PHB options, the same "SPELL_MENUS validates spell choices without
+    claiming to be the only spells that exist" spirit as build_spells_known."""
+    if not subclass or not subclass.strip():
+        return subclass, None
+    options = SUBCLASSES.get(char_class)
+    if not options:
+        return subclass, None
+    canonical = next((o for o in options if o.lower() == subclass.strip().lower()), None)
+    if canonical is None:
+        return subclass, f"'{subclass}' isn't a real {char_class} subclass. Options: {', '.join(options)}."
+    return canonical, None
+
+
+def apply_subclass_features(char: Character) -> None:
+    """Grant real subclass mechanical-feature text (SUBCLASS_FEATURES,
+    fivee_options.py) and any bonus always-prepared spells
+    (SUBCLASS_BONUS_SPELLS) for every level up to char.level that this
+    subclass unlocks — currently level 3 only, see SUBCLASS_FEATURES' module
+    comment for scope. Idempotent: skips any feature string already present
+    in char.features and any spell already in char.spells_prepared, so
+    calling this again on a re-level or a resave is always safe. No-op for
+    an unset/unrecognized subclass or one with no data in either table —
+    same soft-fail philosophy as validate_subclass."""
+    by_level = SUBCLASS_FEATURES.get(char.char_class, {}).get(char.subclass or "", {})
+    for level, texts in by_level.items():
+        if char.level < level:
+            continue
+        for text in texts:
+            if text not in char.features:
+                char.features.append(text)
+
+    bonus_spells = SUBCLASS_BONUS_SPELLS.get(char.char_class, {}).get(char.subclass or "", {})
+    for level, names in bonus_spells.items():
+        if char.level < level:
+            continue
+        for name in names:
+            spell = ALL_SPELLS.get(name)
+            if spell is None:
+                continue  # not in the curated subset — see SUBCLASS_BONUS_SPELLS' module comment
+            if name not in char.spells_prepared:
+                char.spells_prepared.append(name)
+            if not any(s.name == name for s in char.spells_known):
+                char.spells_known.append(spell.model_copy())
 
 
 def char_summary(char: Character) -> str:
@@ -703,6 +773,102 @@ def apply_damage_to_monster(monster: Monster, amount: int) -> str:
     if monster.current_hp == 0:
         msg += " — DEFEATED"
     return msg
+
+
+def apply_damage_to_npc(npc: NPC, amount: int) -> str:
+    """Apply damage (negative amount) or healing (positive amount) to an NPC's
+    combat_stats. Mutates `npc` in place; does not save — callers own the
+    store.save() call. Added 2026-07-13: NPC.combat_stats/CombatantType.NPC
+    existed since the combat-resolution refactor but nothing ever wrote to it
+    (see design.md's deferred list) — this closes that gap, mirroring
+    apply_damage_to_character/_monster exactly (no death-save tracking, same
+    as monsters — NPCs don't get PC-style downed/dying states in this app)."""
+    if npc.combat_stats is None:
+        return f"{npc.name} has no combat_stats set — not currently modeled as able to fight."
+    prev = npc.combat_stats.current_hp
+    npc.combat_stats.current_hp = max(0, min(npc.combat_stats.max_hp, npc.combat_stats.current_hp + amount))
+    msg = f"{npc.name}: {prev} → {npc.combat_stats.current_hp} HP"
+    if npc.combat_stats.current_hp == 0:
+        msg += " — DEFEATED"
+    return msg
+
+
+def find_combatant(campaign: Campaign, name: str) -> Character | NPC | Monster | None:
+    """Look up any combat-capable entity by name — a Character (PC or DM
+    companion), an NPC with combat_stats set, or a Monster. Centralizes the
+    3-way lookup so resolution/combat tools don't each reimplement (and each
+    risk dropping) one of the three types. An NPC with no combat_stats is
+    deliberately excluded here (falls through to find_monster, which will
+    also miss — same "not found" result as before this NPC support existed)
+    rather than returned with meaningless ac=10/max_hp=1 defaults; use
+    find_npc() directly for non-combat NPC lookups."""
+    char = find_char(campaign, name)
+    if char:
+        return char
+    npc = find_npc(campaign, name)
+    if npc and npc.combat_stats is not None:
+        return npc
+    return find_monster(campaign, name)
+
+
+def apply_damage_to_combatant(target: Character | NPC | Monster, amount: int, is_critical: bool = False) -> str:
+    """Dispatches to apply_damage_to_character/_npc/_monster based on target's
+    real type. is_critical only matters for Character (death-save-failure
+    counting while downed) — NPCs and Monsters ignore it, same as their
+    individual functions always have."""
+    if isinstance(target, Character):
+        return apply_damage_to_character(target, amount, is_critical=is_critical)
+    if isinstance(target, NPC):
+        return apply_damage_to_npc(target, amount)
+    return apply_damage_to_monster(target, amount)
+
+
+def _is_hostile_pair(a_side: str, b_side: str) -> bool:
+    """Whether two InitiativeEntry.side values are opposing sides, for
+    opportunity attacks. Added 2026-07-13 — InitiativeEntry.side ("party" |
+    "hostile", set from start_encounter's per-combatant "side" key,
+    defaulting by combatant_type when omitted) replaces an earlier
+    Character-vs-Monster-only check that silently excluded NPCs (no way to
+    know an NPC's allegiance without this field). An NPC now participates
+    correctly on whichever side start_encounter says it's on."""
+    return {a_side, b_side} == {"party", "hostile"}
+
+
+def check_opportunity_attacks(
+    campaign: Campaign, mover_name: str, old_xy: tuple[int, int], new_xy: tuple[int, int],
+) -> list[str]:
+    """Real (x, y) distance check for opportunity attacks — no zone
+    heuristic. Returns the names of every hostile combatant (see
+    _is_hostile_pair) who was within their own real reach (Chebyshev
+    distance, max(|dx|,|dy|) — standard 5e diagonal-counts-as-5ft — against
+    `Attack.reach_ft` // 5 squares, 5 ft/1 square by default, 10 ft/2 squares
+    for a real reach weapon or long-reach creature) of `old_xy` and is now
+    farther than that from `new_xy`, and who still has a reaction available.
+    Doesn't roll or apply anything itself — see resolve_opportunity_attack
+    (resolution.py) for that."""
+    enc = campaign.active_encounter
+    if not enc or not enc.is_active:
+        return []
+    mover_entry = next((e for e in enc.initiative_order if e.name.lower() == mover_name.lower()), None)
+    if not mover_entry:
+        return []
+
+    qualifying = []
+    for pos in enc.combatant_positions:
+        if pos.name.lower() == mover_name.lower() or pos.coordinates is None:
+            continue
+        other_entry = next((e for e in enc.initiative_order if e.name.lower() == pos.name.lower()), None)
+        if not other_entry or not _is_hostile_pair(mover_entry.side, other_entry.side):
+            continue
+        other = find_combatant(campaign, pos.name)
+        if other is None or getattr(other, "current_hp", 1) <= 0 or not getattr(other, "reaction_available", False):
+            continue
+        reach_squares = max(1, (other.attacks[0].reach_ft if other.attacks else 5) // 5)
+        old_dist = max(abs(pos.coordinates[0] - old_xy[0]), abs(pos.coordinates[1] - old_xy[1]))
+        new_dist = max(abs(pos.coordinates[0] - new_xy[0]), abs(pos.coordinates[1] - new_xy[1]))
+        if old_dist <= reach_squares and new_dist > reach_squares:
+            qualifying.append(pos.name)
+    return qualifying
 
 
 # ─── Reaction gating (resolution.py's resolve_attack pause check) ───────────────

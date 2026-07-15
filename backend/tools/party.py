@@ -2,15 +2,15 @@ import re
 
 from langchain_core.tools import tool
 
-from backend.data.equipment import ARMOR, SHIELD_AC_BONUS, WEAPONS
+from backend.data.equipment import ARMOR, SHIELD_AC_BONUS, WEAPONS, weapon_reach_ft
 from backend.models import ActiveEffect, Attack, ConditionType, Container, Currency, Item, SpellSlotLevel
 from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.graph_store import RelationGraphStore
 from backend.stores.lore_store import LoreStore
 from backend.tools._helpers import (
-    all_campaign_item_names, apply_damage_to_character, char_summary, find_char, find_monster,
-    with_ability_mod,
+    all_campaign_item_names, apply_damage_to_character, apply_map_reveal_if_needed, char_summary,
+    find_char, find_location, find_monster, with_ability_mod,
 )
 from backend.tools.loot_generator import ARMOR_BONUS_RARITY, WEAPON_LIKE_BONUS_RARITY
 
@@ -118,6 +118,33 @@ def make_tools(
         msg = apply_damage_to_character(char, delta)
         await store.save(campaign)
         return msg
+
+    @tool
+    async def update_character_detail(character_name: str, field: str, value: str) -> str:
+        """Update a cosmetic detail on an ALREADY-FINALIZED party member — the
+        in-game counterpart to Session 0's update_character_draft, for a field
+        a player forgot to set (or wants to change) after character creation.
+
+        Supported fields: pronouns, appearance, alignment, notes.
+
+        Deliberately narrow — mechanical fields (race, class, ability scores,
+        equipment, ...) aren't editable here; those cascade into derived
+        stats (HP, AC, spell slots, ...) that this tool doesn't recompute, and
+        changing them mid-campaign is a DM judgment call beyond "fix a
+        forgotten detail." Use CLEAR as the value to blank a field."""
+        campaign = await store.load(campaign_id)
+        char = find_char(campaign, character_name)
+        if not char:
+            return f"No character named '{character_name}' in the party."
+        editable = {"pronouns", "appearance", "alignment", "notes"}
+        key = field.strip().lower()
+        if key not in editable:
+            return f"'{field}' isn't editable here — supported fields: {', '.join(sorted(editable))}."
+        cleared = value.strip().upper() == "CLEAR"
+        new_value = (None if key == "alignment" else "") if cleared else value
+        setattr(char, key, new_value)
+        await store.save(campaign)
+        return f"{char.name}'s {key} set to: {new_value or '(cleared)'}"
 
     @tool
     async def add_condition(character_name: str, condition: str) -> str:
@@ -248,6 +275,7 @@ def make_tools(
     @tool
     async def add_item_to_character(
         character_name: str, item_name: str, quantity: int = 1, force: bool = False,
+        map_of_location: str = "",
     ) -> str:
         """Add an item to a character's inventory. Use when a character picks up,
         purchases, or is given an item. Refuses if item_name is actually currency
@@ -256,7 +284,13 @@ def make_tools(
         campaign (in this campaign or the canon Lore Registry), returns a
         warning instead of adding a possible duplicate item under a slightly
         different name — call lookup_entity to check first, or pass
-        force=True if this is genuinely a different item."""
+        force=True if this is genuinely a different item.
+
+        map_of_location: pass an EXISTING location's name if this item is a
+        map/chart of that place (e.g. "the party buys a hand-drawn map of
+        the sewers") — unlocks that location in the Maps browser without
+        the party needing to physically visit it. Leave blank for an
+        ordinary item."""
         if _CURRENCY_ITEM_RE.match(item_name):
             return (
                 f"'{item_name}' is currency, not a physical item — call "
@@ -267,6 +301,12 @@ def make_tools(
         char = find_char(campaign, character_name)
         if not char:
             return f"No character named '{character_name}' in the party."
+        map_location_id = None
+        if map_of_location:
+            map_loc = find_location(campaign, map_of_location)
+            if not map_loc:
+                return f"No location named '{map_of_location}' found — call create_location first if it's new."
+            map_location_id = map_loc.id
         existing = next((i for i in char.inventory if i.name.lower() == item_name.lower()), None)
         if not existing and not force:
             existing_names = all_campaign_item_names(campaign)
@@ -283,15 +323,21 @@ def make_tools(
             existing.quantity += quantity
             new_item = existing
         else:
-            new_item = Item(name=item_name, quantity=quantity)
+            new_item = Item(
+                name=item_name, quantity=quantity,
+                is_map=bool(map_location_id), map_location_id=map_location_id,
+            )
             char.inventory.append(new_item)
+        apply_map_reveal_if_needed(campaign, new_item)
         _mark_loot_granted(campaign)
         await store.save(campaign)
         if graph_store is not None:
             await graph_store.add_edge(
                 campaign_id, "character", char.id, char.name, "item", new_item.id, new_item.name, "owns",
             )
-        return f"Added {quantity}x {item_name} to {char.name}'s inventory."
+        return f"Added {quantity}x {item_name} to {char.name}'s inventory." + (
+            f" Unlocked '{map_of_location}' in the Maps browser." if map_location_id else ""
+        )
 
     @tool
     async def remove_item_from_character(
@@ -412,6 +458,7 @@ def make_tools(
                 damage_dice=with_ability_mod(weapon["damage_dice"], to_hit_mod + bonus),
                 damage_type=weapon["damage_type"],
                 range_ft=weapon["range_ft"],
+                reach_ft=weapon_reach_ft(weapon),
                 notes=description,
             ))
             result = f"{item_name} added to {char.name}'s attacks (grounded on {base_key})."
@@ -478,6 +525,7 @@ def make_tools(
             damage_type=weapon["damage_type"],
             range_ft=weapon["range_ft"],
             action_type=action_type,
+            reach_ft=weapon_reach_ft(weapon),
         ))
         await store.save(campaign)
         return (
@@ -567,6 +615,7 @@ def make_tools(
         get_character,
         get_unassigned_loot,
         update_character_hp,
+        update_character_detail,
         add_condition,
         remove_condition,
         apply_effect,

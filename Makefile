@@ -2,7 +2,26 @@
 
 ## ── Services ──────────────────────────────────────────────────────────────────
 
+## Platform-aware entrypoint. On Apple Silicon, starts the native vLLM-metal
+## chat+embed processes (left running — NOT torn down after, unlike the
+## transient vllm-up usage inside index/recontextualize below) before
+## bringing up db+app; on Linux, just warns if the GPU host's one-time
+## docker-compose.override.yml symlink (see docker-compose.gpu.yml's header
+## comment) is missing, since without it `docker compose up` would silently
+## try to reach vLLM/embeddings at host.docker.internal instead of the
+## containerized services. Either way, plain `docker compose up` (what the
+## auto-deploy watcher already runs) works too — this target is a
+## convenience for local dev, not a requirement.
 up:
+ifeq ($(shell uname -s),Darwin)
+	$(MAKE) --no-print-directory vllm-up
+else
+	@if command -v nvidia-smi >/dev/null 2>&1 && [ ! -e docker-compose.override.yml ]; then \
+		echo "NVIDIA GPU detected but docker-compose.override.yml is missing —"; \
+		echo "run: ln -s docker-compose.gpu.yml docker-compose.override.yml"; \
+		echo "(see docker-compose.gpu.yml's header comment). Continuing without it..."; \
+	fi
+endif
 	docker compose up -d
 
 down:
@@ -48,6 +67,15 @@ shell:
 ## [k="expression"] to filter (pytest -k).
 test:
 	docker compose exec app python -m pytest -v $(if $(k),-k "$(k)",)
+
+## Build/rebuild the "QA Test Campaign" — a small building scenario (grid
+## maps, chargen with pronouns/subclass validation, ability checks, combat
+## with opportunity attacks, loot, a level-up, fog-of-war, session export)
+## exercising the mapping/opportunity-attack features end to end. Safe to
+## re-run — deletes the previous QA campaign first. Leaves the campaign in
+## Postgres afterward so you can open it in the browser (prints the links).
+qa-campaign:
+	docker compose exec app python scripts/qa_smoke_test.py
 
 ## Tear down all containers + volumes, start fresh, and run migrations.
 fresh:

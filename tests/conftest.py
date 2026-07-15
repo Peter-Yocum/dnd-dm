@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.config import settings
 from backend.models import (
-    AbilityScores, Campaign, Character, CombatantType, Encounter, InitiativeEntry, Monster,
+    AbilityScores, Campaign, Character, CombatantType, CombatStatBlock, Encounter, InitiativeEntry,
+    Monster, NPC,
 )
 from backend.stores.campaign_store import CampaignStore
 
@@ -58,6 +59,22 @@ def make_monster(name: str, **overrides) -> Monster:
     defaults = dict(name=name, max_hp=7, current_hp=7, ac=13)
     defaults.update(overrides)
     return Monster(**defaults)
+
+
+def make_combat_npc(name: str, **overrides) -> NPC:
+    """An NPC with combat_stats set — the shape find_combatant() will actually
+    return as a fightable target/attacker (a bare NPC() with no combat_stats
+    is deliberately excluded there, see _helpers.py)."""
+    stat_block_fields = {
+        "max_hp", "current_hp", "ac", "speed", "ability_scores", "attacks",
+        "damage_resistances", "damage_immunities", "condition_immunities", "cr",
+        "saving_throw_bonuses", "skill_bonuses", "conditions",
+    }
+    stat_defaults = dict(max_hp=11, current_hp=11, ac=13, ability_scores=AbilityScores())
+    stat_overrides = {k: v for k, v in overrides.items() if k in stat_block_fields}
+    stat_defaults.update(stat_overrides)
+    npc_overrides = {k: v for k, v in overrides.items() if k not in stat_block_fields}
+    return NPC(name=name, combat_stats=CombatStatBlock(**stat_defaults), **npc_overrides)
 
 
 def start_combat(campaign: Campaign, combatants: list[tuple[str, str, int]]) -> Encounter:

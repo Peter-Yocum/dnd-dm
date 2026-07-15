@@ -1,6 +1,11 @@
 # Environment
 .env
 .venv/
+
+# Per-host Compose override — see docker-compose.gpu.yml's header comment.
+# A GPU host symlinks docker-compose.gpu.yml to this name; a Mac dev
+# checkout never has one. Either way it's machine-specific, never committed.
+docker-compose.override.yml
 __pycache__/
 *.pyc
 *.pyo

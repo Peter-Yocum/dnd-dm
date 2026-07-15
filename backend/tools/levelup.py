@@ -17,7 +17,7 @@ from backend.data.fivee_options import HIT_DICE, SPELL_SLOTS_BY_LEVEL, proficien
 from backend.data.spells import ALL_SPELLS, SPELL_MENUS
 from backend.models import SpellSlotLevel
 from backend.stores.campaign_store import CampaignStore
-from backend.tools._helpers import derive_spellcasting_stats, find_char
+from backend.tools._helpers import apply_subclass_features, derive_spellcasting_stats, find_char, validate_subclass
 
 
 def make_tools(campaign_id: str, store: CampaignStore) -> list:
@@ -88,6 +88,10 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
                 if dupes:
                     return f"{char.name} already knows: {', '.join(dupes)}."
 
+        subclass, subclass_err = validate_subclass(char.char_class, subclass)
+        if subclass_err:
+            return f"Cannot level up — {subclass_err}"
+
         levels_gained = new_level - char.level
         hit_die = HIT_DICE.get(char.char_class, 8)
         con_mod = char.ability_scores.modifier(char.ability_scores.constitution)
@@ -129,6 +133,12 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         if subclass:
             char.subclass = subclass
             lines.append(f"Subclass: {subclass}")
+
+        prior_features = set(char.features)
+        apply_subclass_features(char)
+        gained = [f for f in char.features if f not in prior_features]
+        if gained:
+            lines.append("New subclass features:\n" + "\n".join(f"- {f}" for f in gained))
 
         await store.save(campaign)
         return "\n".join(lines)

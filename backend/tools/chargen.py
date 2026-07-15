@@ -24,6 +24,7 @@ from backend.stores.campaign_store import CampaignStore
 from backend.stores.draft_store import DraftStore
 from backend.tools._helpers import (
     build_spells_known, derive_level1_stats, derive_saving_throw_proficiencies, derive_spellcasting_stats,
+    apply_subclass_features, validate_subclass,
 )
 
 
@@ -61,6 +62,7 @@ def _build_character(draft: dict) -> Character:
         background=draft.get("background") or None,
         alignment=draft.get("alignment") or None,
         appearance=draft.get("appearance", ""),
+        pronouns=draft.get("pronouns", ""),
         level=1,
         ability_scores=ab,
         proficiency_bonus=2,
@@ -356,6 +358,8 @@ def make_tools(
           appearance  (freeform physical description — what the player pictures: build, face,
             clothing, notable features. Ask for this explicitly; it doesn't fall out of
             mechanical choices the way race/class does.)
+          pronouns  (freeform, e.g. "she/her", "he/him", "they/them". Ask for this explicitly
+            too — never assume from name/race, and never leave it unset.)
           strength, dexterity, constitution, intelligence, wisdom, charisma  (integers)
           skill_proficiencies  (comma-separated, e.g. "Perception, Stealth, Arcana")
           spells_known  (comma-separated, ONLY for a spellcasting class — check
@@ -410,6 +414,9 @@ def make_tools(
 
         appearance = draft.get("appearance", "")
         lines.append(f"  {'appearance':20s}: {appearance or '(not set)'}")
+
+        pronouns = draft.get("pronouns", "")
+        lines.append(f"  {'pronouns':20s}: {pronouns or '(not set)'}")
 
         lines.append("\n  Ability Scores:")
         for stat in ab_scores:
@@ -482,7 +489,17 @@ def make_tools(
                     f"tool calls in your next turn, not just described in your reply."
                 )
 
+        normalized_subclass, subclass_err = validate_subclass(cls, draft.get("subclass"))
+        if subclass_err:
+            return (
+                f"Cannot finalize — {subclass_err} Call update_character_draft('subclass', ...) with "
+                f"a real option. Do NOT call finalize_character again until you have actually done "
+                f"this — these must be real tool calls in your next turn, not just described in your reply."
+            )
+        draft["subclass"] = normalized_subclass
+
         character = _build_character(draft)
+        apply_subclass_features(character)
         campaign = await store.load(campaign_id)
         if not campaign:
             return "Error: campaign not found."

@@ -16,7 +16,7 @@ from backend.models import AbilityScores, Character
 from backend.stores.campaign_store import CampaignStore
 from backend.tools._helpers import (
     build_spells_known, derive_level1_stats, derive_saving_throw_proficiencies, derive_spellcasting_stats,
-    find_npc,
+    apply_subclass_features, find_npc, validate_subclass,
 )
 
 
@@ -40,6 +40,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         spells_known: str = "",
         personality_note: str = "",
         appearance: str = "",
+        pronouns: str = "",
     ) -> str:
         """Create a level-1 DM-controlled companion character and add them
         to the party — for filling the party out toward the adventure's
@@ -69,6 +70,8 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
         appearance: a short physical description — this companion will be
         introduced to the player at the next session opening, so give them
         something visual and specific, not just a name and class.
+        pronouns: e.g. "she/her", "he/him", "they/them" — choose deliberately,
+        don't leave blank or assume from name/race.
         """
         campaign = await store.load(campaign_id)
         if not campaign:
@@ -101,6 +104,13 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
                 f"corrected spells_known list."
             )
 
+        subclass, subclass_err = validate_subclass(char_class, subclass)
+        if subclass_err:
+            return (
+                f"Cannot create {name} — {subclass_err} Call generate_companion_character "
+                f"again with a real option (or leave subclass unset)."
+            )
+
         character = Character(
             name=name,
             race=race,
@@ -109,6 +119,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
             background=background,
             alignment=alignment,
             appearance=appearance,
+            pronouns=pronouns,
             level=1,
             ability_scores=ab,
             proficiency_bonus=2,
@@ -132,6 +143,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list:
             notes=personality_note,
             is_player_controlled=False,
         )
+        apply_subclass_features(character)
 
         campaign.party.append(character)
         await store.save(campaign)

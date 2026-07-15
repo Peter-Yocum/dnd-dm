@@ -10,6 +10,10 @@
       <a href="/campaigns/{{ campaign.id }}" class="btn-ghost btn-sm">← Back to Game</a>
       <h2>{{ campaign.name }}</h2>
       <p class="text-dim">{{ sessions | length }} session{% if sessions | length != 1 %}s{% endif %} recorded</p>
+      <a href="/campaigns/{{ campaign.id }}/maps" class="btn-ghost btn-sm">🗺 Maps</a>
+      {% if sessions %}
+      <a href="/campaigns/{{ campaign.id }}/sessions/export/markdown" class="btn-ghost btn-sm" download>⬇ Export Session Log (.md)</a>
+      {% endif %}
     </div>
 
     <ul class="session-list">

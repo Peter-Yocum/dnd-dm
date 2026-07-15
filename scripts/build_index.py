@@ -71,6 +71,7 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Windows' default console codec (cp1252/"charmap") can't encode the em-dashes/
@@ -328,8 +329,16 @@ def _index_documents(
             batch = [d for d in batch if d["id"] not in existing]
 
         if batch:
-            embed_texts = []
-            for d in batch:
+            # Contextualize all children in this batch CONCURRENTLY, not
+            # sequentially — confirmed live (2026-07-13): a plain for-loop
+            # here left vLLM's engine idle between calls (its own log showed
+            # "Running: 0 reqs" gaps, generation throughput far below what
+            # a single request alone measured), because vLLM's whole design
+            # point is serving many concurrent requests efficiently via
+            # continuous batching — one-at-a-time defeats that entirely.
+            # Real network I/O (httpx under the hood), so a thread pool is
+            # enough; no need to make this whole script async for one loop.
+            def _contextualize_one(d: dict) -> str:
                 if d["meta"]["granularity"] == "child" and contextualizer is not None:
                     # find this child's parent text for situating context —
                     # parent_text is only available at build_documents() time,
@@ -337,9 +346,11 @@ def _index_documents(
                     blurb = contextualizer.contextualize(
                         d["text"], d.get("_parent_text", d["text"]), d["meta"]["book"],
                     )
-                    embed_texts.append(f"{blurb}\n\n{d['text']}" if blurb else d["text"])
-                else:
-                    embed_texts.append(d["text"])
+                    return f"{blurb}\n\n{d['text']}" if blurb else d["text"]
+                return d["text"]
+
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                embed_texts = list(pool.map(_contextualize_one, batch))
 
             # Parent rows are never embedded/searched directly — no dense
             # step needed for them, only children.

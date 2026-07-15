@@ -1,3 +1,11 @@
+# Mac-native default: db + app only. vLLM-metal (chat + embed) runs as
+# native host processes (see Makefile's vllm-up/vllm-down), reached via
+# host.docker.internal below. A GPU Linux host instead symlinks
+# docker-compose.gpu.yml → docker-compose.override.yml (Compose auto-merges
+# that filename with zero flags) to containerize both vLLM processes with
+# NVIDIA GPU passthrough — see that file's header comment for the one-time
+# setup step. Either way, plain `docker compose up` is the only command
+# needed on both platforms.
 services:
   db:
     # pgvector/pgvector:pg16 — same Postgres 16 as before (postgres:16-alpine),

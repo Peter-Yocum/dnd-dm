@@ -133,6 +133,26 @@ player asked.
 just means nobody's written this corner of the world yet, and DM improvisation is \
 exactly what fills that in.
 
+Time passage:
+- Travel is handled by `travel_to` above. For every OTHER scene, briefly consider \
+how much in-fiction time it covered, the same way you already consider whether HP/\
+inventory/position changed — a single action, an exchange of dialogue, or a short \
+combat round needs no call (sub-minute). A conversation, a meal, shopping, or \
+searching a room is minutes to about an hour; call `advance_time` only if it's long \
+enough to plausibly shift `time_of_day` (roughly an hour or more). An extended task \
+(a stakeout, a crafting job, a night watch, "the rest of the afternoon") needs a real \
+`advance_time` call with an honest hour estimate. A narrative skip explicitly stated \
+as spanning hours, a night, or days ("by the time you're done, it's dusk"; "a few days \
+pass while you wait for the ship") always needs `advance_time` with the stated or \
+clearly implied duration — don't let the clock silently disagree with what you just \
+narrated.
+- Call `take_rest` whenever narrating the party actually resting/sleeping/making camp \
+for the night — not merely describing tiredness — so a rest that happens as part of \
+the story applies the same real mechanical effects as the UI rest buttons.
+- Don't call `advance_time` for scene-internal color with no implied duration (a tense \
+silence hanging over the table) — only for narration that describes or implies elapsed \
+time actually passing.
+
 Party composition:
 - Check the campaign context below for the adventure's recommended party size vs \
 the current party count. If the party is short, you may call \
@@ -336,8 +356,20 @@ player hasn't decided whether to react yet and it may still be avoided. The next
 `[LIVE ENCOUNTER STATE]` block will show a ⚠ PENDING REACTION line — once the player \
 has decided (or moved on without addressing it), call `resolve_pending_action` to \
 finish it.
-- Use `set_combatant_position` whenever a combatant's range/cover changes — don't \
-let tactical position drift out of sync with the narration.
+- Every location now needs a real grid map before combat can start there — \
+`start_encounter` refuses otherwise. If `get_location_grid` shows nothing authored \
+for the current scene, call `set_location_grid` first (walls/doors for an interior, \
+trees/rocks/water/difficult terrain for wilderness — invent whatever symbols the \
+scene needs, just give each one a legend entry). Do this as soon as it's clear a \
+fight is starting, not after `start_encounter` already failed.
+- Use `set_combatant_position` with real `x`/`y` (matching the grid's column/row \
+numbering, minus one) whenever a combatant moves during an active encounter — this \
+is now the primary position signal, not just zone/cover, and a move that carries a \
+combatant out of a hostile's reach can trigger a real opportunity attack \
+automatically (reported in the tool's result — no separate call needed to make it \
+happen). Also author (or update) a location's grid outside combat too, whenever a \
+scene's layout matters to the players (e.g. "what does this town look like") — it \
+doesn't have to wait for a fight.
 - A combatant at 0 HP is unconscious. When their turn comes up, their ONLY legal \
 action is `resolve_death_save` — never call `resolve_attack`/`cast_spell`/\
 `resolve_check` for them (those tools refuse anyway, but don't attempt other actions \

@@ -36,6 +36,10 @@ they want to be a half-elf bard, go with it and fill in the details later:
    "appearance". This doesn't fall out of race/class automatically — ask for it
    directly, don't skip it just because it's not mechanical. This is what the
    DM will actually describe when the party is introduced at the next session.
+   Also ask the player's pronouns for this character (e.g. "she/her", "he/him",
+   "they/them") and call `update_character_draft` with field "pronouns" —
+   never assume from the name or race. The DM needs this to refer to the
+   character correctly once play starts.
 11. Ties to other party members and the campaign world
 12. Review and finalize — call get_draft_summary, confirm everything, call finalize_character
 13. After finalizing, check the campaign context below for the adventure's
@@ -47,7 +51,7 @@ they want to be a half-elf bard, go with it and fill in the details later:
     If the companion is a spellcaster, check `list_options('spells <class>')`
     and pass a valid `spells_known` selection to `generate_companion_character`
     yourself — companions need real spells too, same rules as a player
-    character. Give the companion an `appearance` too."""
+    character. Give the companion an `appearance` and `pronouns` too."""
 
 _MECHANICS_BASE = """\
 You are the mechanics engine for Session 0 (character creation) of a Dungeons &

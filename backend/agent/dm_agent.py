@@ -218,7 +218,11 @@ def _make_mechanics_modifier(system_prompt: str, campaign_id: str, store: Campai
                 trimmed = trimmed[1:]
         else:
             trimmed = msgs
-        result = [system_msg] + trimmed
+        result = [system_msg]
+        recap = state.get("session_recap")
+        if recap:
+            result.append(HumanMessage(content=_RECAP_MARKER + recap))
+        result += trimmed
 
         campaign = await store.load(campaign_id)
         if campaign and campaign.active_encounter and campaign.active_encounter.is_active:
@@ -239,6 +243,13 @@ def _make_mechanics_modifier(system_prompt: str, campaign_id: str, store: Campai
 
 
 _INTERNAL_DIRECTIVE_MARKER = "[SESSION START"  # see build_session_kickoff_message
+
+_RECAP_MARKER = (
+    "[SESSION RECAP — internal, not player dialogue. A summary of earlier events "
+    "in this session, for narrative context only; call get_character/"
+    "get_current_location/get_party_status for anything you need to act on "
+    "precisely, don't rely on this recap for exact HP/inventory/position]\n"
+)
 
 
 def _narrative_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -281,7 +292,11 @@ def _make_narrator_modifier(system_prompt: str, campaign_id: str, store: Campaig
     async def modifier(state: dict) -> list[BaseMessage]:
         narrative = _narrative_messages(state["messages"])[-_NARRATOR_MAX_TURNS:]
         notes = state.get("mechanics_notes") or "No mechanical changes this turn."
-        result = [system_msg] + narrative
+        result = [system_msg]
+        recap = state.get("session_recap")
+        if recap:
+            result.append(HumanMessage(content=_RECAP_MARKER + recap))
+        result += narrative
 
         campaign = await store.load(campaign_id)
         if campaign:
@@ -358,6 +373,21 @@ class DMState(TypedDict):
                                         # see stream_response's docstring for why a shared
                                         # recursion_limit across a whole multi-combatant response had
                                         # the same starvation problem one level up.
+    time_guardrail_count: int  # caps retries for _detect_missing_time_advance_followup — own
+                               # separate budget, same starvation-avoidance reason as every other
+                               # counter above (a loot/combat correction spending the turn's one
+                               # correction_count retry shouldn't leave zero budget for a missed
+                               # time-skip check later the same turn).
+    session_recap: str  # rolling mid-session narrative recap (see _maybe_update_session_recap) —
+                         # unlike every counter above, this is NOT reset per combatant/per turn; it
+                         # persists and accumulates for the whole session, only ever replaced by a
+                         # fuller merged recap once the narrator's _NARRATOR_MAX_TURNS window is
+                         # about to trim older narrative turns out of view.
+    session_recap_through: int  # how many narrative turns (from the start of the thread) are
+                                 # already folded into session_recap — lets _maybe_update_session_recap
+                                 # feed the LLM only the NEW turns that just fell out of the
+                                 # narrator's window each time, instead of resending the whole
+                                 # ever-growing pre-window prefix.
 
 
 # Every per-combatant-turn guardrail budget above, zeroed. stream_response
@@ -370,6 +400,7 @@ class DMState(TypedDict):
 _FRESH_GUARDRAIL_BUDGETS = {
     "correction_count": 0, "tool_error_count": 0,
     "lore_guardrail_count": 0, "stalled_turn_guardrail_count": 0,
+    "time_guardrail_count": 0,
 }
 
 
@@ -880,6 +911,56 @@ def _detect_missing_loot_followup(notes: str, called: set[str]) -> str | None:
     )
 
 
+_TIME_ADVANCE_TOOLS = {"advance_time", "take_rest", "travel_to"}
+
+# Phrases implying a narrated time-skip outside travel — a stakeout, an
+# evening in town, explicit "hours/days pass" narration, or resting/making
+# camp. Deliberately phrase-based rather than a tight grammar, same trade-off
+# _LOOT_MENTION_RE makes: some false positives are acceptable, a missed real
+# skip is not (see design.md item #14 — the incident this catches: dusk
+# narrated while campaign.time_of_day stayed stuck on "morning").
+_TIME_SKIP_RE = re.compile(
+    r"\bhours?\s+pass(?:es)?\b"
+    r"|\bdays?\s+pass(?:es)?\b"
+    r"|\ba\s+(?:week|fortnight|month)\s+passes\b"
+    r"|\bby\s+(?:the\s+time|dawn|dusk|morning|nightfall)\b"
+    r"|\b(?:the\s+)?(?:next|following)\s+(?:morning|day|night)\b"
+    r"|\bnightfall\s+(?:falls|comes)\b"
+    r"|\bdusk\s+falls\b"
+    r"|\b(?:the\s+)?rest\s+of\s+the\s+(?:afternoon|day|evening|night)\b"
+    r"|\b(?:make|makes|making)\s+camp\b"
+    r"|\b(?:takes?|taking)\s+a\s+(?:short|long)\s+rest\b"
+    r"|\b(?:falls?|fell)\s+asleep\b"
+    r"|\bthrough\s+the\s+night\b"
+    r"|\bkeeps?\s+watch\s+(?:overnight|through the night)\b"
+    r"|\bstakeout\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_missing_time_advance_followup(notes: str, called: set[str]) -> str | None:
+    """Catches the mechanics model's own resolution report narrating a
+    time-skip (a stakeout, an evening in town, explicit hours/days-pass
+    narration, resting/making camp) with no advance_time/take_rest/travel_to
+    call backing it this turn — the backstop half of the Time passage
+    prompt section, mirroring _detect_missing_loot_followup's un-gated
+    design (this kind of skip is just as likely outside combat as in it, so
+    it isn't gated to an active encounter either)."""
+    if called & _TIME_ADVANCE_TOOLS:
+        return None
+    if notes.lstrip().startswith(OOC_MARKER):
+        return None
+    if not _TIME_SKIP_RE.search(notes):
+        return None
+    return (
+        "Your resolution report implies time passed (a time-skip, resting, or making "
+        "camp), but no advance_time / take_rest / travel_to call backs it up this turn. "
+        "If time actually passed, call advance_time (or take_rest for an actual rest) now "
+        "with the right duration before reporting it. If nothing was actually skipped, "
+        "rewrite the report without implying one."
+    )
+
+
 _KILL_VERBS = (
     r"kills?|killed|slays?|slew|slain|executes?|executed|finishes?\s+off|finished\s+off|"
     r"slits?\s+(?:his|her|their|its)\s+throat|slit\s+(?:his|her|their|its)\s+throat|"
@@ -1360,6 +1441,25 @@ def get_agent(
                     update={
                         "correction_note": issue,
                         "correction_count": correction_count + 1,
+                        "tool_error_count": 0,
+                    },
+                )
+
+        # Time-skip guardrail — own separate budget (time_guardrail_count),
+        # same starvation-avoidance reason as stalled_turn_guardrail_count/
+        # lore_guardrail_count. Not folded into the chain above so a loot/
+        # combat correction spending correction_count's one retry doesn't
+        # leave this one starved the same turn.
+        time_guardrail_count = state.get("time_guardrail_count", 0)
+        if time_guardrail_count < 1:
+            time_issue = _detect_missing_time_advance_followup(notes, called_this_turn)
+            if time_issue:
+                log.info("guardrail fired: %s", time_issue)
+                return Command(
+                    goto="mechanics",
+                    update={
+                        "correction_note": time_issue,
+                        "time_guardrail_count": time_guardrail_count + 1,
                         "tool_error_count": 0,
                     },
                 )
@@ -2041,6 +2141,80 @@ def strip_reasoning_leakage(text: str) -> str:
 _MAX_COMBATANT_TURNS = 10
 
 
+_RECAP_PROMPT = """\
+You are maintaining a short rolling recap of an IN-PROGRESS D&D session called \
+"{campaign_name}", for internal DM continuity only — never shown to the player \
+verbatim. Fold the new turns below into an updated recap, merging with the prior \
+recap rather than just appending to it. Keep the WHOLE result to 2-4 short \
+sentences — drop anything no longer relevant to ongoing plot/character continuity.
+
+{prior_recap_section}
+Actual current party state (ground truth — do not claim any item or currency gain \
+in your recap unless it's actually reflected here):
+{party_state}
+
+New turns to fold in:
+{turns}
+
+Write ONLY the updated recap text — no preamble, no labels, no markers."""
+
+
+async def _load_recap_state(thread_id: str) -> tuple[str, int]:
+    """Read session_recap/session_recap_through straight from the checkpoint
+    (not through get_thread_messages, which only surfaces `messages`) — used
+    by _maybe_update_session_recap before the graph runs for a new turn,
+    since that state otherwise only becomes visible mid-graph."""
+    if _checkpointer is None:
+        return "", 0
+    config = {"configurable": {"thread_id": thread_id}}
+    checkpoint_tuple = await _checkpointer.aget_tuple(config)
+    if not checkpoint_tuple:
+        return "", 0
+    values = checkpoint_tuple.checkpoint["channel_values"]
+    return values.get("session_recap", "") or "", values.get("session_recap_through", 0) or 0
+
+
+async def _maybe_update_session_recap(
+    thread_id: str, campaign: Campaign,
+) -> tuple[str, int] | None:
+    """Cheap early-exit check for whether the narrator's turn window
+    (_NARRATOR_MAX_TURNS) has narrative turns sitting beyond it that aren't
+    folded into the recap yet; if so, folds just the NEW ones (since
+    session_recap_through) into a short (2-4 sentence) rolling recap via a
+    small LLM call. Called once per player turn from stream_response — NOT
+    per mechanics-loop iteration or per auto-resolved combatant turn, since
+    those all share the same underlying narrative history. Returns None (no
+    LLM call, no state change) when nothing new has fallen out of the
+    window since the last update."""
+    prior_recap, recap_through = await _load_recap_state(thread_id)
+    narrative = _narrative_messages(await get_thread_messages(thread_id))
+    if len(narrative) <= _NARRATOR_MAX_TURNS:
+        return None
+    boundary = len(narrative) - _NARRATOR_MAX_TURNS
+    to_fold = narrative[recap_through:boundary]
+    if not to_fold:
+        return None
+
+    turns_text = "\n\n".join(
+        f"{'PLAYER' if isinstance(m, HumanMessage) else 'DM'}: {_extract_text(m.content).strip()}"
+        for m in to_fold
+    )
+    prior_section = f"Prior recap:\n{prior_recap}" if prior_recap else "(no prior recap yet)"
+    prompt = _RECAP_PROMPT.format(
+        campaign_name=campaign.name,
+        prior_recap_section=prior_section,
+        party_state=_party_ground_truth(campaign),
+        turns=turns_text,
+    )
+    try:
+        response = await asyncio.wait_for(_get_model().ainvoke(prompt), timeout=45.0)
+        new_recap = _extract_text(response.content).strip()
+    except Exception:
+        log.warning("session recap update failed/timed out (campaign=%s)", campaign.id)
+        new_recap = prior_recap
+    return (new_recap or prior_recap, boundary)
+
+
 async def stream_response(
     campaign: Campaign,
     store: CampaignStore,
@@ -2093,6 +2267,13 @@ async def stream_response(
         "messages": [HumanMessage(content=user_message)],
         **_FRESH_GUARDRAIL_BUDGETS,
     }
+    # Only checked/updated once per player turn (not per auto-resolved
+    # combatant iteration below) — later iterations resume from the
+    # checkpoint automatically since session_recap/session_recap_through
+    # aren't in _FRESH_GUARDRAIL_BUDGETS, same as `messages` itself.
+    recap_update = await _maybe_update_session_recap(thread_id, campaign)
+    if recap_update is not None:
+        turn_input["session_recap"], turn_input["session_recap_through"] = recap_update
 
     for _ in range(_MAX_COMBATANT_TURNS):
         async for event in agent.astream_events(turn_input, config=config, version="v2"):

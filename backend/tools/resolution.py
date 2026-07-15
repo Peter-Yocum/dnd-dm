@@ -13,8 +13,8 @@ from backend.models import (
 )
 from backend.stores.campaign_store import CampaignStore
 from backend.tools._helpers import (
-    advance_combatant_turn, apply_damage_to_character, apply_damage_to_monster,
-    check_and_spend_action_budget, critical_damage_notation, find_char, find_monster,
+    advance_combatant_turn, apply_damage_to_combatant,
+    check_and_spend_action_budget, critical_damage_notation, find_char, find_combatant,
     format_turn_budget_recap, has_plausible_reaction, require_current_turn, roll_notation,
     spell_action_type,
 )
@@ -100,7 +100,7 @@ def _roll_effect(notation: str) -> tuple[int, str]:
     ability modifier baked in (see with_ability_mod), so a negative modifier
     can pull a low roll below zero — e.g. a STR 6 unarmed strike's "1d4-2"
     rolling a 1 totals -1 — and the application sites here pass a SIGNED
-    amount to apply_damage_to_character/apply_damage_to_monster (their
+    amount to apply_damage_to_combatant (its
     convention: negative = damage, positive = healing). An unfloored
     negative total sign-flips into the opposite branch: a hit that HEALS
     its target, or a botched healing spell that wounds. The breakdown is
@@ -138,7 +138,7 @@ async def resolve_pending_action_impl(
     if not enc or not enc.pending_action:
         return "No pending action to resolve."
     pending = enc.pending_action
-    target = find_char(campaign, pending.target_name) or find_monster(campaign, pending.target_name)
+    target = find_combatant(campaign, pending.target_name)
     if not target:
         enc.pending_action = None
         return f"Target '{pending.target_name}' no longer found — pending action cleared."
@@ -163,8 +163,7 @@ async def resolve_pending_action_impl(
             dtype = DamageType(pending.damage_type)
         except ValueError:
             dtype = DamageType.FORCE
-        hp_msg = apply_damage_to_character(target, -dmg_total, is_critical=pending.was_natural_20) if isinstance(target, Character) \
-            else apply_damage_to_monster(target, -dmg_total)
+        hp_msg = apply_damage_to_combatant(target, -dmg_total, is_critical=pending.was_natural_20)
         reaction_note = f", reaction ({reaction_declared}) applied" if reaction_declared else ""
         lines.append(
             f"{pending.attacker_name}'s {pending.attack_name} vs {pending.target_name}: "
@@ -175,7 +174,7 @@ async def resolve_pending_action_impl(
         target.reaction_available = False
 
     if pending.remaining_swings > 0:
-        attacker = find_char(campaign, pending.attacker_name) or find_monster(campaign, pending.attacker_name)
+        attacker = find_combatant(campaign, pending.attacker_name)
         atk = next((a for a in attacker.attacks if a.name.lower() == pending.attack_name.lower()), None) if attacker else None
         if atk:
             for _ in range(pending.remaining_swings):
@@ -186,8 +185,7 @@ async def resolve_pending_action_impl(
                     continue
                 swing_dice = critical_damage_notation(atk.damage_dice) if is_crit else atk.damage_dice
                 dmg_total, dmg_breakdown = _roll_effect(swing_dice)
-                hp_msg = apply_damage_to_character(target, -dmg_total, is_critical=is_crit) if isinstance(target, Character) \
-                    else apply_damage_to_monster(target, -dmg_total)
+                hp_msg = apply_damage_to_combatant(target, -dmg_total, is_critical=is_crit)
                 lines.append(
                     f"{label} — HIT{' (CRITICAL)' if is_crit else ''}, "
                     f"damage {dmg_breakdown} {atk.damage_type.value} — {hp_msg}"
@@ -198,6 +196,62 @@ async def resolve_pending_action_impl(
 
     enc.pending_action = None
     return "\n".join(lines)
+
+
+def resolve_opportunity_attack(campaign, attacker_name: str, mover_name: str) -> str | None:
+    """Rolls an opportunity attack immediately — the attacker's own reaction
+    isn't a decision point this app models (hostile creatures always take a
+    clean opportunity swing, matching how NPC/monster turns already resolve
+    automatically elsewhere). Returns None if the attacker has no usable
+    attack (nothing to swing with — a caster-only NPC/monster, say) so the
+    caller can skip silently rather than fabricate one.
+
+    On a hit against a player-controlled Character with a reaction still
+    available, this pauses exactly like any other hit (same PendingAction
+    shape resolve_attack itself builds) so Shield/Absorb Elements/etc. can
+    still apply — resolve_pending_action already knows how to finish
+    whatever's pending regardless of which call site created it, so no
+    changes were needed there for this to work. Mutates `campaign` in
+    place; does not save — callers own the store.save() call."""
+    attacker = find_combatant(campaign, attacker_name)
+    target = find_combatant(campaign, mover_name)
+    if attacker is None or target is None or not attacker.attacks:
+        return None
+    atk = attacker.attacks[0]
+    hit, is_crit, total, header = _roll_to_hit(target.ac, atk.to_hit_bonus, "none")
+    label = f"{attacker_name} — opportunity attack ({atk.name}) vs {mover_name}: {header}"
+    if not hit:
+        return f"{label} — MISS"
+
+    swing_dice = critical_damage_notation(atk.damage_dice) if is_crit else atk.damage_dice
+    enc = campaign.active_encounter
+    eligible_for_pause = (
+        isinstance(target, Character) and target.is_player_controlled
+        and target.current_hp > 0 and target.reaction_available and has_plausible_reaction(target)
+        and enc is not None and enc.is_active and not enc.pending_action
+    )
+    if eligible_for_pause:
+        enc.pending_action = PendingAction(
+            trigger_type="movement_away",
+            attacker_name=attacker_name,
+            target_name=mover_name,
+            attack_name=atk.name,
+            to_hit_total=total,
+            was_natural_20=is_crit,
+            target_ac_at_time=target.ac,
+            pending_damage_notation=swing_dice,
+            damage_type=atk.damage_type.value,
+            prompt_note=(
+                f"{attacker_name}'s opportunity attack ({atk.name}) hit {mover_name} (total "
+                f"{total} vs AC {target.ac}) for leaving its reach. {mover_name}'s player may "
+                f"react before damage is applied — call resolve_pending_action once they've decided."
+            ),
+        )
+        return f"{label} — HIT{' (CRITICAL)' if is_crit else ''}. PENDING — {mover_name} has a reaction available."
+
+    dmg_total, dmg_breakdown = _roll_effect(swing_dice)
+    hp_msg = apply_damage_to_combatant(target, -dmg_total, is_critical=is_crit)
+    return f"{label} — HIT{' (CRITICAL)' if is_crit else ''}, damage {dmg_breakdown} {atk.damage_type.value} — {hp_msg}"
 
 
 def _save_bonus(target, ability: str) -> int:
@@ -277,9 +331,9 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         continues later via resolve_pending_action.
         """
         campaign = await store.load(campaign_id)
-        attacker = find_char(campaign, attacker_name) or find_monster(campaign, attacker_name)
+        attacker = find_combatant(campaign, attacker_name)
         if not attacker:
-            return f"No character or monster named '{attacker_name}' found."
+            return f"No character, NPC, or monster named '{attacker_name}' found."
         if isinstance(attacker, Character) and attacker.current_hp == 0:
             return f"{attacker_name} is unconscious at 0 HP and cannot act — call resolve_death_save for their turn instead."
         turn_issue = require_current_turn(campaign, attacker_name)
@@ -288,9 +342,9 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         budget_issue = check_and_spend_action_budget(campaign, attacker_name, action_type)
         if budget_issue:
             return budget_issue
-        target = find_char(campaign, target_name) or find_monster(campaign, target_name)
+        target = find_combatant(campaign, target_name)
         if not target:
-            return f"No character or monster named '{target_name}' found."
+            return f"No character, NPC, or monster named '{target_name}' found."
 
         enc = campaign.active_encounter
         if enc and enc.pending_action:
@@ -389,8 +443,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
 
         result_lines = list(swing_lines)
         if hits:
-            hp_msg = apply_damage_to_character(target, -total_damage, is_critical=any_crit) if isinstance(target, Character) \
-                else apply_damage_to_monster(target, -total_damage)
+            hp_msg = apply_damage_to_combatant(target, -total_damage, is_critical=any_crit)
             result_lines.append(hp_msg)
         if end_turn and enc and enc.is_active:
             result_lines.append(advance_combatant_turn(campaign, enc))
@@ -452,7 +505,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
 
         lines = []
         for name in target_names:
-            target = find_char(campaign, name) or find_monster(campaign, name)
+            target = find_combatant(campaign, name)
             if not target:
                 lines.append(f"{name}: not found — skipped.")
                 continue
@@ -468,8 +521,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                 if success:
                     dmg_total //= 2
                 if dmg_total > 0:
-                    hp_msg = apply_damage_to_character(target, -dmg_total) if isinstance(target, Character) \
-                        else apply_damage_to_monster(target, -dmg_total)
+                    hp_msg = apply_damage_to_combatant(target, -dmg_total)
                     line += f", damage {dmg_breakdown}" + (" (halved)" if success else "") + f" {dtype.value} — {hp_msg}"
 
             if cond is not None and not success and cond not in target.conditions:
@@ -504,9 +556,9 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
         dc: optional — if given, the result also reports pass/fail.
         """
         campaign = await store.load(campaign_id)
-        target = find_char(campaign, character_name) or find_monster(campaign, character_name)
+        target = find_combatant(campaign, character_name)
         if not target:
-            return f"No character or monster named '{character_name}' found."
+            return f"No character, NPC, or monster named '{character_name}' found."
         if isinstance(target, Character) and target.current_hp == 0:
             return f"{character_name} is unconscious at 0 HP and incapacitated — cannot take checks or actions."
 
@@ -749,9 +801,9 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
             if not target_names:
                 return "This is an attack-roll spell — target_names needs at least one name."
             target_name = target_names[0]
-            target = find_char(campaign, target_name) or find_monster(campaign, target_name)
+            target = find_combatant(campaign, target_name)
             if not target:
-                return f"No character or monster named '{target_name}' found."
+                return f"No character, NPC, or monster named '{target_name}' found."
             target_ac = target.ac
             to_hit_bonus = caster.spell_attack_bonus or 0
             eligible_for_pause = (
@@ -795,8 +847,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                     return "\n".join(lines)
                 elif spell.effect_dice:
                     dmg_total, dmg_breakdown = _roll_effect(swing_dice)
-                    hp_msg = apply_damage_to_character(target, -dmg_total, is_critical=is_crit) if isinstance(target, Character) \
-                        else apply_damage_to_monster(target, -dmg_total)
+                    hp_msg = apply_damage_to_combatant(target, -dmg_total, is_critical=is_crit)
                     dtype_str = spell.damage_type.value if spell.damage_type else "force"
                     lines.append(f"{label} — HIT{' (CRITICAL)' if is_crit else ''}, damage {dmg_breakdown} {dtype_str} — {hp_msg}")
                 else:
@@ -810,7 +861,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
             dc = caster.spell_save_dc or 0
             dtype_str = spell.damage_type.value if spell.damage_type else "force"
             for name in target_names:
-                target = find_char(campaign, name) or find_monster(campaign, name)
+                target = find_combatant(campaign, name)
                 if not target:
                     lines.append(f"{name}: not found — skipped.")
                     continue
@@ -824,8 +875,7 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
                     if success:
                         dmg_total //= 2
                     if dmg_total > 0:
-                        hp_msg = apply_damage_to_character(target, -dmg_total) if isinstance(target, Character) \
-                            else apply_damage_to_monster(target, -dmg_total)
+                        hp_msg = apply_damage_to_combatant(target, -dmg_total)
                         line += f", damage {dmg_breakdown}" + (" (halved)" if success else "") + f" {dtype_str} — {hp_msg}"
                 if spell.condition_on_fail and not success:
                     try:
@@ -841,14 +891,13 @@ def make_tools(campaign_id: str, store: CampaignStore) -> list[BaseTool]:
             if spell.effect_dice:
                 recipients = target_names or [caster_name]
                 for name in recipients:
-                    target = find_char(campaign, name) or find_monster(campaign, name)
+                    target = find_combatant(campaign, name)
                     if not target:
                         lines.append(f"{name}: not found — skipped.")
                         continue
                     dmg_total, dmg_breakdown = _roll_effect(spell.effect_dice)
                     amount = dmg_total if spell.is_healing else -dmg_total
-                    hp_msg = apply_damage_to_character(target, amount) if isinstance(target, Character) \
-                        else apply_damage_to_monster(target, amount)
+                    hp_msg = apply_damage_to_combatant(target, amount)
                     kind = "healing" if spell.is_healing else (spell.damage_type.value if spell.damage_type else "damage")
                     lines.append(f"{name}: {dmg_breakdown} {kind} — {hp_msg}")
             else:

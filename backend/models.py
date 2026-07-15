@@ -329,6 +329,12 @@ class Item(LoreLinked):
     notes: str = ""
     item_type: str = "misc"   # "weapon" | "armor" | "wondrous" | "consumable" | "quest" | "misc"
     rarity: str = ""          # "" (mundane) | "common".."legendary"/"artifact"
+    # A purchased/found map unlocks a Location's grid in the Maps browser
+    # without the party having physically been there — see
+    # apply_map_reveal_if_needed (_helpers.py), called from
+    # add_item_to_character (party.py).
+    is_map: bool = False
+    map_location_id: str | None = None
 
 
 class SpellResolutionType(str, Enum):
@@ -371,6 +377,12 @@ class Attack(BaseModel):
     range_ft: str = "5"                   # "5" for melee, "80/320" for ranged
     action_type: str = "action"           # "action" | "bonus_action" | "reaction"
     notes: str = ""
+    # Melee reach in feet — 5 for a standard weapon, 10 for a real reach
+    # weapon (Glaive/Halberd/Lance/Pike) or a monster with genuinely long
+    # reach (a giant's reach, a tentacle). Used by check_opportunity_attacks
+    # (_helpers.py) instead of assuming everyone threatens exactly 1 square.
+    # Irrelevant for a purely ranged attack (range_ft containing "/").
+    reach_ft: int = 5
 
 
 # ─── Combat stat block (for NPCs that might fight but don't warrant full sheet) ─
@@ -386,6 +398,22 @@ class CombatStatBlock(BaseModel):
     damage_immunities: list[DamageType] = Field(default_factory=list)
     condition_immunities: list[ConditionType] = Field(default_factory=list)
     cr: str = "0"
+    # Mirrors Monster's own fields exactly (same shape, same semantics) — only
+    # the saves/skills this NPC is actually proficient in need an entry, same
+    # "a real stat block only lists what it's proficient in" convention
+    # _save_bonus/resolve_check already rely on for Monster. Added 2026-07-13
+    # alongside `conditions` so resolve_saving_throw/resolve_check/cast_spell
+    # can resolve an NPC's modifier from real data instead of a stand-in.
+    saving_throw_bonuses: dict[str, int] = Field(default_factory=dict)
+    skill_bonuses: dict[str, int] = Field(default_factory=dict)
+    conditions: list[ConditionType] = Field(default_factory=list)
+    # Tracked symmetrically with Character/Monster.reaction_available (see
+    # their own fields) — added 2026-07-13 alongside opportunity-attack
+    # allegiance support (InitiativeEntry.side): without this, an NPC could
+    # never qualify as an opportunity attacker or a reaction-eligible target,
+    # since check_opportunity_attacks/has_plausible_reaction-adjacent checks
+    # read this attribute and NPC had no real (non-defaulted) home for it.
+    reaction_available: bool = True
 
 
 # ─── Character (PC and DM-controlled companions) ──────────────────────────────
@@ -401,6 +429,7 @@ class Character(BaseModel):
     background: str | None = None
     alignment: str | None = None
     appearance: str = ""   # physical description — mirrors NPC.physical_description
+    pronouns: str = ""     # freeform (e.g. "she/her", "they/them") — asked at chargen, never inferred from name/race
     level: int = 1
     xp: int = 0
 
@@ -544,6 +573,7 @@ class NPC(LoreLinked):
     race: str = ""
     occupation: str = ""
     physical_description: str = ""
+    pronouns: str = ""     # freeform, mirrors Character.pronouns — not yet wired into create_npc (see design.md)
     location: str = ""
 
     # State
@@ -574,6 +604,67 @@ class NPC(LoreLinked):
 
     # Combat — None if this NPC would never fight
     combat_stats: CombatStatBlock | None = None
+
+    # Read-only proxies onto combat_stats (2026-07-13, closing the "NPCs can't
+    # take damage" gap) — Character/Monster both carry ac/current_hp/max_hp/
+    # attacks/ability_scores at the top level; resolution.py's generic
+    # attacker/target handling (resolve_attack, resolve_pending_action_impl)
+    # reads those same names off whatever combatant it's given, so an NPC
+    # needs to expose them the same way rather than making every call site
+    # branch on NPC specifically. Only meaningful when combat_stats is set —
+    # find_combatant() (_helpers.py) only ever hands out a combat_stats-less
+    # NPC to callers that don't touch these.
+    @property
+    def ac(self) -> int:
+        return self.combat_stats.ac if self.combat_stats else 10
+
+    @property
+    def current_hp(self) -> int:
+        return self.combat_stats.current_hp if self.combat_stats else 0
+
+    @property
+    def max_hp(self) -> int:
+        return self.combat_stats.max_hp if self.combat_stats else 1
+
+    @property
+    def attacks(self) -> list["Attack"]:
+        return self.combat_stats.attacks if self.combat_stats else []
+
+    @property
+    def ability_scores(self) -> AbilityScores:
+        return self.combat_stats.ability_scores if self.combat_stats else AbilityScores()
+
+    # Added 2026-07-13 alongside CombatStatBlock.saving_throw_bonuses/
+    # skill_bonuses/conditions — lets resolve_saving_throw/resolve_check/
+    # cast_spell resolve an NPC's save/check modifier and apply conditions
+    # the same way they already do for Monster (same dict/list shape,
+    # dispatched by the same isinstance-else branch in _save_bonus/
+    # resolve_check — no NPC-specific branching needed there). `conditions`
+    # returns combat_stats' own list object (not a copy) so `.append()` at
+    # the call site mutates the real, persisted list.
+    @property
+    def saving_throw_bonuses(self) -> dict[str, int]:
+        return self.combat_stats.saving_throw_bonuses if self.combat_stats else {}
+
+    @property
+    def skill_bonuses(self) -> dict[str, int]:
+        return self.combat_stats.skill_bonuses if self.combat_stats else {}
+
+    @property
+    def conditions(self) -> list[ConditionType]:
+        return self.combat_stats.conditions if self.combat_stats else []
+
+    # Read/write (unlike the other proxies above) — resolve_pending_action_impl
+    # sets target.reaction_available = False after a declared reaction, the
+    # same statement it already uses for Character/Monster.
+    @property
+    def reaction_available(self) -> bool:
+        return self.combat_stats.reaction_available if self.combat_stats else False
+
+    @reaction_available.setter
+    def reaction_available(self, value: bool) -> None:
+        if self.combat_stats:
+            self.combat_stats.reaction_available = value
 
     traveling_with_party: bool = False
 
@@ -738,6 +829,28 @@ class Location(LoreLinked):
     current_npcs: list[str] = Field(default_factory=list)      # NPC names
     notes: str = ""
 
+    # Grid map — any scale (a region-scale settlement's street layout gets
+    # one just as much as a site-scale dungeon room does). Empty grid =
+    # nothing authored yet; falls back to no visual/spatial reasoning for
+    # this location. See set_location_grid/get_location_grid (world.py).
+    grid: list[str] = Field(default_factory=list)          # ASCII rows, one string per row
+    legend: dict[str, str] = Field(default_factory=dict)   # symbol -> meaning, e.g. {"#": "wall", "T": "tree"}
+    # Maps-browser visibility — set automatically on arrival (move_party/
+    # travel_to) or via a purchased/found map Item (is_map/map_location_id,
+    # apply_map_reveal_if_needed in _helpers.py). Independent of each other:
+    # a location can be map_known without ever being visited.
+    visited: bool = False
+    map_known: bool = False
+    # Fog-of-war for the Maps browser only (never applied to get_location_grid
+    # — the DM/mechanics model always sees the real grid). Append-only list
+    # of (x, y) squares a party-side combatant has actually stood at during
+    # combat (the only place real per-visit coordinates exist today) — see
+    # set_combatant_position (combat.py) and render_grid_fogged (map_render.py).
+    # Empty = no partial-reveal data recorded, so the Maps browser falls back
+    # to showing the whole grid once visited/map_known, same as before this
+    # existed — fog only kicks in for a room actually fought over cell-by-cell.
+    revealed_positions: list[tuple[int, int]] = Field(default_factory=list)
+
 
 # ─── Encounter (combat state machine) ────────────────────────────────────────
 
@@ -747,6 +860,12 @@ class InitiativeEntry(BaseModel):
     initiative: int
     is_current_turn: bool = False
     is_surprised: bool = False
+    # "party" | "hostile" — which side this combatant is fighting on, for
+    # opportunity attacks (_is_hostile_pair, _helpers.py) since combatant_type
+    # alone can't say whether an NPC is an ally or an enemy. Set from
+    # start_encounter's per-combatant "side" key; defaults by combatant_type
+    # (character->party, monster/npc->hostile) when omitted.
+    side: str = "hostile"
     # Reset each turn in advance_combatant_turn from 1 + the sum of the
     # combatant's active ActiveEffect bonuses (Haste, Action Surge, ...) — see
     # check_and_spend_action_budget/format_turn_budget_recap in
@@ -760,7 +879,9 @@ class CombatantPosition(BaseModel):
     name: str
     zone: ZoneType = ZoneType.NEAR
     cover: CoverType = CoverType.NONE
-    # Populated when a grid map is eventually introduced.
+    # (x, y) on the active encounter's Location.grid — see
+    # set_combatant_position (combat.py). Only meaningful when that
+    # location has a grid; None otherwise (zone/cover still apply).
     coordinates: tuple[int, int] | None = None
     notes: str = ""
 
@@ -774,8 +895,9 @@ class PendingAction(BaseModel):
     at a time (the mechanics prompt is instructed to stop calling tools the moment
     one goes pending), which is what keeps this from needing a queue."""
     id: str = Field(default_factory=lambda: uuid4().hex)
-    # Only "incoming_attack" is implemented. "incoming_save_damage" (an
-    # Absorb-Elements-style reaction to a failed/half-damage save) and
+    # "incoming_attack" and "movement_away" (an opportunity attack, see
+    # check_opportunity_attacks/_helpers.py) are implemented. "incoming_save_damage"
+    # (an Absorb-Elements-style reaction to a failed/half-damage save) and
     # "spell_cast" (a Counterspell-style interrupt at the moment of casting) are
     # reserved so a schema migration isn't needed if either is built later — see
     # design.md's "Deferred from the combat resolution refactor".

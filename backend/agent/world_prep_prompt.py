@@ -30,7 +30,16 @@ Instructions:
 6. Omit an argument entirely rather than passing null/None for it — every
    optional field already has a sensible default.
 7. You may call search_rules for more detail on any location you're unsure about.
-8. When you've covered the material above, reply with a short plain-text
+8. For each settlement/notable-area location you create, if the text gives
+   enough to ground a rough layout (named streets, districts, notable
+   buildings, terrain), also call set_location_grid with a small ASCII grid
+   (5-ft squares) — this is what lets players browse "what does this town
+   look like" before ever setting foot there. This is OPTIONAL and
+   best-effort: skip it entirely for a location the text doesn't describe
+   physically — DO NOT invent a street layout that isn't grounded in the
+   source text. A location with no grid just gets authored live later,
+   during play.
+9. When you've covered the material above, reply with a short plain-text
    summary of what you created. Do not narrate or roleplay — this is a
    data-entry pass, not a scene."""
 

@@ -4,7 +4,10 @@ from backend.models import AreaType, Location, LocationConnection, LocationScale
 from backend.rag.entity_resolution import find_candidate_matches
 from backend.stores.campaign_store import CampaignStore
 from backend.stores.lore_store import LoreStore
-from backend.tools._helpers import advance_clock, find_connection, find_container, find_location, opposite_direction
+from backend.tools._helpers import (
+    advance_clock, apply_long_rest, apply_short_rest, find_connection, find_container, find_location,
+    opposite_direction,
+)
 
 
 def make_movement_tools(campaign_id: str, store: CampaignStore) -> list:
@@ -55,6 +58,7 @@ def make_movement_tools(campaign_id: str, store: CampaignStore) -> list:
         if not loc:
             return f"No location named '{location_name}' in the campaign."
         campaign.current_location_id = loc.id
+        loc.visited = True
         await store.save(campaign)
         npc_str = (", ".join(loc.current_npcs)) if loc.current_npcs else "no one"
         return (
@@ -272,7 +276,78 @@ def make_authoring_tools(
             dist = "distance unknown"
         return f"Connected {src.name} ↔ {dst.name} ({dist}, {'bidirectional' if bidirectional else 'one-way'})."
 
-    return [create_location, connect_locations]
+    @tool
+    async def set_location_grid(
+        location_name: str,
+        grid: list[str],
+        legend: dict[str, str] | None = None,
+    ) -> str:
+        """Author (or replace) a location's grid map — ANY scale, not just a
+        dungeon room: a settlement's street layout, a wilderness clearing's
+        terrain, a building's interior all work the same way. Sized in 5-ft
+        squares (standard D&D grid scale). Every row must be the same
+        length (a rectangular grid). '.' always means open/passable ground
+        and never needs a legend entry; every OTHER symbol used (walls,
+        doors, trees, rocks, water, difficult terrain, crates, ...) MUST
+        have a legend entry explaining what it is — invent whatever
+        vocabulary the scene actually calls for, there's no fixed symbol set.
+
+        Call this whenever entering a scene where positioning will matter —
+        a room, a street, a clearing — not only right before combat (combat
+        specifically REQUIRES one; see start_encounter). Skip it for scenes
+        where exact positioning is irrelevant."""
+        campaign = await store.load(campaign_id)
+        loc = find_location(campaign, location_name)
+        if not loc:
+            return f"No location named '{location_name}' found. Call create_location first."
+        if not grid:
+            return "grid must have at least one row."
+        width = len(grid[0])
+        if any(len(row) != width for row in grid):
+            return "Every row must be the same length (a rectangular grid) — check for a short/long row."
+        legend = legend or {}
+        used_symbols = {ch for row in grid for ch in row if ch != "."}
+        unlegended = sorted(used_symbols - set(legend))
+        if unlegended:
+            return (
+                f"These symbols appear in the grid but have no legend entry: {', '.join(unlegended)}. "
+                f"Add a legend entry for each (e.g. legend={{'#': 'wall'}}), or use '.' for open ground."
+            )
+        loc.grid = list(grid)
+        loc.legend = dict(legend)
+        await store.save(campaign)
+        return f"Grid set for '{loc.name}': {width}x{len(grid)} squares, legend: {legend or '(none — all open ground)'}."
+
+    @tool
+    async def get_location_grid(location_name: str = "") -> str:
+        """Get a location's grid map (battle-map notation: columns A, B, C...,
+        rows 1, 2, 3...) plus its legend, for spatial reasoning ("you're 15 ft
+        from the door"). Leave location_name blank for the party's current
+        location. Returns a clear message if no grid has been authored yet —
+        call set_location_grid first."""
+        campaign = await store.load(campaign_id)
+        if location_name:
+            loc = find_location(campaign, location_name)
+            if not loc:
+                return f"No location named '{location_name}' found."
+        else:
+            if not campaign.current_location_id:
+                return "The party's current location is not set."
+            loc = next((l for l in campaign.locations if l.id == campaign.current_location_id), None)
+            if not loc:
+                return "Current location not found in campaign data."
+        if not loc.grid:
+            return f"No grid authored for '{loc.name}' yet — call set_location_grid first."
+        col_letters = "   " + " ".join(chr(65 + i) for i in range(len(loc.grid[0])))
+        lines = [f"=== {loc.name} grid ({len(loc.grid[0])}x{len(loc.grid)} squares, 5 ft each) ===", col_letters]
+        for i, row in enumerate(loc.grid, 1):
+            lines.append(f"{i:>2} " + " ".join(row))
+        if loc.legend:
+            lines.append("Legend: " + ", ".join(f"{sym}={meaning}" for sym, meaning in loc.legend.items()))
+        lines.append("Legend: .=open/passable ground")
+        return "\n".join(lines)
+
+    return [create_location, connect_locations, set_location_grid, get_location_grid]
 
 
 _PACE_MI_PER_DAY = {"slow": 18, "normal": 24, "fast": 30}
@@ -341,6 +416,7 @@ def make_travel_tools(campaign_id: str, store: CampaignStore) -> list:
         hours = (conn.distance_miles / _PACE_MI_PER_DAY[pace]) * 24
         days_advanced = advance_clock(campaign, hours)
         campaign.current_location_id = dest.id
+        dest.visited = True
         await store.save(campaign)
         npc_str = ", ".join(dest.current_npcs) if dest.current_npcs else "no one"
         return (
@@ -349,7 +425,44 @@ def make_travel_tools(campaign_id: str, store: CampaignStore) -> list:
             f"Now day {campaign.days_elapsed}, {campaign.time_of_day.value}. Present: {npc_str}."
         )
 
-    return [get_travel_estimate, travel_to]
+    @tool
+    async def advance_time(hours: float, reason: str) -> str:
+        """Advance the campaign clock (days_elapsed/time_of_day) by `hours`
+        of in-fiction time for a narrated time-skip that ISN'T travel — a
+        stakeout, an evening spent in town, a long conversation that runs
+        past dusk, "a week passes" narration, etc. Use travel_to instead for
+        actual region-scale travel between named locations (it advances the
+        clock itself from distance/pace). See the Time passage prompt
+        section for how much to estimate. `reason` is a short label for the
+        resolution report (e.g. "the party keeps watch overnight"), not
+        shown to the player directly."""
+        if hours <= 0:
+            return "hours must be positive."
+        campaign = await store.load(campaign_id)
+        days_advanced = advance_clock(campaign, hours)
+        await store.save(campaign)
+        return (
+            f"{reason}: ~{hours:.1f} hour(s) pass. {days_advanced} day(s) advanced. "
+            f"Now day {campaign.days_elapsed}, {campaign.time_of_day.value}."
+        )
+
+    @tool
+    async def take_rest(kind: str) -> str:
+        """Apply a whole-party short or long rest when the party actually
+        rests/sleeps/makes camp as part of the narrative (not just a player
+        clicking the UI rest buttons) — kind is 'short' or 'long'. Same
+        deterministic effects as the UI buttons (HP/spell slots/hit dice/
+        exhaustion, clock advances 1 hour for short or 8 for long); this is
+        just the in-fiction call path for when resting happens as part of
+        the story rather than a manual click."""
+        if kind not in ("short", "long"):
+            return "kind must be 'short' or 'long'."
+        campaign = await store.load(campaign_id)
+        summary = apply_long_rest(campaign) if kind == "long" else apply_short_rest(campaign)
+        await store.save(campaign)
+        return summary
+
+    return [get_travel_estimate, travel_to, advance_time, take_rest]
 
 
 def make_opening_detail_tools(campaign_id: str, store: CampaignStore) -> list:

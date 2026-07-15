@@ -551,6 +551,364 @@ CLASSES: dict[str, dict] = {
     },
 }
 
+# Real subclass names per class, extracted from each class's own
+# level_3_features entry above (the "Subclass: A, B, C, or D" text) — added
+# 2026-07-13 so finalize_character/generate_companion_character can validate
+# a chosen subclass instead of accepting any free-text string. Character.
+# subclass itself stays a bare str (not an enum) since a homebrew/other-book
+# subclass should still be nameable, not rejected outright — this table only
+# powers a soft, correctable check for the in-scope 2024 PHB classes, same
+# spirit as SPELL_MENUS validating spell choices without trying to be the
+# only allowed universe of spells.
+SUBCLASSES: dict[str, list[str]] = {
+    "Barbarian": ["Berserker", "Wild Heart", "World Tree", "Zealot"],
+    "Bard": ["Dance", "Glamour", "Lore", "Valor"],
+    "Cleric": ["Life", "Light", "Trickery", "War"],
+    "Druid": ["Land", "Moon", "Sea", "Stars"],
+    "Fighter": ["Battle Master", "Champion", "Eldritch Knight", "Psi Warrior"],
+    "Monk": ["Mercy", "Shadow", "The Elements", "The Open Hand"],
+    "Paladin": ["Devotion", "Glory", "The Ancients", "Vengeance"],
+    "Ranger": ["Beast Master", "Fey Wanderer", "Gloom Stalker", "Hunter"],
+    "Rogue": ["Arcane Trickster", "Assassin", "Soulknife", "Thief"],
+    "Sorcerer": ["Aberrant", "Clockwork", "Draconic", "Wild Magic"],
+    # Warlock's subclass IS its level-1 Otherworldly Patron choice — same 4
+    # names, features just unlock further at level 3 (see level_3_features above).
+    "Warlock": ["Archfey", "Celestial", "Fiend", "Great Old One"],
+    "Wizard": ["Abjurer", "Diviner", "Evoker", "Illusionist"],
+}
+
+# Real level-3 mechanical subclass features, transcribed (condensed to the
+# same terse, freeform-string style as CLASSES[cls]["level_1_features"]) from
+# the actual subclass writeups in docs/source/core/D&D 5.5E - Player's
+# Handbook.md — added 2026-07-13 as the first slice of design.md item #12's
+# "still open" mechanical-modeling half (SUBCLASSES above only validates
+# names). Scope deliberately limited to level 3 — the universal subclass-
+# unlock level — same incremental-slice precedent as the name-validation
+# table itself; higher-level features (6/7/9/10+) are a documented follow-up,
+# not attempted here. Many real features are genuinely bespoke (resource
+# pools, conditional damage riders, summoned companions) rather than a
+# uniform shape, so entries are plain descriptive text, applied verbatim onto
+# Character.features by apply_subclass_features (_helpers.py) rather than
+# modeled as new structured fields — matching Character.features' existing
+# freeform-list shape.
+SUBCLASS_FEATURES: dict[str, dict[str, dict[int, list[str]]]] = {
+    "Barbarian": {
+        "Berserker": {3: [
+            "Frenzy: while raging and using Reckless Attack, the first target hit "
+            "each turn takes extra damage (d6s equal to your Rage Damage bonus).",
+        ]},
+        "Wild Heart": {3: [
+            "Animal Speaker: cast Beast Sense and Speak with Animals as Rituals (Wisdom).",
+            "Rage of the Wilds: while raging, choose Bear (resistance to all damage "
+            "but Force/Necrotic/Psychic/Radiant), Eagle (Bonus Action Disengage+Dash), "
+            "or Wolf (allies have advantage vs. enemies within 5 ft of you).",
+        ]},
+        "World Tree": {3: [
+            "Vitality of the Tree: gain temp HP equal to Barbarian level when raging; "
+            "each turn while raging, grant another creature within 10 ft temp HP "
+            "(d6s equal to Rage Damage bonus).",
+        ]},
+        "Zealot": {3: [
+            "Divine Fury: while raging, first creature hit each turn takes extra "
+            "1d6 + half Barbarian level Necrotic or Radiant damage (your choice).",
+            "Warrior of the Gods: a pool of 4d12 you can spend as a Bonus Action to "
+            "heal yourself; regains on a Long Rest.",
+        ]},
+    },
+    "Bard": {
+        "Dance": {3: [
+            "Dazzling Footwork (unarmored, no shield): advantage on Performance "
+            "checks involving dancing; Unarmored Defense (10 + Dex + Cha); can make "
+            "an Unarmed Strike when spending Bardic Inspiration; Unarmed Strikes use "
+            "Dexterity and can deal bludgeoning damage using your Bardic Inspiration die.",
+        ]},
+        "Glamour": {3: [
+            "Beguiling Magic: always have Charm Person and Mirror Image prepared; "
+            "after casting an Enchantment/Illusion spell, force a Wisdom save or "
+            "charm/frighten a creature for 1 minute (once per Long Rest, or refresh "
+            "by spending a Bardic Inspiration).",
+            "Mantle of Inspiration: Bonus Action to spend a Bardic Inspiration, "
+            "granting several creatures temp HP and a free Reaction move without "
+            "provoking Opportunity Attacks.",
+        ]},
+        "Lore": {3: [
+            "Bonus Proficiencies: proficiency with three skills of your choice.",
+            "Cutting Words: Reaction to spend a Bardic Inspiration and subtract the "
+            "roll from an enemy's damage roll, ability check, or attack roll.",
+        ]},
+        "Valor": {3: [
+            "Combat Inspiration: a creature holding your Bardic Inspiration die can "
+            "add it to its AC against an attack (Reaction) or to its damage after a hit.",
+            "Martial Training: proficiency with Martial weapons, Medium armor, and "
+            "Shields; can use a weapon as a spellcasting focus for Bard spells.",
+        ]},
+    },
+    "Cleric": {
+        "Life": {3: [
+            "Disciple of Life: your healing spells restore extra HP (2 + spell "
+            "slot level) on the turn cast.",
+            "Life Domain Spells: Aid, Bless, Cure Wounds, and Lesser Restoration "
+            "always prepared.",
+            "Preserve Life: Channel Divinity to restore HP (5x Cleric level, split "
+            "among Bloodied creatures within 30 ft, none above half max).",
+        ]},
+        "Light": {3: [
+            "Radiance of the Dawn: Channel Divinity to dispel magical darkness in a "
+            "30-ft emanation and deal 2d10 + Cleric level Radiant damage (Con save half).",
+            "Warding Flare: Reaction to impose disadvantage on an attack roll "
+            "against you (uses equal to Wisdom modifier, min 1, per Long Rest).",
+        ]},
+        "Trickery": {3: [
+            "Blessing of the Trickster: grant advantage on Stealth checks to "
+            "yourself or a willing creature until your next Long Rest.",
+            "Invoke Duplicity: Bonus Action, Channel Divinity, to create an "
+            "illusory duplicate of yourself for 1 minute.",
+        ]},
+        "War": {3: [
+            "Guided Strike: Channel Divinity to give a missed attack roll +10, "
+            "potentially turning it into a hit.",
+            "War Priest: Bonus Action weapon/Unarmed Strike attack, uses equal to "
+            "Wisdom modifier (min 1), regained on a Short or Long Rest.",
+        ]},
+    },
+    "Druid": {
+        "Land": {3: [
+            "Circle of the Land Spells: choose arid/polar/temperate/tropical each "
+            "Long Rest and have that terrain's spell list prepared by Druid level.",
+        ]},
+        "Moon": {3: [
+            "Circle Forms: Wild Shape into higher-CR Beasts (CR = Druid level / 3), "
+            "with AC at least 13 + Wisdom modifier and bonus temp HP (3x Druid level).",
+        ]},
+        "Sea": {3: [
+            "Wrath of the Sea: Bonus Action, spend Wild Shape, to manifest an "
+            "ocean-spray emanation that deals Cold damage and pushes creatures away.",
+        ]},
+        "Stars": {3: [
+            "Star Map: a spellcasting focus granting Guidance and Guiding Bolt "
+            "prepared, castable a few times per Long Rest without a slot.",
+            "Starry Form: Bonus Action, spend Wild Shape, to become luminous and "
+            "gain one of three constellation benefits (Archer/Chalice/Dragon).",
+        ]},
+    },
+    "Fighter": {
+        "Battle Master": {3: [
+            "Combat Superiority: learn 3 maneuvers and gain 4 Superiority Dice "
+            "(d8s, regained on Short/Long Rest) that fuel them.",
+            "Student of War: proficiency with one Artisan's Tools and one skill.",
+        ]},
+        "Champion": {3: [
+            "Improved Critical: score a Critical Hit on a roll of 19-20.",
+            "Remarkable Athlete: advantage on Initiative and Strength (Athletics); "
+            "move half your Speed without provoking after a Critical Hit.",
+        ]},
+        "Eldritch Knight": {3: [
+            "Spellcasting: learn 2 Wizard cantrips and prepare 3 level-1 Wizard "
+            "spells (Intelligence-based), gaining a limited slot pool as you level.",
+            "War Bond: ritual-bond a weapon so it can't be disarmed and can be "
+            "summoned to your hand as a Bonus Action.",
+        ]},
+        "Psi Warrior": {3: [
+            "Psionic Power: a pool of Psionic Energy Dice (4d6 at level 3) fueling "
+            "Protective Field (Reaction, reduce damage), Psionic Strike (bonus Force "
+            "damage on a hit), and Telekinetic Movement (move an object/creature).",
+        ]},
+    },
+    "Monk": {
+        "Mercy": {3: [
+            "Hand of Harm: spend a Focus Point on an Unarmed Strike hit for extra "
+            "Necrotic damage (Martial Arts die + Wisdom modifier).",
+            "Hand of Healing: spend a Focus Point to restore HP (Martial Arts die "
+            "+ Wisdom modifier) as a Magic action, or folded into Flurry of Blows.",
+            "Implements of Mercy: proficiency in Insight, Medicine, and the "
+            "Herbalism Kit.",
+        ]},
+        "Shadow": {3: [
+            "Shadow Arts: spend a Focus Point to cast Darkness (seeing through it "
+            "yourself); gain 60-ft Darkvision (or +60 ft); know Minor Illusion "
+            "(Wisdom-based).",
+        ]},
+        "The Elements": {3: [
+            "Elemental Attunement: spend a Focus Point to imbue Unarmed Strikes "
+            "with 10 ft extra reach and a choice of Acid/Cold/Fire/Lightning/Thunder "
+            "damage plus a forced-movement rider.",
+            "Manipulate Elements: know the Elementalism spell (Wisdom-based).",
+        ]},
+        "The Open Hand": {3: [
+            "Open Hand Technique: on a Flurry of Blows hit, impose Addle (no "
+            "Opportunity Attacks), Push (Strength save or pushed 15 ft), or Topple "
+            "(Dexterity save or Prone).",
+        ]},
+    },
+    "Paladin": {
+        "Devotion": {3: [
+            "Sacred Weapon: Channel Divinity to add Charisma modifier to attack "
+            "rolls with a melee weapon and deal Radiant damage, for 10 minutes.",
+        ]},
+        "Glory": {3: [
+            "Inspiring Smite: after casting Divine Smite, spend Channel Divinity to "
+            "distribute temp HP (2d8 + Paladin level) among nearby allies.",
+            "Peerless Athlete: Bonus Action, Channel Divinity, for an hour of "
+            "advantage on Athletics/Acrobatics and longer jumps.",
+        ]},
+        "The Ancients": {3: [
+            "Nature's Wrath: Channel Divinity to Restrain nearby creatures with "
+            "spectral vines (Strength save).",
+            "Oath of the Ancients Spells: Ensnaring Strike and Speak with Animals "
+            "always prepared.",
+        ]},
+        "Vengeance": {3: [
+            "Vow of Enmity: Channel Divinity for advantage on attack rolls against "
+            "one chosen creature for 1 minute (transferable if it drops to 0 HP).",
+        ]},
+    },
+    "Ranger": {
+        "Beast Master": {3: [
+            "Primal Companion: summon a primal beast (Land/Sea/Sky stat block), "
+            "friendly and obedient, acting on your turn; can be restored if it dies.",
+        ]},
+        "Fey Wanderer": {3: [
+            "Dreadful Strikes: weapon hits deal an extra 1d4 Psychic damage, once "
+            "per turn.",
+            "Otherworldly Glamour: add Wisdom modifier to Charisma checks; gain a "
+            "Deception/Performance/Persuasion proficiency.",
+        ]},
+        "Gloom Stalker": {3: [
+            "Dread Ambusher: +10 ft Speed on your first turn of combat; extra 2d6 "
+            "Psychic damage on a hit a few times per Long Rest; add Wisdom modifier "
+            "to Initiative.",
+            "Umbral Sight: 60-ft Darkvision (or +60 ft); invisible to darkvision "
+            "while fully in darkness.",
+        ]},
+        "Hunter": {3: [
+            "Hunter's Lore: while a creature is marked by Hunter's Mark, know its "
+            "immunities/resistances/vulnerabilities.",
+            "Hunter's Prey: choose Colossus Slayer (extra 1d8 damage vs. a "
+            "creature missing HP, once per turn) or Horde Breaker (extra attack "
+            "against an adjacent second target); swappable each rest.",
+        ]},
+    },
+    "Rogue": {
+        "Arcane Trickster": {3: [
+            "Spellcasting: know Mage Hand plus 2 Wizard cantrips and prepare 3 "
+            "level-1 Wizard spells (Intelligence-based), gaining a limited slot pool.",
+            "Mage Hand Legerdemain: cast Mage Hand as a Bonus Action, invisibly, "
+            "and use it to make Sleight of Hand checks.",
+        ]},
+        "Assassin": {3: [
+            "Assassinate: advantage on Initiative; advantage on attacks against "
+            "any creature that hasn't acted yet in the first round, with a Sneak "
+            "Attack hit dealing extra damage equal to your Rogue level.",
+            "Assassin's Tools: proficiency with a Disguise Kit and Poisoner's Kit.",
+        ]},
+        "Soulknife": {3: [
+            "Psionic Power: a pool of Psionic Energy Dice (4d6 at level 3) fueling "
+            "Psi-Bolstered Knack (reroll a failed proficient check) and Psychic "
+            "Whispers (temporary telepathy).",
+            "Psychic Blades: manifest a shimmering blade of psychic energy to "
+            "attack with on an Attack action or Opportunity Attack.",
+        ]},
+        "Thief": {3: [
+            "Fast Hands: Bonus Action to make a Sleight of Hand check, use an "
+            "object, or use a magic item that requires the Magic action.",
+            "Second-Story Work: Climb Speed equal to your Speed; jump distance "
+            "uses Dexterity instead of Strength.",
+        ]},
+    },
+    "Sorcerer": {
+        "Aberrant": {3: [
+            "Psionic Spells: Arms of Hadar, Calm Emotions, Detect Thoughts, "
+            "Dissonant Whispers, and Mind Sliver always prepared.",
+            "Telepathic Speech: form a temporary telepathic link with a creature "
+            "you can see (Charisma-modifier miles range).",
+        ]},
+        "Clockwork": {3: [
+            "Clockwork Spells always prepared by Sorcerer level.",
+            "Restore Balance: Reaction to cancel advantage or disadvantage on a "
+            "nearby creature's d20 roll, uses equal to Charisma modifier per Long Rest.",
+        ]},
+        "Draconic": {3: [
+            "Draconic Resilience: max HP +3 (and +1 per further Sorcerer level); "
+            "unarmored AC becomes 10 + Dex + Cha.",
+            "Draconic Spells always prepared by Sorcerer level.",
+        ]},
+        "Wild Magic": {3: [
+            "Wild Magic Surge: once per turn, rolling a natural 20 on a d20 after "
+            "casting a Sorcerer spell with a slot triggers a Wild Magic Surge table roll.",
+            "Tides of Chaos: gain advantage on one D20 Test before rolling; "
+            "recharges by casting a Sorcerer spell with a slot or a Long Rest "
+            "(may trigger another surge roll).",
+        ]},
+    },
+    "Warlock": {
+        "Archfey": {3: [
+            "Archfey Spells always prepared by Warlock level.",
+            "Steps of the Fey: cast Misty Step without a spell slot (uses equal to "
+            "Charisma modifier per Long Rest), with a bonus refreshing or taunting effect.",
+        ]},
+        "Celestial": {3: [
+            "Celestial Spells always prepared by Warlock level.",
+            "Healing Light: a pool of d6s (1 + Warlock level) spendable as a "
+            "Bonus Action to heal yourself or a nearby creature.",
+        ]},
+        "Fiend": {3: [
+            "Fiend Spells always prepared by Warlock level.",
+            "Dark One's Blessing: gain temp HP (Charisma modifier + Warlock "
+            "level) whenever you or a nearby ally reduces a creature to 0 HP.",
+        ]},
+        "Great Old One": {3: [
+            "Great Old One Spells always prepared by Warlock level.",
+            "Awakened Mind: form a temporary telepathic link with a creature you "
+            "can see (Charisma-modifier miles range).",
+        ]},
+    },
+    "Wizard": {
+        "Abjurer": {3: [
+            "Abjuration Savant: add 2 free Abjuration spells (level 2 or lower) to "
+            "your spellbook, plus one more whenever you gain a new spell-slot level.",
+            "Arcane Ward: casting an Abjuration spell can raise a damage-absorbing "
+            "ward (HP = 2x Wizard level + Intelligence modifier), rechargeable via "
+            "further Abjuration casts or a Bonus Action spell-slot expenditure.",
+        ]},
+        "Diviner": {3: [
+            "Divination Savant: add 2 free Divination spells (level 2 or lower) to "
+            "your spellbook, plus one more whenever you gain a new spell-slot level.",
+            "Portent: roll two d20s on a Long Rest; replace any d20 roll (yours or "
+            "seen) with one of them, once per turn, until used or the rest resets them.",
+        ]},
+        "Evoker": {3: [
+            "Evocation Savant: add 2 free Evocation spells (level 2 or lower) to "
+            "your spellbook, plus one more whenever you gain a new spell-slot level.",
+            "Potent Cantrip: a creature that avoids your damaging cantrip (miss or "
+            "successful save) still takes half its damage.",
+        ]},
+        "Illusionist": {3: [
+            "Illusion Savant: add 2 free Illusion spells (level 2 or lower) to "
+            "your spellbook, plus one more whenever you gain a new spell-slot level.",
+            "Improved Illusions: cast Illusion spells without Verbal components "
+            "and with +60 ft range; know (or replace) Minor Illusion, castable as a "
+            "Bonus Action with both a sound and an image.",
+        ]},
+    },
+}
+
+# Bonus always-prepared spells granted automatically by a subclass — a subset
+# of SUBCLASS_FEATURES' text descriptions that also map cleanly onto a real
+# Spell object already curated in ALL_SPELLS (spells.py). Deliberately small:
+# most subclass spell grants (Domain/Circle/Oath/Patron spell tables) name
+# spells outside ALL_SPELLS' curated cantrip/level-1 subset, and Wizard's
+# Savant features add to the spellbook rather than granting always-prepared
+# spells, so those aren't modeled here — apply_subclass_features
+# (_helpers.py) resolves each name against ALL_SPELLS and silently skips any
+# that aren't in the curated set, same "don't claim to be the only universe"
+# philosophy as SPELL_MENUS/build_spells_known.
+SUBCLASS_BONUS_SPELLS: dict[str, dict[str, dict[int, list[str]]]] = {
+    "Cleric": {"Life": {3: ["Bless", "Cure Wounds"]}},
+    "Paladin": {"The Ancients": {3: ["Speak with Animals"]}},
+    "Sorcerer": {"Aberrant": {3: ["Arms of Hadar", "Dissonant Whispers"]}},
+    "Warlock": {"Archfey": {3: ["Faerie Fire"]}},
+}
+
 # ── Backgrounds (2024 PHB — 16 total) ────────────────────────────────────────
 # Each background now grants: an ability score increase among three named
 # abilities (+2/+1 or +1/+1/+1, never above 20), an Origin feat, two skill
